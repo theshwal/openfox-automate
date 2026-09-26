@@ -11,7 +11,7 @@
     "README.fr.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "echo \"[openfox-automate] dist/ is prebuilt and committed; skipping tsc\" && exit 0",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
