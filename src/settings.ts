@@ -52,7 +52,10 @@ export const settingsSchema: PluginSettingsSchema = {
     {
       key: 'scan.refreshMinutes',
       type: 'number',
-      label: { en: 'Scan refresh interval (minutes)', fr: 'Intervalle de rafraîchissement du scan (minutes)' },
+      label: {
+        en: 'Scan refresh interval (minutes)',
+        fr: 'Intervalle de rafraîchissement du scan (minutes)',
+      },
       default: 30,
     },
     {
@@ -88,9 +91,18 @@ export const settingsSchema: PluginSettingsSchema = {
       type: 'select',
       label: { en: 'Ordering strategy', fr: 'Stratégie de tri' },
       options: [
-        { value: 'default', label: { en: 'Default (deps + bug-first + FIFO)', fr: 'Défaut (dépendances + bugs d’abord + FIFO)' } },
+        {
+          value: 'default',
+          label: {
+            en: 'Default (deps + bug-first + FIFO)',
+            fr: 'Défaut (dépendances + bugs d’abord + FIFO)',
+          },
+        },
         { value: 'priority-labels', label: { en: 'Priority labels', fr: 'Labels de priorité' } },
-        { value: 'strict-deps', label: { en: 'Strict dependencies (topological)', fr: 'Dépendances strictes (topologique)' } },
+        {
+          value: 'strict-deps',
+          label: { en: 'Strict dependencies (topological)', fr: 'Dépendances strictes (topologique)' },
+        },
       ],
       default: 'default',
     },
@@ -103,7 +115,10 @@ export const settingsSchema: PluginSettingsSchema = {
     {
       key: 'dryRun',
       type: 'boolean',
-      label: { en: 'Dry run (no sessions created, no GitHub writes)', fr: 'Simulation (aucune session créée, aucune écriture GitHub)' },
+      label: {
+        en: 'Dry run (no sessions created, no GitHub writes)',
+        fr: 'Simulation (aucune session créée, aucune écriture GitHub)',
+      },
       default: false,
     },
     {
@@ -137,13 +152,19 @@ export const settingsSchema: PluginSettingsSchema = {
     {
       key: 'post.reprocessResetsRetryCount',
       type: 'boolean',
-      label: { en: 'Re-process resets retry count', fr: 'Le retraitement remet à zéro le compteur de tentatives' },
+      label: {
+        en: 'Re-process resets retry count',
+        fr: 'Le retraitement remet à zéro le compteur de tentatives',
+      },
       default: true,
     },
     {
       key: 'pr.monitorEnabled',
       type: 'boolean',
-      label: { en: 'Monitor opened PRs (conflicts / merges)', fr: 'Surveiller les PR ouvertes (conflits / fusions)' },
+      label: {
+        en: 'Monitor opened PRs (conflicts / merges)',
+        fr: 'Surveiller les PR ouvertes (conflits / fusions)',
+      },
       default: true,
     },
     {
@@ -202,7 +223,10 @@ export function parseRepoOverrides(text: string | undefined): Map<string, string
     const repoKey = line.slice(0, eq).trim()
     const chainPart = line.slice(eq + 1).trim()
     if (!repoKey.includes('/')) continue
-    const chain = chainPart.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
+    const chain = chainPart
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
     if (chain.length > 0) map.set(repoKey, chain)
   }
   return map
@@ -210,5 +234,8 @@ export function parseRepoOverrides(text: string | undefined): Map<string, string
 
 export function parseIgnoreLabels(text: string | undefined): string[] {
   if (!text) return []
-  return text.split(',').map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0)
+  return text
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0)
 }

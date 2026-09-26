@@ -7,23 +7,21 @@
  */
 
 import type { PluginContext, PluginRegistry } from 'openfox/plugin'
-import { settingsSchema, parseRepoMapping, parseChain, parseRepoOverrides, parseIgnoreLabels } from './settings.js'
 import {
-  QueueStore,
-  isTerminated,
-  newEntryId,
-} from './queue.js'
+  settingsSchema,
+  parseRepoMapping,
+  parseChain,
+  parseRepoOverrides,
+  parseIgnoreLabels,
+} from './settings.js'
+import { QueueStore, isTerminated, newEntryId } from './queue.js'
 import { orderQueue, findMissingDependencies } from './ordering.js'
 import { fetchAllOpenIssues, getIssue, listIssueComments, validateToken, isPullRequest } from './github.js'
-import { spawnSessionFor, buildSessionTitle } from './spawner.js'
+import { spawnSessionFor } from './spawner.js'
 import { startChain, applyExecutionEvent } from './chain.js'
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js'
 import { computeMetrics } from './metrics.js'
-import type {
-  HealthReport,
-  PluginSettings,
-  QueueEntry,
-} from './types.js'
+import type { HealthReport, PluginSettings, QueueEntry } from './types.js'
 import { DEFAULT_SETTINGS } from './types.js'
 
 interface Runtime {
@@ -36,20 +34,6 @@ interface Runtime {
   executions: Map<string, { entryId: string; sessionId: string; chain: string[]; currentStep: number }>
 }
 
-function makeStorage(store: QueueStore): { get: (k: string) => Promise<unknown>; set: (k: string, v: unknown) => Promise<void> } {
-  return {
-    get: async (k: string) => {
-      if (k === 'queue') return store.loadActive()
-      if (k === 'history') return store.loadHistory()
-      return undefined
-    },
-    set: async (k: string, v: unknown) => {
-      if (k === 'queue') await store.saveActive(v as QueueEntry[])
-      else if (k === 'history') await store.saveHistory(v as QueueEntry[])
-    },
-  }
-}
-
 function readSettingsFromContext(context: PluginContext): PluginSettings {
   const raw = (context.settings ? context.settings() : {}) as Record<string, unknown>
   const merged: Record<string, unknown> = { ...DEFAULT_SETTINGS, ...raw }
@@ -58,9 +42,7 @@ function readSettingsFromContext(context: PluginContext): PluginSettings {
 
 function hasAnyPostToggle(settings: PluginSettings): boolean {
   return Boolean(
-    settings['post.commentTemplate'] ||
-      settings['post.closeOnSuccess'] ||
-      settings['post.assignOnSuccess'],
+    settings['post.commentTemplate'] || settings['post.closeOnSuccess'] || settings['post.assignOnSuccess'],
   )
 }
 
@@ -143,7 +125,10 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
   publishQueue(rt, ordered)
   if (added.length > 0 && !dryRun) {
     rt.context.notify({
-      title: { en: `${added.length} new issue(s) in queue`, fr: `${added.length} nouvelle(s) issue(s) dans la file` },
+      title: {
+        en: `${added.length} new issue(s) in queue`,
+        fr: `${added.length} nouvelle(s) issue(s) dans la file`,
+      },
       level: 'info',
     })
   }
@@ -159,14 +144,9 @@ async function orderAndStore(rt: Runtime): Promise<QueueEntry[]> {
     settings['ordering.dependencyPattern'] ?? '(#(\\d+))',
   )
   const blockedByMissing = findMissingDependencies(ordered).map((x) => x.entry)
-  const blockedIds = new Set([
-    ...cycleEntries.map((e) => e.id),
-    ...blockedByMissing.map((e) => e.id),
-  ])
+  const blockedIds = new Set([...cycleEntries.map((e) => e.id), ...blockedByMissing.map((e) => e.id)])
   const final = ordered.map((e) =>
-    blockedIds.has(e.id)
-      ? { ...e, status: 'blocked' as const, error: 'missing or circular dependency' }
-      : e,
+    blockedIds.has(e.id) ? { ...e, status: 'blocked' as const, error: 'missing or circular dependency' } : e,
   )
   await rt.store.replace(final)
   await rt.store.pruneHistory(settings['history.retentionCount'] ?? 100)
@@ -255,7 +235,14 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
   return updated
 }
 
-function createLaunchDriver(rt: Runtime): { launch(params: { sessionId: string; workflowId: string; content: string; params: Record<string, string> }): void } {
+function createLaunchDriver(rt: Runtime): {
+  launch(params: {
+    sessionId: string
+    workflowId: string
+    content: string
+    params: Record<string, string>
+  }): void
+} {
   return {
     launch: (p) => {
       rt.context.logger.info(`launching ${p.workflowId} on session ${p.sessionId}`)
@@ -266,7 +253,9 @@ function createLaunchDriver(rt: Runtime): { launch(params: { sessionId: string; 
 async function healthCheck(rt: Runtime): Promise<HealthReport> {
   const settings = readSettingsFromContext(rt.context)
   const token = settings['github.token'] ?? ''
-  const tokenRes = token ? await validateToken(token) : { valid: false, rateLimit: { remaining: 0, resetAt: null } }
+  const tokenRes = token
+    ? await validateToken(token)
+    : { valid: false, rateLimit: { remaining: 0, resetAt: null } }
   const repos = parseRepoMapping(settings['repos.mapping'])
   const reposAccessible: Record<string, 'ok' | '404' | '403' | 'unknown'> = {}
   for (const { repoKey } of repos) {
@@ -345,9 +334,26 @@ export function register(registry: PluginRegistry): void {
       { type: 'badge', label: { en: 'DRY RUN', fr: 'DRY RUN' }, tone: 'warning' },
       { type: 'text', text: { en: 'Active queue', fr: 'File active' } },
       { type: 'divider' },
-      { type: 'table', columns: [{ en: '#', fr: '#' }, { en: 'Status', fr: 'Statut' }, { en: 'Title', fr: 'Titre' }, { en: 'Step', fr: 'Étape' }], rows: [] },
-      { type: 'button', label: { en: 'Health check', fr: 'Contrôle de santé' }, onActivate: { kind: 'rpc', method: 'health' } },
-      { type: 'button', label: { en: 'Scan now', fr: 'Scanner maintenant' }, onActivate: { kind: 'rpc', method: 'scan_now' } },
+      {
+        type: 'table',
+        columns: [
+          { en: '#', fr: '#' },
+          { en: 'Status', fr: 'Statut' },
+          { en: 'Title', fr: 'Titre' },
+          { en: 'Step', fr: 'Étape' },
+        ],
+        rows: [],
+      },
+      {
+        type: 'button',
+        label: { en: 'Health check', fr: 'Contrôle de santé' },
+        onActivate: { kind: 'rpc', method: 'health' },
+      },
+      {
+        type: 'button',
+        label: { en: 'Scan now', fr: 'Scanner maintenant' },
+        onActivate: { kind: 'rpc', method: 'scan_now' },
+      },
     ],
   })
 
@@ -399,7 +405,10 @@ export function register(registry: PluginRegistry): void {
     if (!entry) throw new Error(`queue entry not found: ${queueId}`)
     if (entry.status === 'running' && entry.sessionId) {
       try {
-        await spawnSessionFor({ ...entry, sessionId: entry.sessionId }, { createSession: async () => ({ id: entry.sessionId ?? '' }) })
+        await spawnSessionFor(
+          { ...entry, sessionId: entry.sessionId },
+          { createSession: async () => ({ id: entry.sessionId ?? '' }) },
+        )
       } catch {
         // best effort
       }
@@ -422,7 +431,9 @@ export function register(registry: PluginRegistry): void {
       throw new Error(`cannot reprocess entry in status ${entry.status}`)
     }
     const reset = settings['post.reprocessResetsRetryCount']
-    const executionStack = entry.executionStack?.map((s) => (reset ? { ...s, retryCount: 0, status: 'pending' as const } : s))
+    const executionStack = entry.executionStack?.map((s) =>
+      reset ? { ...s, retryCount: 0, status: 'pending' as const } : s,
+    )
     const updated: QueueEntry = {
       ...entry,
       status: 'queued',
@@ -539,16 +550,27 @@ export function register(registry: PluginRegistry): void {
     const currentIndex = stack.findIndex((s) => s.status === 'running')
     const idx = currentIndex >= 0 ? currentIndex : stack.findIndex((s) => s.workflowId === p.workflowId)
     if (idx < 0) return
-    const outcome = applyExecutionEvent(stack, idx, { status: p.status as 'pending' | 'running' | 'done' | 'blocked' })
+    const outcome = applyExecutionEvent(stack, idx, {
+      status: p.status as 'pending' | 'running' | 'done' | 'blocked',
+    })
     if (outcome.finished && !outcome.blocked) {
-      await rt.store.transitionTo(entry.id, 'done', { executionStack: stack, finishedAt: new Date().toISOString() })
+      await rt.store.transitionTo(entry.id, 'done', {
+        executionStack: stack,
+        finishedAt: new Date().toISOString(),
+      })
       await maybePostProcess(rt, entry)
       await pickAndSpawnNext(rt)
     } else if (outcome.blocked) {
-      await rt.store.transitionTo(entry.id, 'blocked', { executionStack: stack, error: `workflow ${p.workflowId} blocked` })
+      await rt.store.transitionTo(entry.id, 'blocked', {
+        executionStack: stack,
+        error: `workflow ${p.workflowId} blocked`,
+      })
       context.notify({
         title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
-        body: { en: `Issue #${entry.issueNumber} needs intervention`, fr: `Issue #${entry.issueNumber} demande intervention` },
+        body: {
+          en: `Issue #${entry.issueNumber} needs intervention`,
+          fr: `Issue #${entry.issueNumber} demande intervention`,
+        },
         level: 'error',
       })
     } else {
@@ -564,16 +586,30 @@ export function register(registry: PluginRegistry): void {
 
   registry.registerTool({
     name: 'issue_queue_list',
-    description: 'Returns the current active issue queue with status, position, repo, and current workflow step.',
-    parameters: { type: 'object', properties: { statusFilter: { type: 'array', items: { type: 'string' } } } },
+    description:
+      'Returns the current active issue queue with status, position, repo, and current workflow step.',
+    parameters: {
+      type: 'object',
+      properties: { statusFilter: { type: 'array', items: { type: 'string' } } },
+    },
     execute: async (args) => {
       const p = (args ?? {}) as { statusFilter?: string[] }
       const active = await rt.store.loadActive()
       const statuses = new Set(p.statusFilter ?? [])
       const filtered = statuses.size === 0 ? active : active.filter((e) => statuses.has(e.status))
-      return { success: true, output: JSON.stringify(filtered.map((e) => ({
-        id: e.id, issueNumber: e.issueNumber, title: e.title, status: e.status, position: e.position, repoKey: e.repoKey,
-      }))) }
+      return {
+        success: true,
+        output: JSON.stringify(
+          filtered.map((e) => ({
+            id: e.id,
+            issueNumber: e.issueNumber,
+            title: e.title,
+            status: e.status,
+            position: e.position,
+            repoKey: e.repoKey,
+          })),
+        ),
+      }
     },
   })
 
@@ -600,7 +636,12 @@ export function register(registry: PluginRegistry): void {
     await postProcess(
       entry,
       settings,
-      { summary: `OpenFox chain completed for #${entry.issueNumber}`, sessionUrl: '', prUrl: entry.prUrl ?? '', ...(me ? { me } : {}) },
+      {
+        summary: `OpenFox chain completed for #${entry.issueNumber}`,
+        sessionUrl: '',
+        prUrl: entry.prUrl ?? '',
+        ...(me ? { me } : {}),
+      },
       { token, owner, repo },
     )
   }

@@ -27,7 +27,12 @@ function entry(partial: Partial<QueueEntry>): QueueEntry {
     sessionId: 'sess1',
     executionStack: [
       { workflowId: 'Plan Issue v2', workflowName: 'Plan Issue v2', status: 'running', retryCount: 0 },
-      { workflowId: 'Build & Verify Auto v2', workflowName: 'Build & Verify Auto v2', status: 'pending', retryCount: 0 },
+      {
+        workflowId: 'Build & Verify Auto v2',
+        workflowName: 'Build & Verify Auto v2',
+        status: 'pending',
+        retryCount: 0,
+      },
       { workflowId: 'Delivery v2', workflowName: 'Delivery v2', status: 'pending', retryCount: 0 },
     ],
     ...partial,
@@ -81,7 +86,16 @@ describe('chain builders', () => {
   it('buildIssueParams exposes the documented keys', () => {
     const params = buildIssueParams(entry({}))
     expect(Object.keys(params).sort()).toEqual(
-      ['issue_body', 'issue_comments', 'issue_labels', 'issue_number', 'issue_title', 'issue_url', 'project_id', 'repo_key'].sort(),
+      [
+        'issue_body',
+        'issue_comments',
+        'issue_labels',
+        'issue_number',
+        'issue_title',
+        'issue_url',
+        'project_id',
+        'repo_key',
+      ].sort(),
     )
   })
 

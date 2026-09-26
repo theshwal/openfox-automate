@@ -93,7 +93,17 @@ export interface PluginSettings {
   'pr.urlRegex'?: string
 }
 
-export const DEFAULT_SETTINGS: Required<Omit<PluginSettings, 'github.token' | 'repos.mapping' | 'workflows.repoOverrides' | 'post.commentTemplate' | 'ordering.dependencyPattern' | 'pr.urlRegex'>> = {
+export const DEFAULT_SETTINGS: Required<
+  Omit<
+    PluginSettings,
+    | 'github.token'
+    | 'repos.mapping'
+    | 'workflows.repoOverrides'
+    | 'post.commentTemplate'
+    | 'ordering.dependencyPattern'
+    | 'pr.urlRegex'
+  >
+> = {
   'workflows.chain': 'Plan Issue v2\nBuild & Verify Auto v2\nDelivery v2',
   'scan.refreshMinutes': 30,
   'scan.startupScan': true,

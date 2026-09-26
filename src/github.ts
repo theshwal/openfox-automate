@@ -158,11 +158,15 @@ export async function createIssueComment(
   issueNumber: number,
   body: string,
 ): Promise<FetchResult<{ html_url: string }>> {
-  return ghFetch<{ html_url: string }>(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ body }),
-  })
+  return ghFetch<{ html_url: string }>(
+    token,
+    `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body }),
+    },
+  )
 }
 
 export async function addIssueLabel(
@@ -221,14 +225,9 @@ export async function assignIssue(
   })
 }
 
-export function issueHasIgnoredLabel(
-  issue: GitHubIssue,
-  ignoreLabels: string[],
-): boolean {
+export function issueHasIgnoredLabel(issue: GitHubIssue, ignoreLabels: string[]): boolean {
   if (ignoreLabels.length === 0) return false
-  const names = issue.labels
-    .map((l) => (typeof l === 'string' ? l : l.name))
-    .map((n) => n.toLowerCase())
+  const names = issue.labels.map((l) => (typeof l === 'string' ? l : l.name)).map((n) => n.toLowerCase())
   return names.some((n) => ignoreLabels.includes(n))
 }
 

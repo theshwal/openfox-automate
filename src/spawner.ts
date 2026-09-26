@@ -25,10 +25,7 @@ export function buildSessionTitle(entry: QueueEntry): string {
   return `[issue #${entry.issueNumber}] ${entry.title}`.slice(0, 200)
 }
 
-export async function spawnSessionFor(
-  entry: QueueEntry,
-  deps: SpawnerDeps = {},
-): Promise<SessionLike> {
+export async function spawnSessionFor(entry: QueueEntry, deps: SpawnerDeps = {}): Promise<SessionLike> {
   if (deps.createSession) {
     return deps.createSession(entry.projectId, buildSessionTitle(entry))
   }
@@ -45,7 +42,10 @@ export async function spawnSessionFor(
   return session
 }
 
-export async function stopSession(sessionId: string, deps: { stopSession?: (id: string) => Promise<void> } = {}): Promise<void> {
+export async function stopSession(
+  sessionId: string,
+  deps: { stopSession?: (id: string) => Promise<void> } = {},
+): Promise<void> {
   if (deps.stopSession) {
     await deps.stopSession(sessionId)
     return

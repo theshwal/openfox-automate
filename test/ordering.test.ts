@@ -22,7 +22,9 @@ function entry(partial: Partial<QueueEntry> & Pick<QueueEntry, 'issueNumber' | '
 
 describe('parseDependencies', () => {
   it('extracts numeric deps from matches', () => {
-    expect(parseDependencies('depends on #12. Also depends on #34.', '(depends on #(\\d+))')).toEqual([12, 34])
+    expect(parseDependencies('depends on #12. Also depends on #34.', '(depends on #(\\d+))')).toEqual([
+      12, 34,
+    ])
   })
 
   it('returns empty array for invalid regex', () => {

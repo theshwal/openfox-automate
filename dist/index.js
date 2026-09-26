@@ -5,8 +5,8 @@
  * LLM tools, scan timer. Runtime state lives in `context.storage` under
  * "queue", "history", "scan_state", "executions".
  */
-import { settingsSchema, parseRepoMapping, parseChain, parseRepoOverrides, parseIgnoreLabels } from './settings.js';
-import { QueueStore, isTerminated, newEntryId, } from './queue.js';
+import { settingsSchema, parseRepoMapping, parseChain, parseRepoOverrides, parseIgnoreLabels, } from './settings.js';
+import { QueueStore, isTerminated, newEntryId } from './queue.js';
 import { orderQueue, findMissingDependencies } from './ordering.js';
 import { fetchAllOpenIssues, getIssue, listIssueComments, validateToken, isPullRequest } from './github.js';
 import { spawnSessionFor } from './spawner.js';
@@ -14,32 +14,13 @@ import { startChain, applyExecutionEvent } from './chain.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
 import { DEFAULT_SETTINGS } from './types.js';
-function makeStorage(store) {
-    return {
-        get: async (k) => {
-            if (k === 'queue')
-                return store.loadActive();
-            if (k === 'history')
-                return store.loadHistory();
-            return undefined;
-        },
-        set: async (k, v) => {
-            if (k === 'queue')
-                await store.saveActive(v);
-            else if (k === 'history')
-                await store.saveHistory(v);
-        },
-    };
-}
 function readSettingsFromContext(context) {
     const raw = (context.settings ? context.settings() : {});
     const merged = { ...DEFAULT_SETTINGS, ...raw };
     return merged;
 }
 function hasAnyPostToggle(settings) {
-    return Boolean(settings['post.commentTemplate'] ||
-        settings['post.closeOnSuccess'] ||
-        settings['post.assignOnSuccess']);
+    return Boolean(settings['post.commentTemplate'] || settings['post.closeOnSuccess'] || settings['post.assignOnSuccess']);
 }
 function defaultChain() {
     return ['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2'];
@@ -119,7 +100,10 @@ async function scanAll(rt) {
     publishQueue(rt, ordered);
     if (added.length > 0 && !dryRun) {
         rt.context.notify({
-            title: { en: `${added.length} new issue(s) in queue`, fr: `${added.length} nouvelle(s) issue(s) dans la file` },
+            title: {
+                en: `${added.length} new issue(s) in queue`,
+                fr: `${added.length} nouvelle(s) issue(s) dans la file`,
+            },
             level: 'info',
         });
     }
@@ -130,13 +114,8 @@ async function orderAndStore(rt) {
     const active = await rt.store.loadActive();
     const { ordered, cycleEntries } = orderQueue(active, settings['ordering.strategy'] ?? 'default', settings['ordering.dependencyPattern'] ?? '(#(\\d+))');
     const blockedByMissing = findMissingDependencies(ordered).map((x) => x.entry);
-    const blockedIds = new Set([
-        ...cycleEntries.map((e) => e.id),
-        ...blockedByMissing.map((e) => e.id),
-    ]);
-    const final = ordered.map((e) => blockedIds.has(e.id)
-        ? { ...e, status: 'blocked', error: 'missing or circular dependency' }
-        : e);
+    const blockedIds = new Set([...cycleEntries.map((e) => e.id), ...blockedByMissing.map((e) => e.id)]);
+    const final = ordered.map((e) => blockedIds.has(e.id) ? { ...e, status: 'blocked', error: 'missing or circular dependency' } : e);
     await rt.store.replace(final);
     await rt.store.pruneHistory(settings['history.retentionCount'] ?? 100);
     return final;
@@ -233,7 +212,9 @@ function createLaunchDriver(rt) {
 async function healthCheck(rt) {
     const settings = readSettingsFromContext(rt.context);
     const token = settings['github.token'] ?? '';
-    const tokenRes = token ? await validateToken(token) : { valid: false, rateLimit: { remaining: 0, resetAt: null } };
+    const tokenRes = token
+        ? await validateToken(token)
+        : { valid: false, rateLimit: { remaining: 0, resetAt: null } };
     const repos = parseRepoMapping(settings['repos.mapping']);
     const reposAccessible = {};
     for (const { repoKey } of repos) {
@@ -312,9 +293,26 @@ export function register(registry) {
             { type: 'badge', label: { en: 'DRY RUN', fr: 'DRY RUN' }, tone: 'warning' },
             { type: 'text', text: { en: 'Active queue', fr: 'File active' } },
             { type: 'divider' },
-            { type: 'table', columns: [{ en: '#', fr: '#' }, { en: 'Status', fr: 'Statut' }, { en: 'Title', fr: 'Titre' }, { en: 'Step', fr: 'Étape' }], rows: [] },
-            { type: 'button', label: { en: 'Health check', fr: 'Contrôle de santé' }, onActivate: { kind: 'rpc', method: 'health' } },
-            { type: 'button', label: { en: 'Scan now', fr: 'Scanner maintenant' }, onActivate: { kind: 'rpc', method: 'scan_now' } },
+            {
+                type: 'table',
+                columns: [
+                    { en: '#', fr: '#' },
+                    { en: 'Status', fr: 'Statut' },
+                    { en: 'Title', fr: 'Titre' },
+                    { en: 'Step', fr: 'Étape' },
+                ],
+                rows: [],
+            },
+            {
+                type: 'button',
+                label: { en: 'Health check', fr: 'Contrôle de santé' },
+                onActivate: { kind: 'rpc', method: 'health' },
+            },
+            {
+                type: 'button',
+                label: { en: 'Scan now', fr: 'Scanner maintenant' },
+                onActivate: { kind: 'rpc', method: 'scan_now' },
+            },
         ],
     });
     registry.registerRpc('ping', async () => ({
@@ -384,7 +382,7 @@ export function register(registry) {
             throw new Error(`cannot reprocess entry in status ${entry.status}`);
         }
         const reset = settings['post.reprocessResetsRetryCount'];
-        const executionStack = entry.executionStack?.map((s) => (reset ? { ...s, retryCount: 0, status: 'pending' } : s));
+        const executionStack = entry.executionStack?.map((s) => reset ? { ...s, retryCount: 0, status: 'pending' } : s);
         const updated = {
             ...entry,
             status: 'queued',
@@ -506,17 +504,28 @@ export function register(registry) {
         const idx = currentIndex >= 0 ? currentIndex : stack.findIndex((s) => s.workflowId === p.workflowId);
         if (idx < 0)
             return;
-        const outcome = applyExecutionEvent(stack, idx, { status: p.status });
+        const outcome = applyExecutionEvent(stack, idx, {
+            status: p.status,
+        });
         if (outcome.finished && !outcome.blocked) {
-            await rt.store.transitionTo(entry.id, 'done', { executionStack: stack, finishedAt: new Date().toISOString() });
+            await rt.store.transitionTo(entry.id, 'done', {
+                executionStack: stack,
+                finishedAt: new Date().toISOString(),
+            });
             await maybePostProcess(rt, entry);
             await pickAndSpawnNext(rt);
         }
         else if (outcome.blocked) {
-            await rt.store.transitionTo(entry.id, 'blocked', { executionStack: stack, error: `workflow ${p.workflowId} blocked` });
+            await rt.store.transitionTo(entry.id, 'blocked', {
+                executionStack: stack,
+                error: `workflow ${p.workflowId} blocked`,
+            });
             context.notify({
                 title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
-                body: { en: `Issue #${entry.issueNumber} needs intervention`, fr: `Issue #${entry.issueNumber} demande intervention` },
+                body: {
+                    en: `Issue #${entry.issueNumber} needs intervention`,
+                    fr: `Issue #${entry.issueNumber} demande intervention`,
+                },
                 level: 'error',
             });
         }
@@ -532,15 +541,26 @@ export function register(registry) {
     registry.registerTool({
         name: 'issue_queue_list',
         description: 'Returns the current active issue queue with status, position, repo, and current workflow step.',
-        parameters: { type: 'object', properties: { statusFilter: { type: 'array', items: { type: 'string' } } } },
+        parameters: {
+            type: 'object',
+            properties: { statusFilter: { type: 'array', items: { type: 'string' } } },
+        },
         execute: async (args) => {
             const p = (args ?? {});
             const active = await rt.store.loadActive();
             const statuses = new Set(p.statusFilter ?? []);
             const filtered = statuses.size === 0 ? active : active.filter((e) => statuses.has(e.status));
-            return { success: true, output: JSON.stringify(filtered.map((e) => ({
-                    id: e.id, issueNumber: e.issueNumber, title: e.title, status: e.status, position: e.position, repoKey: e.repoKey,
-                }))) };
+            return {
+                success: true,
+                output: JSON.stringify(filtered.map((e) => ({
+                    id: e.id,
+                    issueNumber: e.issueNumber,
+                    title: e.title,
+                    status: e.status,
+                    position: e.position,
+                    repoKey: e.repoKey,
+                }))),
+            };
         },
     });
     registry.registerTool({
@@ -566,7 +586,12 @@ export function register(registry) {
         if (!owner || !repo)
             return;
         const me = settings['post.assignOnSuccess'] ? await fetchAuthenticatedLogin(token) : undefined;
-        await postProcess(entry, settings, { summary: `OpenFox chain completed for #${entry.issueNumber}`, sessionUrl: '', prUrl: entry.prUrl ?? '', ...(me ? { me } : {}) }, { token, owner, repo });
+        await postProcess(entry, settings, {
+            summary: `OpenFox chain completed for #${entry.issueNumber}`,
+            sessionUrl: '',
+            prUrl: entry.prUrl ?? '',
+            ...(me ? { me } : {}),
+        }, { token, owner, repo });
     }
     async function startTimer() {
         const settings = readSettingsFromContext(context);

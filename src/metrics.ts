@@ -43,7 +43,7 @@ export function computeMetrics(history: QueueEntry[]): MetricsReport {
   let countToday = 0
   let countWeek = 0
   let countLast24h = 0
-  let durations: number[] = []
+  const durations: number[] = []
   let done = 0
   let failed = 0
   const workflowFailures = new Map<string, number>()

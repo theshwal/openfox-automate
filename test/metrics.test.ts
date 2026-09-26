@@ -34,9 +34,22 @@ describe('computeMetrics', () => {
   it('counts today / week / total correctly', () => {
     const now = new Date()
     const history: QueueEntry[] = [
-      entry({ id: '1', status: 'done', finishedAt: now.toISOString(), startedAt: new Date(now.getTime() - 1000).toISOString() }),
-      entry({ id: '2', status: 'failed', finishedAt: new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000).toISOString() }),
-      entry({ id: '3', status: 'done', finishedAt: new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000).toISOString() }),
+      entry({
+        id: '1',
+        status: 'done',
+        finishedAt: now.toISOString(),
+        startedAt: new Date(now.getTime() - 1000).toISOString(),
+      }),
+      entry({
+        id: '2',
+        status: 'failed',
+        finishedAt: new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+      }),
+      entry({
+        id: '3',
+        status: 'done',
+        finishedAt: new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+      }),
     ]
     const m = computeMetrics(history)
     expect(m.total).toBe(3)
@@ -48,8 +61,18 @@ describe('computeMetrics', () => {
   it('computes average duration from startedAt/finishedAt', () => {
     const now = Date.now()
     const history: QueueEntry[] = [
-      entry({ id: '1', status: 'done', finishedAt: new Date(now).toISOString(), startedAt: new Date(now - 5000).toISOString() }),
-      entry({ id: '2', status: 'done', finishedAt: new Date(now).toISOString(), startedAt: new Date(now - 1000).toISOString() }),
+      entry({
+        id: '1',
+        status: 'done',
+        finishedAt: new Date(now).toISOString(),
+        startedAt: new Date(now - 5000).toISOString(),
+      }),
+      entry({
+        id: '2',
+        status: 'done',
+        finishedAt: new Date(now).toISOString(),
+        startedAt: new Date(now - 1000).toISOString(),
+      }),
     ]
     const m = computeMetrics(history)
     expect(m.avgDurationMs).toBe(3000)
@@ -71,17 +94,13 @@ describe('computeMetrics', () => {
         id: '2',
         status: 'failed',
         finishedAt: new Date(now).toISOString(),
-        executionStack: [
-          { workflowId: 'B', workflowName: 'B', status: 'blocked', retryCount: 2 },
-        ],
+        executionStack: [{ workflowId: 'B', workflowName: 'B', status: 'blocked', retryCount: 2 }],
       }),
       entry({
         id: '3',
         status: 'failed',
         finishedAt: new Date(now).toISOString(),
-        executionStack: [
-          { workflowId: 'B', workflowName: 'B', status: 'blocked', retryCount: 2 },
-        ],
+        executionStack: [{ workflowId: 'B', workflowName: 'B', status: 'blocked', retryCount: 2 }],
       }),
     ]
     const m = computeMetrics(history)

@@ -92,11 +92,7 @@ export class QueueStore {
     return entry
   }
 
-  async transitionTo(
-    id: string,
-    next: QueueStatus,
-    patch: Partial<QueueEntry> = {},
-  ): Promise<QueueEntry> {
+  async transitionTo(id: string, next: QueueStatus, patch: Partial<QueueEntry> = {}): Promise<QueueEntry> {
     const active = await this.loadActive()
     const idx = active.findIndex((e) => e.id === id)
     if (idx < 0) throw new Error(`Queue entry not found: ${id}`)

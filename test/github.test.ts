@@ -15,7 +15,10 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
+function jsonResponse(
+  body: unknown,
+  init: { status?: number; headers?: Record<string, string> } = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status: init.status ?? 200,
     headers: init.headers ?? { 'Content-Type': 'application/json' },
@@ -126,14 +129,29 @@ describe('GitHub fetch wrappers', () => {
   })
 
   it('validateToken fails with 401', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ message: 'bad creds' }, { status: 401 })))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ message: 'bad creds' }, { status: 401 })),
+    )
     const res = await validateToken('bad')
     expect(res.valid).toBe(false)
   })
 
   it('listOpenIssues calls the right URL with per_page', async () => {
     const fetchMock = vi.fn(async () =>
-      jsonResponse([{ number: 1, title: 'a', body: '', html_url: '', state: 'open', labels: [], created_at: '', updated_at: '', user: null }]),
+      jsonResponse([
+        {
+          number: 1,
+          title: 'a',
+          body: '',
+          html_url: '',
+          state: 'open',
+          labels: [],
+          created_at: '',
+          updated_at: '',
+          user: null,
+        },
+      ]),
     )
     vi.stubGlobal('fetch', fetchMock)
     await listOpenIssues('tok', 'org', 'repo', { perPage: 50, page: 2 })
@@ -141,7 +159,7 @@ describe('GitHub fetch wrappers', () => {
       expect.stringContaining('/repos/org/repo/issues'),
       expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer tok' }) }),
     )
-    const url = String((fetchMock.mock.calls[0]?.[0] as string))
+    const url = String(fetchMock.mock.calls[0]?.[0] as string)
     expect(url).toContain('per_page=50')
     expect(url).toContain('page=2')
   })
@@ -158,7 +176,19 @@ describe('GitHub fetch wrappers', () => {
       updated_at: '',
       user: null,
     }))
-    const page2 = [{ number: 200, title: 't200', body: '', html_url: '', state: 'open' as const, labels: [], created_at: '', updated_at: '', user: null }]
+    const page2 = [
+      {
+        number: 200,
+        title: 't200',
+        body: '',
+        html_url: '',
+        state: 'open' as const,
+        labels: [],
+        created_at: '',
+        updated_at: '',
+        user: null,
+      },
+    ]
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(page1))
@@ -186,7 +216,7 @@ describe('GitHub fetch wrappers', () => {
     const [url, init] = fetchMock.mock.calls[0] ?? []
     expect(String(url)).toContain('/issues/7/comments')
     expect((init as RequestInit | undefined)?.method).toBe('POST')
-    expect(JSON.parse(((init as RequestInit).body as string))).toEqual({ body: 'hello' })
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({ body: 'hello' })
   })
 
   it('getPullRequest hits the pulls endpoint', async () => {

@@ -65,7 +65,11 @@ describe('parseRepoOverrides', () => {
 
 describe('parseIgnoreLabels', () => {
   it('parses comma-separated labels, lowercase, trimmed', () => {
-    expect(parseIgnoreLabels('WontFix, duplicate , Needs-Discussion')).toEqual(['wontfix', 'duplicate', 'needs-discussion'])
+    expect(parseIgnoreLabels('WontFix, duplicate , Needs-Discussion')).toEqual([
+      'wontfix',
+      'duplicate',
+      'needs-discussion',
+    ])
   })
 
   it('returns empty for empty input', () => {

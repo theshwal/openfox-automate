@@ -75,7 +75,13 @@ export async function postProcess(
     result.errors.push(`label add exception: ${e instanceof Error ? e.message : String(e)}`)
   }
   try {
-    const removed = await removeIssueLabel(deps.token, deps.owner, deps.repo, entry.issueNumber, 'agent-ready')
+    const removed = await removeIssueLabel(
+      deps.token,
+      deps.owner,
+      deps.repo,
+      entry.issueNumber,
+      'agent-ready',
+    )
     if (removed.ok || removed.status === 404) result.labeled.removed.push('agent-ready')
     else result.errors.push(`label remove: ${removed.error ?? removed.status}`)
   } catch (e) {

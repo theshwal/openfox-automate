@@ -24,7 +24,7 @@ export function computeMetrics(history) {
     let countToday = 0;
     let countWeek = 0;
     let countLast24h = 0;
-    let durations = [];
+    const durations = [];
     let done = 0;
     let failed = 0;
     const workflowFailures = new Map();

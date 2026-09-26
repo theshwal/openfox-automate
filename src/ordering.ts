@@ -34,10 +34,7 @@ function priorityRank(labels: string[]): number {
   return 999
 }
 
-export function parseDependencies(
-  text: string,
-  pattern: string,
-): number[] {
+export function parseDependencies(text: string, pattern: string): number[] {
   let re: RegExp
   try {
     re = new RegExp(pattern, 'gi')
@@ -102,7 +99,10 @@ export function orderQueue(
   depPattern: string,
 ): { ordered: QueueEntry[]; cycleEntries: QueueEntry[] } {
   const annotated = entries.map((e) => {
-    const depsFromText = parseDependencies(`${e.title}\n${e.body}\n${e.comments.map((c) => c.body).join('\n')}`, depPattern)
+    const depsFromText = parseDependencies(
+      `${e.title}\n${e.body}\n${e.comments.map((c) => c.body).join('\n')}`,
+      depPattern,
+    )
     return depsFromText.length > e.dependsOn.length ? { ...e, dependsOn: depsFromText } : e
   })
 
@@ -143,9 +143,7 @@ export function orderQueue(
   }
 }
 
-export function findMissingDependencies(
-  entries: QueueEntry[],
-): { entry: QueueEntry; missing: number[] }[] {
+export function findMissingDependencies(entries: QueueEntry[]): { entry: QueueEntry; missing: number[] }[] {
   const known = new Set(entries.map((e) => e.issueNumber))
   return entries
     .map((entry) => ({

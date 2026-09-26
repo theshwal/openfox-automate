@@ -98,9 +98,7 @@ describe('openfox-automate (stub build)', () => {
     expect(calls.uiAction[0]).toMatchObject({ slot: 'header.actions' })
     expect(calls.uiPanel[0]).toMatchObject({ id: 'issue-queue-panel', kind: 'declarative' })
     const hookEvents = calls.hook.map((h) => (h as { h: string }).h)
-    expect(hookEvents).toEqual(
-      expect.arrayContaining(['workflow.execution.changed', 'task.completed']),
-    )
+    expect(hookEvents).toEqual(expect.arrayContaining(['workflow.execution.changed', 'task.completed']))
     expect(calls.tool.map((t) => (t as { name: string }).name)).toEqual(
       expect.arrayContaining(['issue_queue_list', 'issue_queue_status']),
     )
@@ -153,7 +151,9 @@ describe('openfox-automate (stub build)', () => {
         backing.set(k, v)
       }),
     } as unknown as PluginContext['storage']
-    registry.context.settings = vi.fn(() => ({ 'repos.mapping': 'o/r=p1' })) as unknown as PluginContext['settings']
+    registry.context.settings = vi.fn(() => ({
+      'repos.mapping': 'o/r=p1',
+    })) as unknown as PluginContext['settings']
 
     register(registry)
 

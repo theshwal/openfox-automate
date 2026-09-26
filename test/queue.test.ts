@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { QueueStore, canTransition, isTerminated, newEntryId, assertTransition } from '../src/queue.js'
 import type { QueueEntry } from '../src/types.js'
 
-function entry(partial: Partial<QueueEntry> & Pick<QueueEntry, 'repoKey' | 'projectId' | 'issueNumber' | 'title'>): QueueEntry {
+function entry(
+  partial: Partial<QueueEntry> & Pick<QueueEntry, 'repoKey' | 'projectId' | 'issueNumber' | 'title'>,
+): QueueEntry {
   return {
     id: newEntryId(),
     body: '',
@@ -107,7 +109,11 @@ describe('QueueStore', () => {
     const { store } = makeStore()
     const e = entry({ repoKey: 'o/r', projectId: 'p', issueNumber: 1, title: 'T' })
     await store.addNew([e])
-    await store.update({ ...e, status: 'running', executionStack: [{ workflowId: 'w1', workflowName: 'W1', status: 'blocked', retryCount: 2 }] })
+    await store.update({
+      ...e,
+      status: 'running',
+      executionStack: [{ workflowId: 'w1', workflowName: 'W1', status: 'blocked', retryCount: 2 }],
+    })
     // entry is blocked (not terminated) — can transition back to queued
     await store.transitionTo(e.id, 'blocked')
     const reprocessed = await store.transitionTo(e.id, 'queued')
