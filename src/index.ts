@@ -525,64 +525,85 @@ export function register(registry: PluginRegistry): void {
     return { paused: false }
   })
 
-  registry.registerHook('tool.completed', async (payload: unknown) => {
-    const p = payload as { sessionId?: string; output?: string }
-    if (!p.sessionId || !p.output) return
-    const settings = readSettingsFromContext(context)
-    const re = new RegExp(settings['pr.urlRegex'] ?? 'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)', 'i')
-    const match = re.exec(p.output)
-    if (!match) return
-    const active = await rt.store.loadActive()
-    const entry = active.find((e) => e.sessionId === p.sessionId)
-    if (!entry || entry.prUrl) return
-    entry.prUrl = match[0]
-    await rt.store.update(entry)
-    publishQueue(rt, await rt.store.loadActive())
-  })
+  function safeHook<F extends (...args: unknown[]) => Promise<void>>(name: string, fn: F): F {
+    return (async (...args: unknown[]) => {
+      try {
+        await fn(...args)
+      } catch (err) {
+        context.logger.error(`hook ${name} failed`, {
+          message: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }) as F
+  }
 
-  registry.registerHook('workflow.execution.changed', async (payload: unknown) => {
-    const p = payload as { sessionId?: string; workflowId?: string; status?: string }
-    if (!p.sessionId || !p.status) return
-    const active = await rt.store.loadActive()
-    const entry = active.find((e) => e.sessionId === p.sessionId)
-    if (!entry) return
-    const stack = entry.executionStack ?? []
-    const currentIndex = stack.findIndex((s) => s.status === 'running')
-    const idx = currentIndex >= 0 ? currentIndex : stack.findIndex((s) => s.workflowId === p.workflowId)
-    if (idx < 0) return
-    const outcome = applyExecutionEvent(stack, idx, {
-      status: p.status as 'pending' | 'running' | 'done' | 'blocked',
-    })
-    if (outcome.finished && !outcome.blocked) {
-      await rt.store.transitionTo(entry.id, 'done', {
-        executionStack: stack,
-        finishedAt: new Date().toISOString(),
+  registry.registerHook(
+    'tool.completed',
+    safeHook('tool.completed', async (payload: unknown) => {
+      const p = payload as { sessionId?: string; output?: string }
+      if (!p.sessionId || !p.output) return
+      const settings = readSettingsFromContext(context)
+      const re = new RegExp(settings['pr.urlRegex'] ?? 'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)', 'i')
+      const match = re.exec(p.output)
+      if (!match) return
+      const active = await rt.store.loadActive()
+      const entry = active.find((e) => e.sessionId === p.sessionId)
+      if (!entry || entry.prUrl) return
+      entry.prUrl = match[0]
+      await rt.store.update(entry)
+      publishQueue(rt, await rt.store.loadActive())
+    }),
+  )
+
+  registry.registerHook(
+    'workflow.execution.changed',
+    safeHook('workflow.execution.changed', async (payload: unknown) => {
+      const p = payload as { sessionId?: string; workflowId?: string; status?: string }
+      if (!p.sessionId || !p.status) return
+      const active = await rt.store.loadActive()
+      const entry = active.find((e) => e.sessionId === p.sessionId)
+      if (!entry) return
+      const stack = entry.executionStack ?? []
+      const currentIndex = stack.findIndex((s) => s.status === 'running')
+      const idx = currentIndex >= 0 ? currentIndex : stack.findIndex((s) => s.workflowId === p.workflowId)
+      if (idx < 0) return
+      const outcome = applyExecutionEvent(stack, idx, {
+        status: p.status as 'pending' | 'running' | 'done' | 'blocked',
       })
-      await maybePostProcess(rt, entry)
+      if (outcome.finished && !outcome.blocked) {
+        await rt.store.transitionTo(entry.id, 'done', {
+          executionStack: stack,
+          finishedAt: new Date().toISOString(),
+        })
+        await maybePostProcess(rt, entry)
+        await pickAndSpawnNext(rt)
+      } else if (outcome.blocked) {
+        await rt.store.transitionTo(entry.id, 'blocked', {
+          executionStack: stack,
+          error: `workflow ${p.workflowId} blocked`,
+        })
+        context.notify({
+          title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
+          body: {
+            en: `Issue #${entry.issueNumber} needs intervention`,
+            fr: `Issue #${entry.issueNumber} demande intervention`,
+          },
+          level: 'error',
+        })
+      } else {
+        await rt.store.update({ ...entry, executionStack: stack })
+      }
+      publishQueue(rt, await rt.store.loadActive())
+    }),
+  )
+
+  registry.registerHook(
+    'task.completed',
+    safeHook('task.completed', async () => {
       await pickAndSpawnNext(rt)
-    } else if (outcome.blocked) {
-      await rt.store.transitionTo(entry.id, 'blocked', {
-        executionStack: stack,
-        error: `workflow ${p.workflowId} blocked`,
-      })
-      context.notify({
-        title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
-        body: {
-          en: `Issue #${entry.issueNumber} needs intervention`,
-          fr: `Issue #${entry.issueNumber} demande intervention`,
-        },
-        level: 'error',
-      })
-    } else {
-      await rt.store.update({ ...entry, executionStack: stack })
-    }
-    publishQueue(rt, await rt.store.loadActive())
-  })
-
-  registry.registerHook('task.completed', async () => {
-    await pickAndSpawnNext(rt)
-    publishQueue(rt, await rt.store.loadActive())
-  })
+      publishQueue(rt, await rt.store.loadActive())
+    }),
+  )
 
   registry.registerTool({
     name: 'issue_queue_list',

@@ -474,7 +474,19 @@ export function register(registry) {
         publishQueue(rt, await rt.store.loadActive());
         return { paused: false };
     });
-    registry.registerHook('tool.completed', async (payload) => {
+    function safeHook(name, fn) {
+        return (async (...args) => {
+            try {
+                await fn(...args);
+            }
+            catch (err) {
+                context.logger.error(`hook ${name} failed`, {
+                    message: err instanceof Error ? err.message : String(err),
+                });
+            }
+        });
+    }
+    registry.registerHook('tool.completed', safeHook('tool.completed', async (payload) => {
         const p = payload;
         if (!p.sessionId || !p.output)
             return;
@@ -490,8 +502,8 @@ export function register(registry) {
         entry.prUrl = match[0];
         await rt.store.update(entry);
         publishQueue(rt, await rt.store.loadActive());
-    });
-    registry.registerHook('workflow.execution.changed', async (payload) => {
+    }));
+    registry.registerHook('workflow.execution.changed', safeHook('workflow.execution.changed', async (payload) => {
         const p = payload;
         if (!p.sessionId || !p.status)
             return;
@@ -533,11 +545,11 @@ export function register(registry) {
             await rt.store.update({ ...entry, executionStack: stack });
         }
         publishQueue(rt, await rt.store.loadActive());
-    });
-    registry.registerHook('task.completed', async () => {
+    }));
+    registry.registerHook('task.completed', safeHook('task.completed', async () => {
         await pickAndSpawnNext(rt);
         publishQueue(rt, await rt.store.loadActive());
-    });
+    }));
     registry.registerTool({
         name: 'issue_queue_list',
         description: 'Returns the current active issue queue with status, position, repo, and current workflow step.',

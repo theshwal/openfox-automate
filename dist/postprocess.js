@@ -6,7 +6,7 @@
  * the canonical interaction. The plugin only acts when explicitly
  * configured to.
  */
-import { addIssueLabel, assignIssue, createIssueComment, removeIssueLabel, setIssueState, validateToken, } from './github.js';
+import { addIssueLabel, assignIssue, createIssueComment, removeIssueLabel, setIssueState, } from './github.js';
 export function renderTemplate(template, ctx) {
     return template
         .replace(/\{\{title\}\}/g, ctx.title)
@@ -22,6 +22,12 @@ export async function postProcess(entry, settings, ctx, deps) {
         assigned: [],
         errors: [],
     };
+    const hasAnyToggle = Boolean(settings['post.commentTemplate']) ||
+        Boolean(settings['post.closeOnSuccess']) ||
+        Boolean(settings['post.assignOnSuccess']);
+    if (!deps.token || !hasAnyToggle) {
+        return result;
+    }
     const template = settings['post.commentTemplate'];
     if (template && template.trim().length > 0) {
         try {
@@ -88,10 +94,9 @@ export async function postProcess(entry, settings, ctx, deps) {
     return result;
 }
 export async function fetchAuthenticatedLogin(token) {
-    const res = await validateToken(token);
-    if (!res.valid)
+    if (!token)
         return null;
-    const r = await fetch('https://api.github.com/user', {
+    const res = await fetch('https://api.github.com/user', {
         headers: {
             Accept: 'application/vnd.github+json',
             Authorization: `Bearer ${token}`,
@@ -99,9 +104,9 @@ export async function fetchAuthenticatedLogin(token) {
             'User-Agent': 'openfox-automate/0.1.0',
         },
     });
-    if (!r.ok)
+    if (!res.ok)
         return null;
-    const body = (await r.json());
+    const body = (await res.json());
     return body.login ?? null;
 }
 //# sourceMappingURL=postprocess.js.map

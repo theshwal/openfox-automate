@@ -8,14 +8,7 @@
  */
 
 import type { PluginSettings, QueueEntry } from './types.js'
-import {
-  addIssueLabel,
-  assignIssue,
-  createIssueComment,
-  removeIssueLabel,
-  setIssueState,
-  validateToken,
-} from './github.js'
+import { addIssueLabel, assignIssue, createIssueComment, removeIssueLabel, setIssueState } from './github.js'
 
 export interface PostProcessResult {
   commented: boolean
@@ -48,6 +41,14 @@ export async function postProcess(
     closed: false,
     assigned: [],
     errors: [],
+  }
+
+  const hasAnyToggle =
+    Boolean(settings['post.commentTemplate']) ||
+    Boolean(settings['post.closeOnSuccess']) ||
+    Boolean(settings['post.assignOnSuccess'])
+  if (!deps.token || !hasAnyToggle) {
+    return result
   }
 
   const template = settings['post.commentTemplate']
@@ -112,9 +113,8 @@ export async function postProcess(
 }
 
 export async function fetchAuthenticatedLogin(token: string): Promise<string | null> {
-  const res = await validateToken(token)
-  if (!res.valid) return null
-  const r = await fetch('https://api.github.com/user', {
+  if (!token) return null
+  const res = await fetch('https://api.github.com/user', {
     headers: {
       Accept: 'application/vnd.github+json',
       Authorization: `Bearer ${token}`,
@@ -122,7 +122,7 @@ export async function fetchAuthenticatedLogin(token: string): Promise<string | n
       'User-Agent': 'openfox-automate/0.1.0',
     },
   })
-  if (!r.ok) return null
-  const body = (await r.json()) as { login?: string }
+  if (!res.ok) return null
+  const body = (await res.json()) as { login?: string }
   return body.login ?? null
 }
