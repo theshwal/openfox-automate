@@ -18,7 +18,8 @@ import { QueueStore, isTerminated, newEntryId } from './queue.js'
 import { orderQueue, findMissingDependencies } from './ordering.js'
 import { fetchAllOpenIssues, getIssue, listIssueComments, validateToken, isPullRequest } from './github.js'
 import { spawnSessionFor } from './spawner.js'
-import { startChain, applyExecutionEvent } from './chain.js'
+import { startChain, applyExecutionEvent, buildIssueContext, buildIssueParams } from './chain.js'
+import { createOrchestration, type OpenFoxOrchestration } from './orchestration.js'
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js'
 import { computeMetrics } from './metrics.js'
 import type { HealthReport, PluginSettings, QueueEntry } from './types.js'
@@ -33,6 +34,8 @@ interface Runtime {
   lastScanAt: string | null
   rateLimitedUntil: number | null
   executions: Map<string, { entryId: string; sessionId: string; chain: string[]; currentStep: number }>
+  orchestration: OpenFoxOrchestration
+  appliedExecutionEvents: Set<string>
 }
 
 function readSettingsFromContext(context: PluginContext): PluginSettings {
@@ -258,7 +261,16 @@ function createLaunchDriver(rt: Runtime): {
 } {
   return {
     launch: (p) => {
-      rt.context.logger.info(`launching ${p.workflowId} on session ${p.sessionId}`)
+      try {
+        rt.orchestration.launchWorkflow({
+          sessionId: p.sessionId,
+          workflowId: p.workflowId,
+          params: p.params,
+          content: p.content,
+        })
+      } catch (err) {
+        rt.context.logger.error(`launchWorkflow failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
     },
   }
 }
@@ -334,6 +346,8 @@ export function register(registry: PluginRegistry): void {
     lastScanAt: null,
     rateLimitedUntil: null,
     executions: new Map(),
+    orchestration: createOrchestration(context),
+    appliedExecutionEvents: new Set(),
   }
 
   registry.registerSettings(settingsSchema)
@@ -402,14 +416,13 @@ export function register(registry: PluginRegistry): void {
     const { queueId } = (params ?? {}) as { queueId: string }
     const entry = await rt.store.findById(queueId)
     if (!entry) throw new Error(`queue entry not found: ${queueId}`)
-    if (entry.status === 'running' && entry.sessionId) {
+    if (entry.sessionId) {
       try {
-        await spawnSessionFor(
-          { ...entry, sessionId: entry.sessionId },
-          { createSession: async () => ({ id: entry.sessionId ?? '' }) },
+        await rt.orchestration.stopSession(entry.sessionId)
+      } catch (err) {
+        context.logger.warn(
+          `cancel_issue: stopSession failed: ${err instanceof Error ? err.message : String(err)}`,
         )
-      } catch {
-        // best effort
       }
     }
     return await rt.store.transitionTo(queueId, 'cancelled', { finishedAt: new Date().toISOString() })
@@ -557,8 +570,24 @@ export function register(registry: PluginRegistry): void {
   registry.registerHook(
     'workflow.execution.changed',
     safeHook('workflow.execution.changed', async (payload: unknown) => {
-      const p = payload as { sessionId?: string; workflowId?: string; status?: string }
+      const p = payload as {
+        sessionId?: string
+        workflowId?: string
+        status?: string
+        executionId?: string
+        currentStepId?: string
+      }
       if (!p.sessionId || !p.status) return
+
+      // Idempotency: dedupe events by executionId when present; fall back to
+      // (sessionId, workflowId, status) so older hosts without executionId
+      // still don't double-trigger.
+      const dedupeKey = p.executionId
+        ? `exec:${p.executionId}:${p.status}`
+        : `sw:${p.sessionId}:${p.workflowId}:${p.status}`
+      if (rt.appliedExecutionEvents.has(dedupeKey)) return
+      rt.appliedExecutionEvents.add(dedupeKey)
+
       const active = await rt.store.loadActive()
       const entry = active.find((e) => e.sessionId === p.sessionId)
       if (!entry) return
@@ -590,7 +619,24 @@ export function register(registry: PluginRegistry): void {
           level: 'error',
         })
       } else {
+        // Workflow transitioned but chain not finished — either:
+        //   - 'done' and next workflow should launch, OR
+        //   - 'blocked' but retry-once kicked in (status reset to 'running').
+        // In both cases, re-launch the current step so the host actually
+        // re-runs it instead of just mutating local state.
         await rt.store.update({ ...entry, executionStack: stack })
+        const step = stack[idx]
+        if (step && step.status === 'running' && entry.sessionId) {
+          const nextStep = p.status === 'done' && idx + 1 < stack.length ? stack[idx + 1] : step
+          if (nextStep) {
+            createLaunchDriver(rt).launch({
+              sessionId: entry.sessionId,
+              workflowId: nextStep.workflowId,
+              content: buildIssueContext(entry),
+              params: buildIssueParams(entry),
+            })
+          }
+        }
       }
       publishQueue(rt, await rt.store.loadActive())
     }),
