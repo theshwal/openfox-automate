@@ -96,7 +96,7 @@ describe('openfox-automate (stub build)', () => {
     expect(calls.uiAction).toHaveLength(1)
     expect(calls.uiPanel).toHaveLength(1)
     expect(calls.uiAction[0]).toMatchObject({ slot: 'header.actions' })
-    expect(calls.uiPanel[0]).toMatchObject({ id: 'issue-queue-panel', kind: 'declarative' })
+    expect(calls.uiPanel[0]).toMatchObject({ id: 'issue-queue-panel', kind: 'iframe' })
     const hookEvents = calls.hook.map((h) => (h as { h: string }).h)
     expect(hookEvents).toEqual(expect.arrayContaining(['workflow.execution.changed', 'task.completed']))
     expect(calls.tool.map((t) => (t as { name: string }).name)).toEqual(

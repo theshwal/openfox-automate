@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Issue Queue</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --panel: #1e293b;
+        --border: #334155;
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: #38bdf8;
+        --success: #22c55e;
+        --warn: #f59e0b;
+        --danger: #ef4444;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 13px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--border);
+        background: var(--panel);
+      }
+      header h1 { font-size: 14px; margin: 0; flex: 1; }
+      .badge {
+        padding: 2px 8px;
+        border-radius: 9999px;
+        font-size: 11px;
+        font-weight: 600;
+        background: var(--warn);
+        color: #1a1a1a;
+        display: none;
+      }
+      .badge.show { display: inline-block; }
+      .badge.success { background: var(--success); color: #052e16; }
+      .badge.danger { background: var(--danger); color: #450a0a; }
+      .tabs { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid var(--border); }
+      .tab {
+        padding: 8px 14px;
+        cursor: pointer;
+        color: var(--muted);
+        border-bottom: 2px solid transparent;
+      }
+      .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+      main { padding: 16px; }
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 12px;
+        align-items: center;
+      }
+      .toolbar input, .toolbar select {
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 4px 8px;
+        font: inherit;
+      }
+      .toolbar input { flex: 1; }
+      .toolbar button {
+        background: var(--accent);
+        color: #082f49;
+        border: 0;
+        padding: 4px 10px;
+        border-radius: 4px;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 600;
+      }
+      .toolbar button.secondary { background: var(--border); color: var(--text); }
+      table { width: 100%; border-collapse: collapse; }
+      th, td {
+        text-align: left;
+        padding: 6px 8px;
+        border-bottom: 1px solid var(--border);
+      }
+      th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+      td button {
+        background: var(--border);
+        color: var(--text);
+        border: 0;
+        padding: 2px 6px;
+        border-radius: 4px;
+        cursor: pointer;
+        font: inherit;
+      }
+      .status-queued { color: var(--muted); }
+      .status-running { color: var(--accent); }
+      .status-done { color: var(--success); }
+      .status-failed { color: var(--danger); }
+      .status-cancelled { color: var(--muted); }
+      .status-blocked { color: var(--warn); }
+      .sparkline { display: flex; align-items: flex-end; gap: 4px; height: 60px; margin: 12px 0; }
+      .sparkline .bar { flex: 1; min-height: 2px; background: var(--border); border-radius: 2px; position: relative; }
+      .sparkline .bar .done { background: var(--success); }
+      .sparkline .bar .failed { background: var(--danger); }
+      .empty { color: var(--muted); padding: 24px; text-align: center; }
+      .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+      .metric { background: var(--panel); padding: 12px; border-radius: 6px; border: 1px solid var(--border); }
+      .metric .label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+      .metric .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Issue Queue</h1>
+      <span id="dryRunBadge" class="badge">DRY RUN</span>
+    </header>
+    <nav class="tabs">
+      <div class="tab active" data-tab="active">Active</div>
+      <div class="tab" data-tab="history">History</div>
+      <div class="tab" data-tab="metrics">Metrics</div>
+    </nav>
+    <main>
+      <section id="active" class="tab-panel">
+        <div class="toolbar">
+          <input id="filterText" type="text" placeholder="Filter by title, body, URL..." />
+          <select id="filterStatus">
+            <option value="">All statuses</option>
+            <option value="queued">queued</option>
+            <option value="running">running</option>
+            <option value="blocked">blocked</option>
+            <option value="done">done</option>
+            <option value="failed">failed</option>
+            <option value="cancelled">cancelled</option>
+          </select>
+          <button id="scanNow">Scan now</button>
+          <button id="healthCheck" class="secondary">Health check</button>
+        </div>
+        <div id="activeTable"></div>
+      </section>
+      <section id="history" class="tab-panel hidden">
+        <div id="historyTable"></div>
+      </section>
+      <section id="metrics" class="tab-panel hidden">
+        <div class="metrics" id="metricsGrid"></div>
+        <div class="sparkline" id="sparkline"></div>
+      </section>
+    </main>
+    <script>
+      ;(function () {
+        const params = new URLSearchParams(location.search)
+        const token = params.get('token') || ''
+        const authHeaders = token ? { Authorization: 'Bearer ' + token } : {}
+
+        let queue = []
+        let history = []
+        let metrics = null
+        let autoScan = { enabled: false, lastScanAt: null, nextScanAt: null, intervalMinutes: 30 }
+        let state = { dryRun: false }
+
+        async function rpc(method, params = {}) {
+          const res = await fetch(`/api/plugins/openfox-automate/rpc/${method}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...authHeaders },
+            body: JSON.stringify({ params }),
+          })
+          if (!res.ok) throw new Error(await res.text())
+          const data = await res.json()
+          if (data.error) throw new Error(data.error)
+          return data.result
+        }
+
+        function escapeHtml(s) {
+          return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+        }
+
+        function renderActive() {
+          const text = (document.getElementById('filterText').value || '').toLowerCase()
+          const status = document.getElementById('filterStatus').value
+          const rows = queue.filter((e) => {
+            if (status && e.status !== status) return false
+            if (text) {
+              const blob = ((e.title || '') + ' ' + (e.body || '') + ' ' + (e.url || '')).toLowerCase()
+              if (!blob.includes(text)) return false
+            }
+            return true
+          })
+          const el = document.getElementById('activeTable')
+          if (rows.length === 0) {
+            el.innerHTML = '<div class="empty">No issues in queue</div>'
+            return
+          }
+          let html = '<table><thead><tr><th>#</th><th>Status</th><th>Title</th><th>Step</th></tr></thead><tbody>'
+          for (const e of rows) {
+            const step = (e.executionStack || []).find((s) => s.status === 'running') || {}
+            html += `<tr>
+              <td>${e.issueNumber || ''}</td>
+              <td class="status-${escapeHtml(e.status)}">${escapeHtml(e.status)}</td>
+              <td>${escapeHtml(e.title || '')}</td>
+              <td>${escapeHtml(step.workflowId || '')}</td>
+            </tr>`
+          }
+          html += '</tbody></table>'
+          el.innerHTML = html
+        }
+
+        function renderHistory() {
+          const el = document.getElementById('historyTable')
+          if (history.length === 0) {
+            el.innerHTML = '<div class="empty">No history yet</div>'
+            return
+          }
+          let html = '<table><thead><tr><th>#</th><th>Status</th><th>Title</th><th>Finished</th><th></th></tr></thead><tbody>'
+          for (const e of history) {
+            const canReprocess = ['done', 'failed', 'cancelled'].includes(e.status)
+            const btn = canReprocess
+              ? `<button data-action="reprocess" data-id="${escapeHtml(e.id)}">Re-process</button>`
+              : '<span class="status-running">running</span>'
+            html += `<tr>
+              <td>${e.issueNumber || ''}</td>
+              <td class="status-${escapeHtml(e.status)}">${escapeHtml(e.status)}</td>
+              <td>${escapeHtml(e.title || '')}</td>
+              <td>${escapeHtml((e.finishedAt || '').slice(0, 19))}</td>
+              <td>${btn}</td>
+            </tr>`
+          }
+          html += '</tbody></table>'
+          el.innerHTML = html
+        }
+
+        function renderMetrics() {
+          if (!metrics) {
+            document.getElementById('metricsGrid').innerHTML = '<div class="empty">No metrics yet</div>'
+            document.getElementById('sparkline').innerHTML = ''
+            return
+          }
+          const items = [
+            { label: 'Total', value: metrics.total },
+            { label: 'Today', value: metrics.today },
+            { label: 'This week', value: metrics.thisWeek },
+            { label: 'Success rate', value: (metrics.successRate * 100).toFixed(0) + '%' },
+            { label: 'Throughput (/h)', value: metrics.throughputPerHour },
+          ]
+          document.getElementById('metricsGrid').innerHTML = items
+            .map((m) => `<div class="metric"><div class="label">${m.label}</div><div class="value">${m.value}</div></div>`)
+            .join('')
+          const sl = document.getElementById('sparkline')
+          const max = Math.max(1, ...metrics.sparkline.map((d) => (d.done || 0) + (d.failed || 0)))
+          sl.innerHTML = metrics.sparkline
+            .map((d) => {
+              const total = (d.done || 0) + (d.failed || 0)
+              const h = total === 0 ? 2 : Math.max(2, (total / max) * 56)
+              const failedH = total === 0 ? 0 : ((d.failed || 0) / total) * h
+              return `<div class="bar" title="${d.day}: ${d.done} done, ${d.failed} failed" style="height:${h}px">
+                <div class="done" style="height:${h - failedH}px"></div>
+                <div class="failed" style="height:${failedH}px;position:absolute;bottom:0;left:0;right:0;"></div>
+              </div>`
+            })
+            .join('')
+        }
+
+        function applyState() {
+          const badge = document.getElementById('dryRunBadge')
+          if (state.dryRun) badge.classList.add('show')
+          else badge.classList.remove('show')
+        }
+
+        function activate(tab) {
+          document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab))
+          document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('hidden', p.id !== tab))
+          if (tab === 'active') renderActive()
+          else if (tab === 'history') renderHistory()
+          else if (tab === 'metrics') renderMetrics()
+        }
+
+        document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => activate(t.dataset.tab)))
+        document.getElementById('filterText').addEventListener('input', renderActive)
+        document.getElementById('filterStatus').addEventListener('change', renderActive)
+        document.getElementById('scanNow').addEventListener('click', () =>
+          rpc('scan_now').catch((e) => alert('scan_now: ' + e.message)),
+        )
+        document.getElementById('healthCheck').addEventListener('click', async () => {
+          try {
+            const h = await rpc('health')
+            const lines = [
+              'github.tokenValid: ' + h.github.tokenValid,
+              'github.rateLimitRemaining: ' + h.github.rateLimitRemaining,
+              'openFoxInternals.sessionManager: ' + h.openFoxInternals.sessionManager,
+              'openFoxInternals.launchWorkflowRun: ' + h.openFoxInternals.launchWorkflowRun,
+              'workflows: ' + Object.keys(h.workflows).length,
+              'repos: ' + Object.keys(h.github.reposAccessible).length,
+              'mapping.valid: ' + h.mapping.valid,
+            ]
+            alert(lines.join('\n'))
+          } catch (e) {
+            alert('health: ' + e.message)
+          }
+        })
+        document.getElementById('historyTable').addEventListener('click', async (ev) => {
+          const btn = ev.target.closest('button[data-action="reprocess"]')
+          if (!btn) return
+          const id = btn.dataset.id
+          try {
+            await rpc('reprocess', { queueId: id })
+            await refresh()
+          } catch (e) {
+            alert('reprocess: ' + e.message)
+          }
+        })
+
+        async function refresh() {
+          try {
+            const [q, h, m] = await Promise.all([
+              rpc('get_queue'),
+              rpc('get_history', { limit: 50, offset: 0 }),
+              rpc('get_metrics'),
+            ])
+            queue = Array.isArray(q) ? q : []
+            history = Array.isArray(h) ? h : []
+            metrics = m || null
+          } catch (e) {
+            console.error('refresh failed', e)
+          }
+          renderActive()
+          renderHistory()
+          renderMetrics()
+          applyState()
+        }
+
+        function connectWs() {
+          try {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+            const url = proto + '//' + location.host + '/ws'
+            const ws = new WebSocket(url + (token ? '?token=' + token : ''))
+            ws.addEventListener('message', (ev) => {
+              try {
+                const msg = JSON.parse(ev.data)
+                if (msg.type !== 'plugin.ui_state') return
+                const payload = msg.payload || {}
+                if (payload.panelId !== 'issue-queue-panel') return
+                if (payload.key === 'queue') queue = Array.isArray(payload.value) ? payload.value : queue
+                if (payload.key === 'history') history = Array.isArray(payload.value) ? payload.value : history
+                if (payload.key === 'metrics') metrics = payload.value || metrics
+                if (payload.key === 'autoScan') autoScan = payload.value || autoScan
+                if (payload.key === 'state') state = payload.value || state
+                renderActive()
+                renderHistory()
+                renderMetrics()
+                applyState()
+              } catch (e) {
+                console.error(e)
+              }
+            })
+            ws.addEventListener('close', () => setTimeout(connectWs, 1500))
+            ws.addEventListener('error', () => ws.close())
+          } catch (e) {
+            setTimeout(connectWs, 1500)
+          }
+        }
+
+        activate('active')
+        refresh()
+        connectWs()
+        setInterval(refresh, 10000)
+      })()
+    </script>
+  </body>
+</html>

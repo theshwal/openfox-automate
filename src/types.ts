@@ -6,7 +6,7 @@ export type QueueStatus = 'queued' | 'running' | 'blocked' | 'done' | 'failed' |
 
 export type OrderingStrategy = 'default' | 'priority-labels' | 'strict-deps'
 
-export type ExecutionStepStatus = 'pending' | 'running' | 'done' | 'blocked'
+export type ExecutionStepStatus = 'pending' | 'running' | 'done' | 'blocked' | 'waiting'
 
 export interface QueueEntry {
   id: string

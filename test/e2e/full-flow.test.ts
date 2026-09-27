@@ -182,7 +182,7 @@ describe.skipIf(!SHOULD_RUN)('openfox-automate e2e (live OpenFox)', () => {
 
     const panel = data.contributions.panels.find((p) => p.id === 'issue-queue-panel')
     expect(panel).toBeDefined()
-    expect(panel?.kind).toBe('declarative')
+    expect(panel?.kind).toBe('iframe')
     expect(panel?.title.en).toContain('Issue Queue')
   })
 

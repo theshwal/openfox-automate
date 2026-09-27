@@ -11,7 +11,7 @@
     "README.fr.md"
   ],
   "scripts": {
-    "build": "echo \"[openfox-automate] dist/ is prebuilt and committed; skipping tsc\" && exit 0",
+    "build": "test -f dist/index.js || tsc; test -f dist/panel.html || test -f src/panel/panel.html && cp src/panel/panel.html dist/panel.html",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

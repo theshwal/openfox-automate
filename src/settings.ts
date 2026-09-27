@@ -184,7 +184,52 @@ export function readSettings(raw: Record<string, unknown>): PluginSettings {
   for (const [k, v] of Object.entries(raw)) {
     if (v !== undefined && v !== null && v !== '') merged[k] = v
   }
-  return merged as PluginSettings
+  return clampSettings(merged as PluginSettings)
+}
+
+/**
+ * Clamp / validate plugin settings to safe ranges.
+ *
+ * Host-side validation rejects negative / zero numeric values, but the
+ * plugin applies its own defensive clamps so behavior is consistent
+ * regardless of the host's validator. Negative / non-finite values fall
+ * back to the default.
+ */
+export function clampSettings(settings: PluginSettings): PluginSettings {
+  const out = { ...settings }
+  const minutes = Number(out['scan.refreshMinutes'])
+  if (!Number.isFinite(minutes) || minutes < 1) {
+    out['scan.refreshMinutes'] = 30
+  } else if (minutes > 60) {
+    out['scan.refreshMinutes'] = 60
+  } else {
+    out['scan.refreshMinutes'] = Math.floor(minutes)
+  }
+  const global = Number(out['batch.maxConcurrency'])
+  if (!Number.isFinite(global) || global < 1) {
+    out['batch.maxConcurrency'] = 3
+  } else if (global > 10) {
+    out['batch.maxConcurrency'] = 10
+  } else {
+    out['batch.maxConcurrency'] = Math.floor(global)
+  }
+  const perRepo = Number(out['batch.maxConcurrencyPerRepo'])
+  if (!Number.isFinite(perRepo) || perRepo < 1) {
+    out['batch.maxConcurrencyPerRepo'] = 2
+  } else if (perRepo > 5) {
+    out['batch.maxConcurrencyPerRepo'] = 5
+  } else {
+    out['batch.maxConcurrencyPerRepo'] = Math.floor(perRepo)
+  }
+  const retention = Number(out['history.retentionCount'])
+  if (!Number.isFinite(retention) || retention < 10) {
+    out['history.retentionCount'] = 100
+  } else if (retention > 500) {
+    out['history.retentionCount'] = 500
+  } else {
+    out['history.retentionCount'] = Math.floor(retention)
+  }
+  return out
 }
 
 export function parseRepoMapping(text: string | undefined): { repoKey: string; projectId: string }[] {

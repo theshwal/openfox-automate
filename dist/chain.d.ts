@@ -34,9 +34,10 @@ export interface ChainOutcome {
     nextStepIndex: number;
     finished: boolean;
     blocked: boolean;
+    waiting: boolean;
 }
 export declare function applyExecutionEvent(stack: ExecutionStep[], currentIndex: number, event: {
-    status: 'pending' | 'running' | 'done' | 'blocked';
+    status: 'pending' | 'running' | 'done' | 'blocked' | 'waiting';
 }): ChainOutcome;
 export declare function startChain(entry: QueueEntry, driver: LaunchDriver, options: {
     sessionId: string;

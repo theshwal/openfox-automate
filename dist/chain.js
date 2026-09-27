@@ -59,22 +59,40 @@ export function initExecutionStack(chain) {
 export function applyExecutionEvent(stack, currentIndex, event) {
     const step = stack[currentIndex];
     if (!step)
-        return { nextStepIndex: currentIndex, finished: true, blocked: false };
-    step.status = event.status;
+        return { nextStepIndex: currentIndex, finished: true, blocked: false, waiting: false };
+    // 'waiting' (e.g. a user step is awaiting input) does not advance the chain.
+    // Subsequent 'running' / 'done' events on the same step clear the wait.
+    if (event.status === 'waiting') {
+        step.status = 'waiting';
+        return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: true };
+    }
+    // Resume the step from any non-waiting status (covers user choice clearing
+    // the wait without forcing a full status overwrite on the existing entry).
+    if (step.status === 'waiting') {
+        step.status = event.status;
+    }
+    else {
+        step.status = event.status;
+    }
     if (event.status === 'done') {
         step.finishedAt = new Date().toISOString();
-        return { nextStepIndex: currentIndex + 1, finished: currentIndex + 1 >= stack.length, blocked: false };
+        return {
+            nextStepIndex: currentIndex + 1,
+            finished: currentIndex + 1 >= stack.length,
+            blocked: false,
+            waiting: false,
+        };
     }
     if (event.status === 'blocked') {
         step.retryCount += 1;
         if (step.retryCount >= 2) {
             step.finishedAt = new Date().toISOString();
-            return { nextStepIndex: currentIndex, finished: true, blocked: true };
+            return { nextStepIndex: currentIndex, finished: true, blocked: true, waiting: false };
         }
         step.status = 'running';
-        return { nextStepIndex: currentIndex, finished: false, blocked: false };
+        return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: false };
     }
-    return { nextStepIndex: currentIndex, finished: false, blocked: false };
+    return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: false };
 }
 export function startChain(entry, driver, options) {
     const chain = (entry.executionStack ?? []).map((s) => s.workflowId);

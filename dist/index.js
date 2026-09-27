@@ -137,6 +137,8 @@ function publishQueue(rt, active) {
         nextScanAt: rt.paused || !rt.timer ? null : nextScanAtIso(rt),
         intervalMinutes: readSettingsFromContext(rt.context)['scan.refreshMinutes'] ?? 30,
     });
+    const settings = readSettingsFromContext(rt.context);
+    rt.context.publish('issue-queue-panel', 'state', { dryRun: Boolean(settings.dryRun) });
 }
 function nextScanAtIso(rt) {
     if (!rt.timer)
@@ -305,33 +307,10 @@ export function register(registry) {
         id: 'issue-queue-panel',
         title: { en: 'Issue Queue', fr: 'File d’attente d’issues' },
         size: 'xl',
-        kind: 'declarative',
-        content: [
-            { type: 'badge', label: { en: 'DRY RUN', fr: 'DRY RUN' }, tone: 'warning' },
-            { type: 'text', text: { en: 'Active queue', fr: 'File active' } },
-            { type: 'divider' },
-            {
-                type: 'table',
-                columns: [
-                    { en: '#', fr: '#' },
-                    { en: 'Status', fr: 'Statut' },
-                    { en: 'Title', fr: 'Titre' },
-                    { en: 'Step', fr: 'Étape' },
-                ],
-                rows: [],
-            },
-            {
-                type: 'button',
-                label: { en: 'Health check', fr: 'Contrôle de santé' },
-                onActivate: { kind: 'rpc', method: 'health' },
-            },
-            {
-                type: 'button',
-                label: { en: 'Scan now', fr: 'Scanner maintenant' },
-                onActivate: { kind: 'rpc', method: 'scan_now' },
-            },
-        ],
+        kind: 'iframe',
+        url: 'dist/panel.html',
     });
+    registry.registerAsset('dist/panel.html');
     registry.registerRpc('ping', async () => ({
         ok: true,
         plugin: context.id,
