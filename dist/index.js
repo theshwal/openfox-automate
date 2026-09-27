@@ -599,13 +599,34 @@ export function register(registry) {
         if (rt.timer)
             clearInterval(rt.timer);
         rt.timer = setInterval(() => {
-            if (!rt.paused)
-                void scanAll(rt);
+            if (rt.paused)
+                return;
+            void scanAll(rt).then(() => monitorAndPublish());
         }, minutes * 60_000);
+    }
+    async function monitorAndPublish() {
+        const settings = readSettingsFromContext(context);
+        if (!settings['pr.monitorEnabled'])
+            return;
+        const token = settings['github.token'];
+        if (!token)
+            return;
+        const { monitorPRs } = await import('./pr-monitor.js');
+        const result = await monitorPRs({
+            token,
+            store: rt.store,
+            notify: (n) => context.notify(n),
+            republish: () => {
+                void rt.store.loadActive().then((q) => publishQueue(rt, q));
+            },
+        });
+        if (result.checked > 0 || result.errors.length > 0) {
+            context.logger.info(`pr-monitor: checked=${result.checked} completed=${result.completed} failed=${result.failed} errors=${result.errors.length}`);
+        }
     }
     void startTimer();
     if (readSettingsFromContext(context)['scan.startupScan']) {
-        void scanAll(rt);
+        void scanAll(rt).then(() => monitorAndPublish());
     }
     void orderAndStore(rt);
     void publishQueue(rt, []);
