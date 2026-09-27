@@ -46,6 +46,43 @@ flowchart LR
   M --> Q[Done]
 ```
 
+## Plugin architecture
+
+The plugin runs **in-process** with the OpenFox host. It uses the host-exposed
+`PluginContext.openFoxInternals` (apiVersion 2, added in OpenFox
+`>= 2.0.160`) to drive sessions and workflow chains — no HTTP, no password,
+no dynamic import of host internals.
+
+```ts
+// What the plugin calls (when the host exposes internals):
+const session = await context.openFoxInternals.sessionManager.createSession(
+  projectId,
+  `[issue #${issueNumber}] ${title}`,
+)
+// session.id → stored in entry.sessionId, used by subsequent runWorkflow calls
+
+context.openFoxInternals.runWorkflow(sessionId, {
+  workflowId: 'Plan Issue v2',
+  params: { issue_url, issue_title, repo_key, ... },
+  content: buildIssueContext(entry), // markdown rendered to the agent
+})
+```
+
+### Fallback for older hosts
+
+Hosts without `openFoxInternals` (OpenFox `< 2.0.160`) trigger a fallback path
+that resolves `openfox` via `import.meta.resolve(...)` and dynamically imports
+`sessionManager` + `launchWorkflowRun`. The plugin's `health()` RPC reports
+which path is active.
+
+### Host-side verification
+
+```bash
+# Plugin loaded with the openFoxInternals path:
+curl -X POST http://localhost:10369/api/plugins/openfox-automate/rpc/health
+# → { "openFoxInternals": { "sessionManager": "ok", "launchWorkflowRun": "ok" }, ... }
+```
+
 ## Requirements
 
 - OpenFox `>=2.0.140` (must expose the plugin v2 API and the workflow runner)
