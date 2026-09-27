@@ -10,7 +10,7 @@ import { QueueStore, isTerminated, newEntryId } from './queue.js';
 import { orderQueue, findMissingDependencies } from './ordering.js';
 import { fetchAllOpenIssues, getIssue, listIssueComments, validateToken, isPullRequest } from './github.js';
 import { spawnSessionFor } from './spawner.js';
-import { startChain, applyExecutionEvent, buildIssueContext, buildIssueParams } from './chain.js';
+import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent, } from './chain.js';
 import { createOrchestration } from './orchestration.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
@@ -514,41 +514,43 @@ export function register(registry) {
     }));
     registry.registerHook('workflow.execution.changed', safeHook('workflow.execution.changed', async (payload) => {
         const p = payload;
-        if (!p.sessionId || !p.status)
-            return;
-        // Idempotency: dedupe events by executionId when present; fall back to
-        // (sessionId, workflowId, status) so older hosts without executionId
-        // still don't double-trigger.
-        const dedupeKey = p.executionId
-            ? `exec:${p.executionId}:${p.status}`
-            : `sw:${p.sessionId}:${p.workflowId}:${p.status}`;
-        if (rt.appliedExecutionEvents.has(dedupeKey))
-            return;
-        rt.appliedExecutionEvents.add(dedupeKey);
         const active = await rt.store.loadActive();
         const entry = active.find((e) => e.sessionId === p.sessionId);
         if (!entry)
             return;
-        const stack = entry.executionStack ?? [];
-        const currentIndex = stack.findIndex((s) => s.status === 'running');
-        const idx = currentIndex >= 0 ? currentIndex : stack.findIndex((s) => s.workflowId === p.workflowId);
-        if (idx < 0)
-            return;
-        const outcome = applyExecutionEvent(stack, idx, {
+        const outcome = processWorkflowEvent(entry, {
+            sessionId: p.sessionId,
+            workflowId: p.workflowId,
+            executionId: p.executionId,
             status: p.status,
+        }, {
+            appliedExecutionEvents: rt.appliedExecutionEvents,
+            log: (msg) => context.logger.warn(msg),
+            buildIssueContext,
+            buildIssueParams,
         });
-        if (outcome.finished && !outcome.blocked) {
+        if (outcome.deduplicated)
+            return;
+        for (const launch of outcome.launches) {
+            rt.orchestration.launchWorkflow({
+                sessionId: launch.sessionId,
+                workflowId: launch.workflowId,
+                params: launch.params,
+                content: launch.content,
+            });
+        }
+        if (outcome.transitionTo === 'done') {
             await rt.store.transitionTo(entry.id, 'done', {
-                executionStack: stack,
+                executionStack: entry.executionStack ?? [],
                 finishedAt: new Date().toISOString(),
             });
             await maybePostProcess(rt, entry);
             await pickAndSpawnNext(rt);
         }
-        else if (outcome.blocked) {
+        else if (outcome.transitionTo === 'blocked') {
             await rt.store.transitionTo(entry.id, 'blocked', {
-                executionStack: stack,
-                error: `workflow ${p.workflowId} blocked`,
+                executionStack: entry.executionStack ?? [],
+                error: outcome.blockedReason ?? `workflow ${p.workflowId} blocked`,
             });
             context.notify({
                 title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
@@ -559,27 +561,11 @@ export function register(registry) {
                 level: 'error',
             });
         }
-        else {
-            // Workflow transitioned but chain not finished — either:
-            //   - 'done' and next workflow should launch, OR
-            //   - 'blocked' but retry-once kicked in (status reset to 'running').
-            // In both cases, re-launch the current step so the host actually
-            // re-runs it instead of just mutating local state.
-            await rt.store.update({ ...entry, executionStack: stack });
-            const step = stack[idx];
-            if (step && step.status === 'running' && entry.sessionId) {
-                const nextStep = p.status === 'done' && idx + 1 < stack.length
-                    ? stack[idx + 1]
-                    : step;
-                if (nextStep) {
-                    createLaunchDriver(rt).launch({
-                        sessionId: entry.sessionId,
-                        workflowId: nextStep.workflowId,
-                        content: buildIssueContext(entry),
-                        params: buildIssueParams(entry),
-                    });
-                }
-            }
+        else if (outcome.launches.length === 0) {
+            await rt.store.update({
+                ...entry,
+                ...(entry.executionStack ? { executionStack: entry.executionStack } : {}),
+            });
         }
         publishQueue(rt, await rt.store.loadActive());
     }));

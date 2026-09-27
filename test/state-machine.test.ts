@@ -1,31 +1,12 @@
-import { describe, expect, it } from 'vitest'
-import { applyExecutionEvent, type ExecutionStep } from '../src/chain.js'
-import type { OpenFoxOrchestration, LaunchWorkflowParams } from '../src/orchestration.js'
+import { beforeEach, describe, expect, it } from 'vitest'
+import {
+  processWorkflowEvent,
+  buildIssueContext,
+  buildIssueParams,
+  purgeAppliedExecutionEvents,
+  type ExecutionStep,
+} from '../src/chain.js'
 import type { QueueEntry } from '../src/types.js'
-
-interface CallRecord {
-  method: 'createSession' | 'stopSession' | 'launchWorkflow'
-  args: unknown[]
-}
-
-function makeSpy(): { orch: OpenFoxOrchestration; calls: CallRecord[] } {
-  const calls: CallRecord[] = []
-  return {
-    calls,
-    orch: {
-      async createSession(projectId: string, title: string) {
-        calls.push({ method: 'createSession', args: [projectId, title] })
-        return { id: 'sess-1', workdir: '/tmp/work' }
-      },
-      async stopSession(sessionId: string) {
-        calls.push({ method: 'stopSession', args: [sessionId] })
-      },
-      launchWorkflow(params: LaunchWorkflowParams): void {
-        calls.push({ method: 'launchWorkflow', args: [params] })
-      },
-    },
-  }
-}
 
 function entryWithStack(chain: string[], sessionId = 'sess-1'): QueueEntry {
   const executionStack: ExecutionStep[] = chain.map((id) => ({
@@ -41,7 +22,7 @@ function entryWithStack(chain: string[], sessionId = 'sess-1'): QueueEntry {
     issueNumber: 42,
     title: 'test issue',
     body: '',
-    url: '',
+    url: 'https://github.com/o/r/issues/42',
     labels: [],
     comments: [],
     dependsOn: [],
@@ -54,263 +35,289 @@ function entryWithStack(chain: string[], sessionId = 'sess-1'): QueueEntry {
   }
 }
 
-/**
- * Replica of the workflow.execution.changed hook's control flow, isolated
- * from the Runtime/registry so it can be unit-tested directly.
- *
- * Contract:
- * - 'done' with chain continuing → launch next step
- * - 'blocked' on first block (retryCount goes 0→1) → relaunch current step
- * - 'blocked' on second block (retryCount goes 1→2) → no launch (entry becomes blocked)
- * - 'done' on last step → no launch (chain finished)
- * - 'running' / 'pending' / 'waiting' → no launch
- * - duplicate events for the same executionId → no-op
- */
-
-interface AdvanceResult {
-  launches: number
-  finished: boolean
-  blocked: boolean
-  nextStatus: QueueEntry['status']
+function processDeps() {
+  return {
+    appliedExecutionEvents: new Set<string>(),
+    log: (_msg: string) => {},
+    buildIssueContext,
+    buildIssueParams,
+  }
 }
 
-function advanceChain(
-  entry: QueueEntry,
-  event: {
-    workflowId?: string
-    status: 'pending' | 'running' | 'done' | 'blocked' | 'waiting'
-    executionId?: string
-  },
-  orchestration: OpenFoxOrchestration,
-  appliedExecutionEvents: Set<string>,
-): AdvanceResult {
-  const eventKey = event.executionId
-    ? `exec:${event.executionId}`
-    : `sw:${entry.sessionId}:${event.workflowId}:${event.status}`
-  if (appliedExecutionEvents.has(eventKey)) {
-    return {
-      launches: 0,
-      finished: entry.status === 'done',
-      blocked: entry.status === 'blocked',
-      nextStatus: entry.status,
-    }
-  }
-  appliedExecutionEvents.add(eventKey)
-
-  const stack = entry.executionStack ?? []
-  const idx = stack.findIndex((s) => s.status === 'running')
-  if (idx < 0) {
-    return { launches: 0, finished: false, blocked: false, nextStatus: entry.status }
-  }
-  const prevRetry = stack[idx]!.retryCount
-  const outcome = applyExecutionEvent(stack, idx, { status: event.status })
-  let nextStatus: QueueEntry['status'] = 'running'
-  let launches = 0
-
-  if (outcome.finished && !outcome.blocked) {
-    nextStatus = 'done'
-  } else if (outcome.blocked) {
-    nextStatus = 'blocked'
-  } else if (event.status === 'done' && idx + 1 < stack.length) {
-    const nextStep = stack[idx + 1]!
-    if (entry.sessionId) {
-      orchestration.launchWorkflow({
-        sessionId: entry.sessionId,
-        workflowId: nextStep.workflowId,
-      })
-      launches = 1
-    }
-  } else if (event.status === 'blocked' && stack[idx]!.retryCount > prevRetry) {
-    if (entry.sessionId) {
-      orchestration.launchWorkflow({
-        sessionId: entry.sessionId,
-        workflowId: stack[idx]!.workflowId,
-      })
-      launches = 1
-    }
-  }
-
-  return { launches, finished: outcome.finished, blocked: outcome.blocked, nextStatus }
-}
-
-/** Simulate the initial startChain call (sets running + launches step[0]). */
-function startChain(entry: QueueEntry, orchestration: OpenFoxOrchestration, _calls: CallRecord[]): void {
+function startChain(entry: QueueEntry): void {
   if (entry.executionStack?.[0]) {
     entry.executionStack[0].status = 'running'
     entry.executionStack[0].startedAt = '2026-01-01T00:00:02Z'
   }
-  if (entry.sessionId && entry.executionStack?.[0]) {
-    orchestration.launchWorkflow({
-      sessionId: entry.sessionId,
-      workflowId: entry.executionStack[0].workflowId,
-    })
+}
+
+function feed(
+  entry: QueueEntry,
+  events: Array<{
+    workflowId: string
+    status: 'pending' | 'running' | 'done' | 'blocked' | 'waiting'
+    executionId: string
+  }>,
+  appliedExecutionEvents?: Set<string>,
+) {
+  const seen = appliedExecutionEvents ?? new Set<string>()
+  const results = []
+  for (const e of events) {
+    const r = processWorkflowEvent(
+      entry,
+      {
+        workflowId: e.workflowId,
+        status: e.status,
+        executionId: e.executionId,
+        sessionId: entry.sessionId ?? '',
+      },
+      { ...processDeps(), appliedExecutionEvents: seen },
+    )
+    results.push(r)
   }
+  return results
 }
 
-function launchCalls(calls: CallRecord[]): CallRecord[] {
-  return calls.filter((c) => c.method === 'launchWorkflow')
-}
+describe('state machine — production code (processWorkflowEvent)', () => {
+  beforeEach(() => {})
 
-function launchWorkflowIds(calls: CallRecord[]): string[] {
-  return launchCalls(calls).map((c) => (c.args[0] as LaunchWorkflowParams).workflowId)
-}
-
-describe('state machine — full chain advancement', () => {
-  it('workflow 1 → 2 → 3 → entry done with exactly 3 launches', () => {
-    const { orch, calls } = makeSpy()
+  it('full chain: workflow 1 → 2 → 3 → entry done', () => {
     const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2'])
+    startChain(entry)
+
     const seen = new Set<string>()
-
-    startChain(entry, orch, calls)
-    expect(launchCalls(calls)).toHaveLength(1)
-
-    // Workflow 1 'running' confirmation — no-op
-    let r = advanceChain(
-      entry,
-      { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
-      orch,
-      seen,
+    const all: ReturnType<typeof feed> = []
+    let curIdx = 1
+    function promote() {
+      entry.executionStack![curIdx]!.status = 'running'
+      curIdx++
+    }
+    all.push(...feed(entry, [{ workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' }], seen))
+    all.push(...feed(entry, [{ workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' }], seen))
+    promote()
+    all.push(
+      ...feed(entry, [{ workflowId: 'Build & Verify Auto v2', status: 'done', executionId: 'e3' }], seen),
     )
-    expect(r.launches).toBe(0)
-    expect(launchCalls(calls)).toHaveLength(1)
+    promote()
+    all.push(...feed(entry, [{ workflowId: 'Delivery v2', status: 'done', executionId: 'e4' }], seen))
 
-    // Workflow 1 done → launch workflow 2
-    r = advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' }, orch, seen)
-    expect(r.launches).toBe(1)
-    expect(r.finished).toBe(false)
-    expect(r.blocked).toBe(false)
-    expect(launchCalls(calls)).toHaveLength(2)
-    if (entry.executionStack) entry.executionStack[1]!.status = 'running'
-
-    // Workflow 2 done → launch workflow 3
-    r = advanceChain(
-      entry,
-      { workflowId: 'Build & Verify Auto v2', status: 'done', executionId: 'e3' },
-      orch,
-      seen,
-    )
-    expect(r.launches).toBe(1)
-    expect(r.finished).toBe(false)
-    if (entry.executionStack) entry.executionStack[2]!.status = 'running'
-
-    // Workflow 3 done → finished
-    r = advanceChain(entry, { workflowId: 'Delivery v2', status: 'done', executionId: 'e4' }, orch, seen)
-    expect(r.launches).toBe(0)
-    expect(r.finished).toBe(true)
-
-    // Total: 1 initial + 2 chain advances = 3 launches
-    expect(launchCalls(calls)).toHaveLength(3)
+    expect(all[0]!.launches).toHaveLength(0)
+    expect(all[1]!.launches.map((l) => l.workflowId)).toEqual(['Build & Verify Auto v2'])
+    expect(all[2]!.launches.map((l) => l.workflowId)).toEqual(['Delivery v2'])
+    expect(all[3]!.launches).toHaveLength(0)
+    expect(all[3]!.finished).toBe(true)
+    expect(all[3]!.transitionTo).toBe('done')
   })
 
   it('duplicate done event with same executionId does NOT re-launch (idempotency)', () => {
-    const { orch, calls } = makeSpy()
     const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2'])
+    startChain(entry)
+
     const seen = new Set<string>()
+    feed(
+      entry,
+      [
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
+        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' },
+      ],
+      seen,
+    )
+    entry.executionStack![1]!.status = 'running'
 
-    startChain(entry, orch, calls)
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' }, orch, seen)
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' }, orch, seen)
-    if (entry.executionStack) entry.executionStack[1]!.status = 'running'
+    const dup = feed(entry, [{ workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' }], seen)
 
-    // Duplicate 'done' with SAME executionId → no-op
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' }, orch, seen)
-
-    // 1 initial + 1 chain advance = 2 total, not 3
-    expect(launchCalls(calls)).toHaveLength(2)
+    expect(dup[0]!.deduplicated).toBe(true)
+    expect(dup[0]!.launches).toHaveLength(0)
   })
 
-  it('duplicate done with different executionIds but same workflowId triggers re-launch (dedup key is executionId)', () => {
-    const { orch, calls } = makeSpy()
-    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2'])
+  it('same executionId with different status is NOT deduplicated (running then done)', () => {
+    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2'])
+    startChain(entry)
+
     const seen = new Set<string>()
+    const results = feed(
+      entry,
+      [
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'exec-1' },
+        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'exec-1' },
+      ],
+      seen,
+    )
 
-    startChain(entry, orch, calls)
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' }, orch, seen)
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' }, orch, seen)
-    if (entry.executionStack) entry.executionStack[1]!.status = 'running'
+    expect(results[0]!.deduplicated).toBe(false)
+    expect(results[1]!.deduplicated).toBe(false)
+    expect(results[1]!.launches).toHaveLength(1)
+    expect(results[1]!.launches[0]?.workflowId).toBe('Build & Verify Auto v2')
+  })
 
-    // Same workflow done event with DIFFERENT executionId → NOT dedup'd,
-    // advances chain to step[2].
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e3' }, orch, seen)
-    if (entry.executionStack) entry.executionStack[2]!.status = 'running'
+  it('duplicate done with different executionIds but same workflowId triggers re-launch', () => {
+    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2'])
+    startChain(entry)
 
-    // 1 initial + 2 chain advances = 3 launches
-    expect(launchWorkflowIds(calls)).toEqual(['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2'])
+    const seen = new Set<string>()
+    feed(
+      entry,
+      [
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
+        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' },
+      ],
+      seen,
+    )
+    entry.executionStack![1]!.status = 'running'
+
+    const seen2 = new Set<string>()
+    const results = feed(
+      entry,
+      [
+        { workflowId: 'Build & Verify Auto v2', status: 'running', executionId: 'e1b' },
+        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e3' },
+      ],
+      seen2,
+    )
+    entry.executionStack![2]!.status = 'running'
+
+    expect(results[1]!.launches.map((l) => l.workflowId)).toEqual(['Delivery v2'])
   })
 
   it('blocked #1 → real retry (1 relaunch), blocked #2 → entry blocked (no launch)', () => {
-    const { orch, calls } = makeSpy()
     const entry = entryWithStack(['Plan Issue v2'])
+    startChain(entry)
+
     const seen = new Set<string>()
-
-    startChain(entry, orch, calls)
-
-    // First blocked → retry
-    let r = advanceChain(
+    const results = feed(
       entry,
-      { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' },
-      orch,
+      [
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'b0' },
+        { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' },
+        { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b2' },
+      ],
       seen,
     )
-    expect(r.launches).toBe(1)
-    expect(r.blocked).toBe(false)
-    expect(launchCalls(calls)).toHaveLength(2)
 
-    // Second blocked → entry becomes blocked, no launch
-    r = advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b2' }, orch, seen)
-    expect(r.launches).toBe(0)
-    expect(r.blocked).toBe(true)
-    expect(launchCalls(calls)).toHaveLength(2)
+    expect(results[1]!.launches).toHaveLength(1)
+    expect(results[1]!.launches[0]?.workflowId).toBe('Plan Issue v2')
+    expect(results[1]!.transitionTo).toBeUndefined()
+
+    expect(results[2]!.launches).toHaveLength(0)
+    expect(results[2]!.transitionTo).toBe('blocked')
   })
 
-  it('duplicate blocked event with same executionId does NOT trigger extra retry (idempotency)', () => {
-    const { orch, calls } = makeSpy()
+  it('duplicate blocked event with same executionId does NOT trigger extra retry', () => {
     const entry = entryWithStack(['Plan Issue v2'])
+    startChain(entry)
+
     const seen = new Set<string>()
-
-    startChain(entry, orch, calls)
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' }, orch, seen)
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b2' }, orch, seen)
-
-    // Duplicate first blocked (same executionId) → no-op
-    advanceChain(entry, { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' }, orch, seen)
-
-    // 1 initial + 1 retry = 2 launches (duplicate didn't add a third)
-    expect(launchCalls(calls)).toHaveLength(2)
-  })
-
-  it('waiting does NOT launch anything; resume via running reuses cached state', () => {
-    const { orch, calls } = makeSpy()
-    const entry = entryWithStack(['Plan Issue v2'])
-    const seen = new Set<string>()
-
-    startChain(entry, orch, calls)
-    // Waiting pauses the chain
-    const r = advanceChain(
+    feed(
       entry,
-      { workflowId: 'Plan Issue v2', status: 'waiting', executionId: 'w1' },
-      orch,
+      [
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'b0' },
+        { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' },
+        { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b2' },
+      ],
       seen,
     )
-    expect(r.launches).toBe(0)
 
-    // Running resumes (treated as confirmation since step is already running)
-    const r2 = advanceChain(
-      entry,
-      { workflowId: 'Plan Issue v2', status: 'running', executionId: 'r1' },
-      orch,
-      seen,
-    )
-    expect(r2.launches).toBe(0)
+    const dup = feed(entry, [{ workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' }], seen)
+
+    expect(dup[0]!.deduplicated).toBe(true)
+    expect(dup[0]!.launches).toHaveLength(0)
   })
 
-  it('cancel_issue calls orchestration.stopSession then transitions to cancelled', () => {
-    const { orch, calls } = makeSpy()
-    const entry = entryWithStack(['Plan Issue v2'], 'sess-cancel')
-    void orch.stopSession(entry.sessionId!)
-    expect(calls.find((c) => c.method === 'stopSession')).toEqual({
-      method: 'stopSession',
-      args: ['sess-cancel'],
-    })
+  it('waiting does NOT launch; running after waiting is also a no-op', () => {
+    const entry = entryWithStack(['Plan Issue v2'])
+    startChain(entry)
+
+    const seen = new Set<string>()
+    const results = feed(
+      entry,
+      [
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'r0' },
+        { workflowId: 'Plan Issue v2', status: 'waiting', executionId: 'w1' },
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'r1' },
+      ],
+      seen,
+    )
+
+    expect(results[1]!.launches).toHaveLength(0)
+    expect(results[1]!.transitionTo).toBeUndefined()
+    expect(results[2]!.launches).toHaveLength(0)
+  })
+
+  it('event without executionId is rejected (logged) and not processed', () => {
+    const entry = entryWithStack(['Plan Issue v2'])
+    startChain(entry)
+
+    let logged = ''
+    const r = processWorkflowEvent(
+      entry,
+      { workflowId: 'Plan Issue v2', status: 'done', sessionId: entry.sessionId ?? '' },
+      {
+        appliedExecutionEvents: new Set<string>(),
+        log: (msg) => {
+          logged = msg
+        },
+        buildIssueContext,
+        buildIssueParams,
+      },
+    )
+
+    expect(r.launches).toHaveLength(0)
+    expect(r.transitionTo).toBeUndefined()
+    expect(r.deduplicated).toBe(false)
+    expect(logged).toMatch(/without executionId/)
+  })
+
+  it('chain advance populates content and params via buildIssueContext/buildIssueParams', () => {
+    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2'])
+    startChain(entry)
+
+    const seen = new Set<string>()
+    const results = feed(
+      entry,
+      [
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
+        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' },
+      ],
+      seen,
+    )
+
+    const launch = results[1]!.launches[0]!
+    expect(launch.sessionId).toBe('sess-1')
+    expect(launch.workflowId).toBe('Build & Verify Auto v2')
+    expect(launch.content).toContain('**Title:** test issue')
+    expect(launch.params.issue_url).toBe('https://github.com/o/r/issues/42')
+    expect(launch.params.issue_number).toBe('42')
+    expect(launch.params.repo_key).toBe('o/r')
+    expect(launch.params.project_id).toBe('p')
+  })
+
+  it('last workflow done → entry transitions to done', () => {
+    const entry = entryWithStack(['Plan Issue v2'])
+    startChain(entry)
+
+    const seen = new Set<string>()
+    const results = feed(
+      entry,
+      [
+        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
+        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' },
+      ],
+      seen,
+    )
+
+    expect(results[1]!.launches).toHaveLength(0)
+    expect(results[1]!.finished).toBe(true)
+    expect(results[1]!.transitionTo).toBe('done')
+  })
+
+  it('purgeAppliedExecutionEvents removes only matching keys', () => {
+    const set = new Set<string>(['exec-1:done', 'exec-2:blocked', 'sw-fallback:done'])
+    purgeAppliedExecutionEvents(set, (k) => k.startsWith('exec-1:'))
+    expect(set.has('exec-1:done')).toBe(false)
+    expect(set.has('exec-2:blocked')).toBe(true)
+    expect(set.has('sw-fallback:done')).toBe(true)
+
+    purgeAppliedExecutionEvents(set, () => true)
+    expect(set.size).toBe(0)
   })
 })

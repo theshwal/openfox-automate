@@ -109,4 +109,89 @@ export function startChain(entry, driver, options) {
     });
     return stack;
 }
+/**
+ * Process one workflow.execution.changed event against the entry's
+ * executionStack. Returns the side-effects the caller should apply
+ * (transitions, launches). The function itself only mutates the
+ * entry's executionStack via applyExecutionEvent.
+ *
+ * Idempotency: keyed by `${executionId}:${status}`. Without executionId,
+ * the event is rejected (warning + no-op) so we never confuse two
+ * distinct retry attempts with the same status.
+ */
+export function processWorkflowEvent(entry, event, deps) {
+    if (!event.sessionId || !event.status) {
+        return { launches: [], dedupKey: null, deduplicated: false };
+    }
+    if (!event.executionId) {
+        deps.log?.(`[openfox-automate] workflow.execution.changed without executionId: status=${event.status} workflowId=${event.workflowId ?? '?'} sessionId=${event.sessionId}; ignored`);
+        return { launches: [], dedupKey: null, deduplicated: false };
+    }
+    const dedupKey = `${event.executionId}:${event.status}`;
+    if (deps.appliedExecutionEvents.has(dedupKey)) {
+        return { launches: [], dedupKey, deduplicated: true };
+    }
+    deps.appliedExecutionEvents.add(dedupKey);
+    const stack = entry.executionStack ?? [];
+    const idx = stack.findIndex((s) => s.status === 'running');
+    if (idx < 0) {
+        return { launches: [], dedupKey, deduplicated: false };
+    }
+    const prevRetry = stack[idx].retryCount;
+    const outcome = applyExecutionEvent(stack, idx, { status: event.status });
+    const launches = [];
+    let transitionTo;
+    let blockedReason;
+    if (outcome.finished && !outcome.blocked) {
+        transitionTo = 'done';
+    }
+    else if (outcome.blocked) {
+        transitionTo = 'blocked';
+        blockedReason = `workflow ${event.workflowId ?? stack[idx].workflowId} blocked`;
+    }
+    else if (event.status === 'done' && idx + 1 < stack.length) {
+        // Chain advance: launch the next workflow
+        const nextStep = stack[idx + 1];
+        if (entry.sessionId) {
+            launches.push({
+                sessionId: entry.sessionId,
+                workflowId: nextStep.workflowId,
+                content: deps.buildIssueContext(entry),
+                params: deps.buildIssueParams(entry),
+            });
+        }
+    }
+    else if (event.status === 'blocked' && stack[idx].retryCount > prevRetry) {
+        // Retry-once kicked in: relaunch the same workflow.
+        if (entry.sessionId) {
+            launches.push({
+                sessionId: entry.sessionId,
+                workflowId: stack[idx].workflowId,
+                content: deps.buildIssueContext(entry),
+                params: deps.buildIssueParams(entry),
+            });
+        }
+    }
+    return {
+        launches,
+        transitionTo,
+        blockedReason,
+        dedupKey,
+        deduplicated: false,
+        finished: outcome.finished,
+        waiting: outcome.waiting,
+    };
+}
+/**
+ * Remove all dedup keys for a given sessionId. Call this when an entry
+ * transitions to a terminal status (done/blocked/cancelled) so the
+ * appliedExecutionEvents Set doesn't grow unbounded over a long-running
+ * OpenFox instance.
+ */
+export function purgeAppliedExecutionEvents(set, predicate) {
+    for (const key of [...set]) {
+        if (predicate(key))
+            set.delete(key);
+    }
+}
 //# sourceMappingURL=chain.js.map
