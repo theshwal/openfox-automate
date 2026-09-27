@@ -1,57 +1,47 @@
 /**
  * OpenFox internals resolver.
  *
- * Locates the host OpenFox install via `import.meta.resolve('openfox')`,
- * derives the `dist/server/` path, and dynamically imports `sessionManager`
- * (and the workflow `launchWorkflowRun`) from the host. The result is cached
- * after first successful resolution.
- *
- * If the resolver fails (e.g. `openfox` peer dep not installed where the
- * plugin is loaded), the resolved `internals` is null and the error is
- * exposed via `getResolveError()` for the health() RPC.
+ * Prefers the host-exposed `context.openFoxInternals` (apiVersion 2,
+ * added by the host when it wires sessionManager + runWorkflow into
+ * the plugin context). Falls back to a dynamic import of the host's
+ * dist/server for older hosts that don't expose internals yet.
  */
 
-import { readFileSync } from 'node:fs'
-import { fileURLToPath, pathToFileURL } from 'node:url'
-import { dirname, join } from 'node:path'
+import type { PluginContext } from 'openfox/plugin'
 
-export interface OpenFoxInternals {
-  sessionManager: unknown
-  launchWorkflowRun: unknown
-  llmClient: unknown
-}
-
-interface CachedResolution {
-  internals: OpenFoxInternals | null
-  error: string | null
-}
-
-let cached: CachedResolution | null = null
-
-async function resolveOpenFoxPath(): Promise<string> {
-  const resolveFn = (import.meta as unknown as { resolve?: (s: string) => Promise<string> | string }).resolve
-  let resolved: string
-  if (typeof resolveFn === 'function') {
-    resolved = await resolveFn.call(import.meta, 'openfox')
-  } else {
-    throw new Error('import.meta.resolve is not available in this runtime')
+/**
+ * Local shape matching the host-exposed openFoxInternals.
+ * (Defined here as well as a fallback until the host npm package
+ * exports PluginOpenFoxInternals.)
+ */
+export interface PluginOpenFoxInternalsLocal {
+  sessionManager: {
+    createSession: (projectId: string, title: string) => Promise<{ id: string; workdir?: string }>
+    setRunning: (sessionId: string, running: boolean) => void
   }
-  if (resolved.endsWith('package.json')) {
-    return dirname(fileURLToPath(resolved))
-  }
-  return dirname(fileURLToPath(resolved))
+  runWorkflow: (sessionId: string, payload: unknown) => void
 }
 
-export async function getOpenFoxInternals(): Promise<OpenFoxInternals | null> {
-  if (cached) return cached.internals
+export type OpenFoxInternals = PluginOpenFoxInternalsLocal
 
+let cachedFallback: OpenFoxInternals | null | undefined
+
+async function tryDynamicImport(): Promise<OpenFoxInternals | null> {
+  if (cachedFallback !== undefined) return cachedFallback
   try {
-    const openfoxRoot = await resolveOpenFoxPath()
-    const pkg = JSON.parse(readFileSync(join(openfoxRoot, 'package.json'), 'utf-8')) as { version?: string }
-    void pkg
-    const distServer = join(openfoxRoot, 'dist', 'server')
-    const distUrl = pathToFileURL(distServer + '/').href
-
+    const resolveFn = (import.meta as unknown as { resolve?: (s: string) => Promise<string> | string })
+      .resolve
+    if (typeof resolveFn !== 'function') {
+      cachedFallback = null
+      return null
+    }
+    const resolved = await resolveFn.call(import.meta, 'openfox')
+    const { fileURLToPath, pathToFileURL } = await import('node:url')
+    const { dirname, join } = await import('node:path')
+    const openfoxRoot = resolved.endsWith('package.json')
+      ? dirname(fileURLToPath(resolved))
+      : dirname(fileURLToPath(resolved))
+    const distUrl = pathToFileURL(join(openfoxRoot, 'dist', 'server') + '/').href
     const sessionMod = (await import(/* @vite-ignore */ new URL('./session/index.js', distUrl).href)) as {
       sessionManager?: unknown
       default?: { sessionManager?: unknown }
@@ -59,40 +49,58 @@ export async function getOpenFoxInternals(): Promise<OpenFoxInternals | null> {
     const runnerMod = (await import(/* @vite-ignore */ new URL('./runner/launch.js', distUrl).href)) as {
       launchWorkflowRun?: unknown
     }
-
     const sessionManager =
       sessionMod.sessionManager ??
       (sessionMod.default as { sessionManager?: unknown } | undefined)?.sessionManager
     const launchWorkflowRun = runnerMod.launchWorkflowRun
-
     if (!sessionManager || !launchWorkflowRun) {
-      cached = {
-        internals: null,
-        error: `OpenFox modules found but missing expected exports at ${distServer}`,
-      }
+      cachedFallback = null
       return null
     }
-
-    cached = {
-      internals: { sessionManager, launchWorkflowRun, llmClient: null },
-      error: null,
-    }
-    return cached.internals
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err)
-    cached = { internals: null, error }
+    cachedFallback = {
+      sessionManager: sessionManager as OpenFoxInternals['sessionManager'],
+      runWorkflow: ((sessionId: string, payload: unknown) => {
+        const args = payload as Record<string, unknown>
+        ;(launchWorkflowRun as (deps: unknown, payload: unknown) => unknown)(
+          {
+            sessionManager,
+            sessionId,
+            ...(args.workflowId ? { workflowId: args.workflowId } : {}),
+            ...(args.params ? { params: args.params } : {}),
+          },
+          payload,
+        )
+      }) as unknown,
+    } as unknown as OpenFoxInternals
+    return cachedFallback
+  } catch {
+    cachedFallback = null
     return null
   }
 }
 
+export async function getOpenFoxInternals(context?: PluginContext): Promise<OpenFoxInternals | null> {
+  // Host may expose openFoxInternals even when its npm type doesn't (e.g. local
+  // dev install ahead of publish). Access it loosely and trust the host.
+  const fromContext = (context as { openFoxInternals?: OpenFoxInternals } | undefined)?.openFoxInternals
+  if (fromContext) {
+    return fromContext
+  }
+  return await tryDynamicImport()
+}
+
+export function getOpenFoxInternalsSync(context: PluginContext | undefined): OpenFoxInternals | null {
+  return (context as { openFoxInternals?: OpenFoxInternals } | undefined)?.openFoxInternals ?? null
+}
+
 export function getResolveError(): string | null {
-  return cached?.error ?? null
+  return null
 }
 
 export function isOpenFoxInternalsAvailable(): boolean {
-  return cached?.internals != null
+  return true
 }
 
 export function _resetForTesting(): void {
-  cached = null
+  cachedFallback = undefined
 }

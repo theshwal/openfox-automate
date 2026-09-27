@@ -6,7 +6,7 @@
  * the canonical interaction. The plugin only acts when explicitly
  * configured to.
  */
-import { addIssueLabel, assignIssue, createIssueComment, removeIssueLabel, setIssueState, } from './github.js';
+import { addIssueLabel, assignIssue, createIssueComment, removeIssueLabel, setIssueState } from './github.js';
 export function renderTemplate(template, ctx) {
     return template
         .replace(/\{\{title\}\}/g, ctx.title)

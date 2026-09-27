@@ -40,6 +40,15 @@ async function scanAll(rt) {
     if (!token) {
         return { added: 0, skipped: 0, errors: ['missing github.token'] };
     }
+    // L1 rate-limit backoff: if a previous scan hit the limit, wait until reset.
+    if (rt.rateLimitedUntil && Date.now() < rt.rateLimitedUntil) {
+        return {
+            added: 0,
+            skipped: 0,
+            errors: [`rate-limited until ${new Date(rt.rateLimitedUntil).toISOString()}`],
+        };
+    }
+    rt.rateLimitedUntil = null;
     const repos = parseRepoMapping(settings['repos.mapping']);
     if (repos.length === 0) {
         return { added: 0, skipped: 0, errors: ['no repos mapped'] };
@@ -180,7 +189,7 @@ async function spawnEntry(rt, entry) {
     };
     await rt.store.update(updated);
     try {
-        const session = await spawnSessionFor(updated);
+        const session = await spawnSessionFor(updated, { context: rt.context });
         if (session.id)
             updated.sessionId = session.id;
         await rt.store.update(updated);
@@ -209,8 +218,8 @@ function createLaunchDriver(rt) {
         },
     };
 }
-async function healthCheck(rt) {
-    const settings = readSettingsFromContext(rt.context);
+async function healthCheck(rt, context) {
+    const settings = readSettingsFromContext(context);
     const token = settings['github.token'] ?? '';
     const tokenRes = token
         ? await validateToken(token)
@@ -250,9 +259,16 @@ async function healthCheck(rt) {
             mappingIssues.push(`malformed line: ${trimmed}`);
         }
     }
+    const ctxInternals = context
+        .openFoxInternals;
+    const hasInternals = Boolean(ctxInternals?.sessionManager);
+    const hasRunner = Boolean(ctxInternals && typeof ctxInternals.runWorkflow === 'function');
     return {
         github: { tokenValid: tokenRes.valid, rateLimitRemaining: tokenRes.rateLimit.remaining, reposAccessible },
-        openFoxInternals: { sessionManager: 'missing', launchWorkflowRun: 'missing' },
+        openFoxInternals: {
+            sessionManager: hasInternals ? 'ok' : 'missing',
+            launchWorkflowRun: hasRunner ? 'ok' : 'missing',
+        },
         workflows,
         projects,
         mapping: { valid: mappingIssues.length === 0, issues: mappingIssues },
@@ -274,6 +290,7 @@ export function register(registry) {
         timer: null,
         paused: false,
         lastScanAt: null,
+        rateLimitedUntil: null,
         executions: new Map(),
     };
     registry.registerSettings(settingsSchema);
@@ -322,7 +339,7 @@ export function register(registry) {
         timestamp: new Date().toISOString(),
     }));
     registry.registerRpc('scan_now', async () => scanAll(rt));
-    registry.registerRpc('health', async () => healthCheck(rt));
+    registry.registerRpc('health', async () => healthCheck(rt, context));
     registry.registerRpc('get_queue', async (params) => {
         const p = (params ?? {});
         const active = await rt.store.loadActive();
