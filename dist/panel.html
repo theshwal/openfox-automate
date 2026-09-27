@@ -15,10 +15,16 @@
         --warn: #f59e0b;
         --danger: #ef4444;
       }
-      * { box-sizing: border-box; }
+      * {
+        box-sizing: border-box;
+      }
       body {
         margin: 0;
-        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          sans-serif;
         background: var(--bg);
         color: var(--text);
         font-size: 13px;
@@ -31,7 +37,11 @@
         border-bottom: 1px solid var(--border);
         background: var(--panel);
       }
-      header h1 { font-size: 14px; margin: 0; flex: 1; }
+      header h1 {
+        font-size: 14px;
+        margin: 0;
+        flex: 1;
+      }
       .badge {
         padding: 2px 8px;
         border-radius: 9999px;
@@ -41,25 +51,44 @@
         color: #1a1a1a;
         display: none;
       }
-      .badge.show { display: inline-block; }
-      .badge.success { background: var(--success); color: #052e16; }
-      .badge.danger { background: var(--danger); color: #450a0a; }
-      .tabs { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid var(--border); }
+      .badge.show {
+        display: inline-block;
+      }
+      .badge.success {
+        background: var(--success);
+        color: #052e16;
+      }
+      .badge.danger {
+        background: var(--danger);
+        color: #450a0a;
+      }
+      .tabs {
+        display: flex;
+        gap: 4px;
+        padding: 0 16px;
+        border-bottom: 1px solid var(--border);
+      }
       .tab {
         padding: 8px 14px;
         cursor: pointer;
         color: var(--muted);
         border-bottom: 2px solid transparent;
       }
-      .tab.active { color: var(--text); border-bottom-color: var(--accent); }
-      main { padding: 16px; }
+      .tab.active {
+        color: var(--text);
+        border-bottom-color: var(--accent);
+      }
+      main {
+        padding: 16px;
+      }
       .toolbar {
         display: flex;
         gap: 8px;
         margin-bottom: 12px;
         align-items: center;
       }
-      .toolbar input, .toolbar select {
+      .toolbar input,
+      .toolbar select {
         background: var(--bg);
         color: var(--text);
         border: 1px solid var(--border);
@@ -67,7 +96,9 @@
         padding: 4px 8px;
         font: inherit;
       }
-      .toolbar input { flex: 1; }
+      .toolbar input {
+        flex: 1;
+      }
       .toolbar button {
         background: var(--accent);
         color: #082f49;
@@ -78,14 +109,26 @@
         font: inherit;
         font-weight: 600;
       }
-      .toolbar button.secondary { background: var(--border); color: var(--text); }
-      table { width: 100%; border-collapse: collapse; }
-      th, td {
+      .toolbar button.secondary {
+        background: var(--border);
+        color: var(--text);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
         text-align: left;
         padding: 6px 8px;
         border-bottom: 1px solid var(--border);
       }
-      th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+      th {
+        color: var(--muted);
+        font-weight: 500;
+        font-size: 11px;
+        text-transform: uppercase;
+      }
       td button {
         background: var(--border);
         color: var(--text);
@@ -95,22 +138,73 @@
         cursor: pointer;
         font: inherit;
       }
-      .status-queued { color: var(--muted); }
-      .status-running { color: var(--accent); }
-      .status-done { color: var(--success); }
-      .status-failed { color: var(--danger); }
-      .status-cancelled { color: var(--muted); }
-      .status-blocked { color: var(--warn); }
-      .sparkline { display: flex; align-items: flex-end; gap: 4px; height: 60px; margin: 12px 0; }
-      .sparkline .bar { flex: 1; min-height: 2px; background: var(--border); border-radius: 2px; position: relative; }
-      .sparkline .bar .done { background: var(--success); }
-      .sparkline .bar .failed { background: var(--danger); }
-      .empty { color: var(--muted); padding: 24px; text-align: center; }
-      .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
-      .metric { background: var(--panel); padding: 12px; border-radius: 6px; border: 1px solid var(--border); }
-      .metric .label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
-      .metric .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
-      .hidden { display: none; }
+      .status-queued {
+        color: var(--muted);
+      }
+      .status-running {
+        color: var(--accent);
+      }
+      .status-done {
+        color: var(--success);
+      }
+      .status-failed {
+        color: var(--danger);
+      }
+      .status-cancelled {
+        color: var(--muted);
+      }
+      .status-blocked {
+        color: var(--warn);
+      }
+      .sparkline {
+        display: flex;
+        align-items: flex-end;
+        gap: 4px;
+        height: 60px;
+        margin: 12px 0;
+      }
+      .sparkline .bar {
+        flex: 1;
+        min-height: 2px;
+        background: var(--border);
+        border-radius: 2px;
+        position: relative;
+      }
+      .sparkline .bar .done {
+        background: var(--success);
+      }
+      .sparkline .bar .failed {
+        background: var(--danger);
+      }
+      .empty {
+        color: var(--muted);
+        padding: 24px;
+        text-align: center;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+      }
+      .metric {
+        background: var(--panel);
+        padding: 12px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+      }
+      .metric .label {
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+      }
+      .metric .value {
+        font-size: 22px;
+        font-weight: 700;
+        margin-top: 4px;
+      }
+      .hidden {
+        display: none;
+      }
     </style>
   </head>
   <body>
@@ -175,8 +269,11 @@
 
         function escapeHtml(s) {
           return String(s == null ? '' : s)
-            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
         }
 
         function renderActive() {
@@ -195,7 +292,8 @@
             el.innerHTML = '<div class="empty">No issues in queue</div>'
             return
           }
-          let html = '<table><thead><tr><th>#</th><th>Status</th><th>Title</th><th>Step</th></tr></thead><tbody>'
+          let html =
+            '<table><thead><tr><th>#</th><th>Status</th><th>Title</th><th>Step</th></tr></thead><tbody>'
           for (const e of rows) {
             const step = (e.executionStack || []).find((s) => s.status === 'running') || {}
             html += `<tr>
@@ -215,7 +313,8 @@
             el.innerHTML = '<div class="empty">No history yet</div>'
             return
           }
-          let html = '<table><thead><tr><th>#</th><th>Status</th><th>Title</th><th>Finished</th><th></th></tr></thead><tbody>'
+          let html =
+            '<table><thead><tr><th>#</th><th>Status</th><th>Title</th><th>Finished</th><th></th></tr></thead><tbody>'
           for (const e of history) {
             const canReprocess = ['done', 'failed', 'cancelled'].includes(e.status)
             const btn = canReprocess
@@ -247,7 +346,10 @@
             { label: 'Throughput (/h)', value: metrics.throughputPerHour },
           ]
           document.getElementById('metricsGrid').innerHTML = items
-            .map((m) => `<div class="metric"><div class="label">${m.label}</div><div class="value">${m.value}</div></div>`)
+            .map(
+              (m) =>
+                `<div class="metric"><div class="label">${m.label}</div><div class="value">${m.value}</div></div>`,
+            )
             .join('')
           const sl = document.getElementById('sparkline')
           const max = Math.max(1, ...metrics.sparkline.map((d) => (d.done || 0) + (d.failed || 0)))
@@ -271,19 +373,23 @@
         }
 
         function activate(tab) {
-          document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab))
+          document
+            .querySelectorAll('.tab')
+            .forEach((t) => t.classList.toggle('active', t.dataset.tab === tab))
           document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('hidden', p.id !== tab))
           if (tab === 'active') renderActive()
           else if (tab === 'history') renderHistory()
           else if (tab === 'metrics') renderMetrics()
         }
 
-        document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => activate(t.dataset.tab)))
+        document
+          .querySelectorAll('.tab')
+          .forEach((t) => t.addEventListener('click', () => activate(t.dataset.tab)))
         document.getElementById('filterText').addEventListener('input', renderActive)
         document.getElementById('filterStatus').addEventListener('change', renderActive)
-        document.getElementById('scanNow').addEventListener('click', () =>
-          rpc('scan_now').catch((e) => alert('scan_now: ' + e.message)),
-        )
+        document
+          .getElementById('scanNow')
+          .addEventListener('click', () => rpc('scan_now').catch((e) => alert('scan_now: ' + e.message)))
         document.getElementById('healthCheck').addEventListener('click', async () => {
           try {
             const h = await rpc('health')
@@ -344,7 +450,8 @@
                 const payload = msg.payload || {}
                 if (payload.panelId !== 'issue-queue-panel') return
                 if (payload.key === 'queue') queue = Array.isArray(payload.value) ? payload.value : queue
-                if (payload.key === 'history') history = Array.isArray(payload.value) ? payload.value : history
+                if (payload.key === 'history')
+                  history = Array.isArray(payload.value) ? payload.value : history
                 if (payload.key === 'metrics') metrics = payload.value || metrics
                 if (payload.key === 'autoScan') autoScan = payload.value || autoScan
                 if (payload.key === 'state') state = payload.value || state

@@ -12,6 +12,7 @@ import { fetchAllOpenIssues, getIssue, listIssueComments, validateToken, isPullR
 import { spawnSessionFor } from './spawner.js';
 import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent } from './chain.js';
 import { createOrchestration } from './orchestration.js';
+import { getHostInternal } from './resolve-openfox.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
 import { DEFAULT_SETTINGS } from './types.js';
@@ -272,15 +273,15 @@ async function healthCheck(rt, context) {
             mappingIssues.push(`malformed line: ${trimmed}`);
         }
     }
-    const ctxInternals = context
-        .openFoxInternals;
-    const hasInternals = Boolean(ctxInternals?.sessionManager);
-    const hasRunner = Boolean(ctxInternals && typeof ctxInternals.runWorkflow === 'function');
+    const internal = await getHostInternal(context);
+    const hasFacade = internal?.kind === 'facade';
+    const hasLegacy = internal?.kind === 'legacy';
     return {
         github: { tokenValid: tokenRes.valid, rateLimitRemaining: tokenRes.rateLimit.remaining, reposAccessible },
         openFoxInternals: {
-            sessionManager: hasInternals ? 'ok' : 'missing',
-            launchWorkflowRun: hasRunner ? 'ok' : 'missing',
+            sessionManager: internal ? 'ok' : 'missing',
+            launchWorkflowRun: hasLegacy ? 'ok' : hasFacade ? 'ok' : 'missing',
+            host: hasFacade ? 'ok' : 'missing',
         },
         workflows,
         projects,

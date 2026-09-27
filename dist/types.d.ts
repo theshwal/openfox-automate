@@ -56,6 +56,7 @@ export interface HealthReport {
     openFoxInternals: {
         sessionManager: 'ok' | 'missing';
         launchWorkflowRun: 'ok' | 'missing';
+        host: 'ok' | 'missing';
     };
     workflows: Record<string, 'ok' | 'not-found'>;
     projects: Record<string, 'ok' | 'missing'>;
