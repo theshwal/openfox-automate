@@ -65,6 +65,7 @@
     "@types/node": "^24.0.0",
     "@vitest/coverage-v8": "^2.1.0",
     "eslint": "^9.39.5",
+    "openfox": ">=2.0.140",
     "prettier": "^3.9.9",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.70.1",
