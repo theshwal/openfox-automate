@@ -1,20 +1,40 @@
 /**
  * OpenFox internals resolver.
  *
- * Prefers the host-exposed `context.openFoxInternals` (apiVersion 2,
- * added by the host when it wires sessionManager + runWorkflow into
- * the plugin context). Falls back to a dynamic import of the host's
- * dist/server for older hosts that don't expose internals yet.
+ * Prefers the host-exposed `context.host` (Plugin API v2.1+, exposes
+ * `sessions.create / sessions.stop / workflows.launch`). Falls back to the
+ * older `context.openFoxInternals` shape for backward compatibility, then to
+ * a dynamic import of the host's dist/server for hosts that don't expose
+ * either.
  */
 
 import type { PluginContext } from 'openfox/plugin'
 
 /**
- * Local shape matching the host-exposed openFoxInternals.
- * (Defined here as well as a fallback until the host npm package
- * exports PluginOpenFoxInternals.)
+ * Minimal surface the plugin needs from the host. The host exposes this via
+ * `context.host` on hosts that support plugin orchestration (>=2.1).
  */
-export interface PluginOpenFoxInternalsLocal {
+export interface PluginHostFacade {
+  sessions: {
+    create(input: { projectId: string; title?: string }): Promise<{ sessionId: string; workdir?: string }>
+    stop(sessionId: string): void
+  }
+  workflows: {
+    launch(input: {
+      sessionId: string
+      workflowId: string
+      params?: Record<string, string>
+      content?: string
+      subGroup?: string
+    }): void
+  }
+}
+
+/**
+ * Legacy surface (apiVersion 2.0). Kept as a fallback for hosts that
+ * expose `openFoxInternals` but not the newer `host` shape.
+ */
+export interface PluginOpenFoxInternalsLegacy {
   sessionManager: {
     createSession: (projectId: string, title: string) => Promise<{ id: string; workdir?: string }>
     setRunning: (sessionId: string, running: boolean) => void
@@ -22,11 +42,13 @@ export interface PluginOpenFoxInternalsLocal {
   runWorkflow: (sessionId: string, payload: unknown) => void
 }
 
-export type OpenFoxInternals = PluginOpenFoxInternalsLocal
+/** Discriminated union: 'kind' tag identifies the host surface. */
+export type PluginHostInternal =
+  { kind: 'facade'; facade: PluginHostFacade } | { kind: 'legacy'; legacy: PluginOpenFoxInternalsLegacy }
 
-let cachedFallback: OpenFoxInternals | null | undefined
+let cachedFallback: PluginHostInternal | null | undefined
 
-async function tryDynamicImport(): Promise<OpenFoxInternals | null> {
+async function tryDynamicImport(): Promise<PluginHostInternal | null> {
   if (cachedFallback !== undefined) return cachedFallback
   try {
     const resolveFn = (import.meta as unknown as { resolve?: (s: string) => Promise<string> | string })
@@ -58,47 +80,69 @@ async function tryDynamicImport(): Promise<OpenFoxInternals | null> {
       return null
     }
     cachedFallback = {
-      sessionManager: sessionManager as OpenFoxInternals['sessionManager'],
-      runWorkflow: ((sessionId: string, payload: unknown) => {
-        const args = payload as Record<string, unknown>
-        ;(launchWorkflowRun as (deps: unknown, payload: unknown) => unknown)(
-          {
-            sessionManager,
-            sessionId,
-            ...(args.workflowId ? { workflowId: args.workflowId } : {}),
-            ...(args.params ? { params: args.params } : {}),
-          },
-          payload,
-        )
-      }) as unknown,
-    } as unknown as OpenFoxInternals
-    return cachedFallback
+      kind: 'legacy',
+      legacy: {
+        sessionManager: sessionManager as PluginOpenFoxInternalsLegacy['sessionManager'],
+        runWorkflow: (sessionId: string, payload: unknown): void => {
+          const args = payload as Record<string, unknown>
+          const runner = launchWorkflowRun as (deps: unknown, payload: unknown) => unknown
+          runner(
+            {
+              sessionManager,
+              sessionId,
+              ...(args.workflowId ? { workflowId: args.workflowId } : {}),
+              ...(args.params ? { params: args.params } : {}),
+            },
+            payload,
+          )
+        },
+      },
+    }
+    return cachedFallback ?? null
   } catch {
     cachedFallback = null
     return null
   }
 }
 
-export async function getOpenFoxInternals(context?: PluginContext): Promise<OpenFoxInternals | null> {
-  // Host may expose openFoxInternals even when its npm type doesn't (e.g. local
-  // dev install ahead of publish). Access it loosely and trust the host.
-  const fromContext = (context as { openFoxInternals?: OpenFoxInternals } | undefined)?.openFoxInternals
-  if (fromContext) {
-    return fromContext
-  }
+/** Resolve the orchestration surface. */
+export async function getHostInternal(context?: PluginContext): Promise<PluginHostInternal | null> {
+  // Preferred: host exposes PluginHost facade via context.host
+  const hostFacade = (context as { host?: PluginHostFacade } | undefined)?.host
+  if (hostFacade) return { kind: 'facade', facade: hostFacade }
+
+  // Legacy: context.openFoxInternals
+  const legacy = (context as { openFoxInternals?: PluginOpenFoxInternalsLegacy } | undefined)
+    ?.openFoxInternals
+  if (legacy) return { kind: 'legacy', legacy }
+
+  // Last resort: dynamic import of the host's dist/server
   return await tryDynamicImport()
 }
 
-export function getOpenFoxInternalsSync(context: PluginContext | undefined): OpenFoxInternals | null {
-  return (context as { openFoxInternals?: OpenFoxInternals } | undefined)?.openFoxInternals ?? null
+/** Convenience: create session + launch each chain step. */
+export async function createSessionAndLaunch(
+  context: PluginContext,
+  entry: { repoKey: string; title: string },
+  chain: Array<{ workflowId: string }>,
+): Promise<{ sessionId: string } | null> {
+  const internal = await getHostInternal(context)
+  if (!internal) return null
+  if (internal.kind === 'facade') {
+    const session = await internal.facade.sessions.create({ projectId: entry.repoKey, title: entry.title })
+    for (const step of chain) {
+      internal.facade.workflows.launch({ sessionId: session.sessionId, workflowId: step.workflowId })
+    }
+    return { sessionId: session.sessionId }
+  }
+  for (const step of chain) {
+    internal.legacy.runWorkflow(/* sessionId will be set after create */ '', { workflowId: step.workflowId })
+  }
+  return null
 }
 
 export function getResolveError(): string | null {
   return null
-}
-
-export function isOpenFoxInternalsAvailable(): boolean {
-  return true
 }
 
 export function _resetForTesting(): void {

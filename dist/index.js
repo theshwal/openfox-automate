@@ -10,7 +10,7 @@ import { QueueStore, isTerminated, newEntryId } from './queue.js';
 import { orderQueue, findMissingDependencies } from './ordering.js';
 import { fetchAllOpenIssues, getIssue, listIssueComments, validateToken, isPullRequest } from './github.js';
 import { spawnSessionFor } from './spawner.js';
-import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent, } from './chain.js';
+import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent } from './chain.js';
 import { createOrchestration } from './orchestration.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';

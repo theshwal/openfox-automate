@@ -1,10 +1,11 @@
 /**
  * OpenFox internals resolver.
  *
- * Prefers the host-exposed `context.openFoxInternals` (apiVersion 2,
- * added by the host when it wires sessionManager + runWorkflow into
- * the plugin context). Falls back to a dynamic import of the host's
- * dist/server for older hosts that don't expose internals yet.
+ * Prefers the host-exposed `context.host` (Plugin API v2.1+, exposes
+ * `sessions.create / sessions.stop / workflows.launch`). Falls back to the
+ * older `context.openFoxInternals` shape for backward compatibility, then to
+ * a dynamic import of the host's dist/server for hosts that don't expose
+ * either.
  */
 let cachedFallback;
 async function tryDynamicImport() {
@@ -34,41 +35,61 @@ async function tryDynamicImport() {
             return null;
         }
         cachedFallback = {
-            sessionManager: sessionManager,
-            runWorkflow: ((sessionId, payload) => {
-                const args = payload;
-                launchWorkflowRun({
-                    sessionManager,
-                    sessionId,
-                    ...(args.workflowId ? { workflowId: args.workflowId } : {}),
-                    ...(args.params ? { params: args.params } : {}),
-                }, payload);
-            }),
+            kind: 'legacy',
+            legacy: {
+                sessionManager: sessionManager,
+                runWorkflow: (sessionId, payload) => {
+                    const args = payload;
+                    const runner = launchWorkflowRun;
+                    runner({
+                        sessionManager,
+                        sessionId,
+                        ...(args.workflowId ? { workflowId: args.workflowId } : {}),
+                        ...(args.params ? { params: args.params } : {}),
+                    }, payload);
+                },
+            },
         };
-        return cachedFallback;
+        return cachedFallback ?? null;
     }
     catch {
         cachedFallback = null;
         return null;
     }
 }
-export async function getOpenFoxInternals(context) {
-    // Host may expose openFoxInternals even when its npm type doesn't (e.g. local
-    // dev install ahead of publish). Access it loosely and trust the host.
-    const fromContext = context?.openFoxInternals;
-    if (fromContext) {
-        return fromContext;
-    }
+/** Resolve the orchestration surface. */
+export async function getHostInternal(context) {
+    // Preferred: host exposes PluginHost facade via context.host
+    const hostFacade = context?.host;
+    if (hostFacade)
+        return { kind: 'facade', facade: hostFacade };
+    // Legacy: context.openFoxInternals
+    const legacy = context
+        ?.openFoxInternals;
+    if (legacy)
+        return { kind: 'legacy', legacy };
+    // Last resort: dynamic import of the host's dist/server
     return await tryDynamicImport();
 }
-export function getOpenFoxInternalsSync(context) {
-    return context?.openFoxInternals ?? null;
+/** Convenience: create session + launch each chain step. */
+export async function createSessionAndLaunch(context, entry, chain) {
+    const internal = await getHostInternal(context);
+    if (!internal)
+        return null;
+    if (internal.kind === 'facade') {
+        const session = await internal.facade.sessions.create({ projectId: entry.repoKey, title: entry.title });
+        for (const step of chain) {
+            internal.facade.workflows.launch({ sessionId: session.sessionId, workflowId: step.workflowId });
+        }
+        return { sessionId: session.sessionId };
+    }
+    for (const step of chain) {
+        internal.legacy.runWorkflow(/* sessionId will be set after create */ '', { workflowId: step.workflowId });
+    }
+    return null;
 }
 export function getResolveError() {
     return null;
-}
-export function isOpenFoxInternalsAvailable() {
-    return true;
 }
 export function _resetForTesting() {
     cachedFallback = undefined;

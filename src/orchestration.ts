@@ -3,12 +3,12 @@
  *
  * The state machine in the plugin talks only to this interface, which
  * keeps it testable and decoupled from the concrete shape of the
- * PluginContext API exposed by the host (openFoxInternals vs the future
- * `host` rename vs a mock for tests).
+ * PluginContext API exposed by the host (the discriminated union in
+ * resolve-openfox.js).
  */
 
 import type { PluginContext } from 'openfox/plugin'
-import { getOpenFoxInternals } from './resolve-openfox.js'
+import { getHostInternal } from './resolve-openfox.js'
 
 export interface SessionLike {
   id: string
@@ -24,9 +24,9 @@ export interface LaunchWorkflowParams {
 }
 
 /**
- * Internal contract used by the plugin's chain orchestrator. The host
- * implements this (in-process today via context.openFoxInternals, or via a
- * dedicated `host` API in the future). Tests inject a fake.
+ * Default implementation that bridges to whichever host surface is exposed
+ * (`context.host` on Plugin API v2.1+, or legacy `context.openFoxInternals`
+ * on older hosts). Tests inject a fake via deps.
  */
 export interface OpenFoxOrchestration {
   createSession(projectId: string, title: string): Promise<SessionLike>
@@ -40,27 +40,28 @@ export interface OrchestrationDeps {
   launchWorkflow?: (params: LaunchWorkflowParams) => void
 }
 
-/**
- * Default implementation that bridges to `context.openFoxInternals`
- * (and falls back to dynamic import for older hosts).
- */
 export function createHostOrchestration(context: PluginContext): OpenFoxOrchestration {
   return {
     async createSession(projectId: string, title: string) {
-      const internals = await getOpenFoxInternals(context)
-      if (!internals) {
-        throw new Error('OpenFox internals are not available; cannot create session')
+      const internal = await getHostInternal(context)
+      if (!internal) {
+        throw new Error('OpenFox host orchestration is not available; cannot create session')
       }
-      const sm = internals.sessionManager as {
-        createSession: (p: string, t: string) => SessionLike | Promise<SessionLike>
+      if (internal.kind === 'facade') {
+        const s = await internal.facade.sessions.create({ projectId, title })
+        return { id: s.sessionId, ...(s.workdir !== undefined ? { workdir: s.workdir } : {}) }
       }
-      const session = await sm.createSession(projectId, title)
-      return session
+      const s = await internal.legacy.sessionManager.createSession(projectId, title)
+      return { id: s.id, ...(s.workdir !== undefined ? { workdir: s.workdir } : {}) }
     },
     async stopSession(sessionId: string) {
-      const internals = await getOpenFoxInternals(context)
-      if (!internals) return
-      const sm = internals.sessionManager as {
+      const internal = await getHostInternal(context)
+      if (!internal) return
+      if (internal.kind === 'facade') {
+        internal.facade.sessions.stop(sessionId)
+        return
+      }
+      const sm = internal.legacy.sessionManager as {
         stopSession?: (id: string) => Promise<void> | void
         setRunning?: (id: string, running: boolean) => void
       }
@@ -71,34 +72,28 @@ export function createHostOrchestration(context: PluginContext): OpenFoxOrchestr
       }
     },
     async launchWorkflow(params: LaunchWorkflowParams) {
-      const internals = await getOpenFoxInternals(context)
-      if (!internals) {
+      const internal = await getHostInternal(context)
+      if (!internal) {
         context.logger.warn(
-          'OpenFox internals are not available; cannot launch workflow',
+          'OpenFox host orchestration is not available; cannot launch workflow',
           params as unknown as Record<string, unknown>,
         )
         return
       }
-      const fn = internals.runWorkflow
-      if (typeof fn !== 'function') {
-        context.logger.warn('runWorkflow is not a function on openFoxInternals; cannot launch workflow')
+      if (internal.kind === 'facade') {
+        internal.facade.workflows.launch(params)
         return
       }
-      const payload = {
-        ...(params.workflowId ? { workflowId: params.workflowId } : {}),
+      internal.legacy.runWorkflow(params.sessionId, {
+        workflowId: params.workflowId,
         ...(params.params ? { params: params.params } : {}),
         ...(params.content !== undefined ? { content: params.content } : {}),
         ...(params.subGroup ? { subGroup: params.subGroup } : {}),
-      }
-      ;(fn as unknown as (sessionId: string, payload: unknown) => void)(params.sessionId, payload)
+      })
     },
   }
 }
 
-/**
- * Build an `OpenFoxOrchestration` from explicit deps (used by tests).
- * If a dep is missing, it falls back to the default implementation.
- */
 export function createOrchestration(
   context: PluginContext,
   deps: OrchestrationDeps = {},
@@ -121,7 +116,7 @@ export function createOrchestration(
         deps.launchWorkflow(params)
         return
       }
-      host.launchWorkflow(params)
+      void host.launchWorkflow(params)
     },
   }
 }

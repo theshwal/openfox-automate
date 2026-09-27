@@ -1,11 +1,8 @@
 /**
  * Session spawner.
  *
- * Uses `context.openFoxInternals` (host-exposed) to create sessions.
- * The actual workflow chain driving is delegated to `chain.ts`.
- *
- * In tests, the spawner takes an injected `createSession` function so unit
- * tests do not need a real OpenFox host.
+ * Uses `context.host` (Plugin API v2.1+) when available, with fallback
+ * to `context.openFoxInternals` (legacy) and finally to a dynamic import.
  */
 import type { PluginContext } from 'openfox/plugin';
 import type { QueueEntry } from './types.js';
