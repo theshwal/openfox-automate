@@ -162,11 +162,102 @@ describe.skipIf(!SHOULD_RUN)('openfox-automate e2e (live OpenFox)', () => {
   })
 
   it('no GitHub writes happen via plugin RPCs when post.* settings are all false (M6)', async () => {
-    // The plugin only calls GitHub on scan_now (if token set) and on postProcess.
-    // With no token and post.* all false, scan_now + get_queue etc. should not write.
     const queue = (await rpc('get_queue', {})) as QueueEntryLike[]
     expect(Array.isArray(queue)).toBe(true)
-    // We don't have direct writes count from RPCs; we assert no error side-effects.
+  })
+
+  it('plugin UI contributions match the documented shape (E4-E6, UI1-UI3)', async () => {
+    const res = await fetch(`${BASE}/api/plugins/ui`)
+    expect(res.ok).toBe(true)
+    const data = (await res.json()) as {
+      contributions: {
+        actions: Array<{ id: string; slot: string; onActivate: { kind: string } }>
+        panels: Array<{ id: string; kind: string; title: { en: string } }>
+      }
+    }
+    const issueQueueAction = data.contributions.actions.find((a) => a.id === 'open-issue-queue')
+    expect(issueQueueAction).toBeDefined()
+    expect(issueQueueAction?.slot).toBe('header.actions')
+    expect(issueQueueAction?.onActivate.kind).toBe('openPanel')
+
+    const panel = data.contributions.panels.find((p) => p.id === 'issue-queue-panel')
+    expect(panel).toBeDefined()
+    expect(panel?.kind).toBe('declarative')
+    expect(panel?.title.en).toContain('Issue Queue')
+  })
+
+  it('plugin RPC surface exposes all 14 documented methods (R1-R4 + base)', async () => {
+    const res = await fetch(`${BASE}/api/plugins`)
+    expect(res.ok).toBe(true)
+    const data = (await res.json()) as {
+      plugins: Array<{ packageName: string; contributions: { rpcMethods: number } }>
+    }
+    const plugin = data.plugins.find((p) => p.packageName === 'openfox-automate')
+    expect(plugin).toBeDefined()
+    expect(plugin?.contributions.rpcMethods).toBeGreaterThanOrEqual(14)
+  })
+
+  it('plugin settings schema exposes 19 fields (B1-B14 + extensions)', async () => {
+    const res = await fetch(`${BASE}/api/plugins/openfox-automate/settings`)
+    expect(res.ok).toBe(true)
+    const data = (await res.json()) as {
+      schema: { fields: Array<{ key: string; type: string }> }
+      values: Record<string, unknown>
+    }
+    const keys = data.schema.fields.map((f) => f.key)
+    expect(keys).toEqual(
+      expect.arrayContaining([
+        'github.token',
+        'repos.mapping',
+        'workflows.chain',
+        'workflows.repoOverrides',
+        'scan.refreshMinutes',
+        'scan.startupScan',
+        'scan.ignoreLabels',
+        'batch.maxConcurrency',
+        'batch.maxConcurrencyPerRepo',
+        'ordering.strategy',
+        'ordering.dependencyPattern',
+        'dryRun',
+        'history.retentionCount',
+        'post.closeOnSuccess',
+        'post.assignOnSuccess',
+        'post.commentTemplate',
+        'post.reprocessResetsRetryCount',
+        'pr.monitorEnabled',
+        'pr.urlRegex',
+      ]),
+    )
+  })
+
+  it('metrics() returns full shape including 7-day sparkline (MT1-MT3)', async () => {
+    const metrics = (await rpc('get_metrics')) as {
+      total: number
+      today: number
+      thisWeek: number
+      successRate: number
+      avgDurationMs: number | null
+      throughputPerHour: number
+      mostFailingWorkflow: string | null
+      sparkline: Array<{ day: string; done: number; failed: number }>
+    }
+    expect(metrics.sparkline.length).toBe(7)
+    for (const day of metrics.sparkline) {
+      expect(typeof day.day).toBe('string')
+      expect(day.day).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+      expect(typeof day.done).toBe('number')
+      expect(typeof day.failed).toBe('number')
+    }
+    expect(metrics.successRate).toBeGreaterThanOrEqual(0)
+    expect(metrics.successRate).toBeLessThanOrEqual(1)
+  })
+
+  it('settings update propagates to subsequent RPC calls', async () => {
+    await setPluginSetting('batch.maxConcurrency', 5)
+    const res = await fetch(`${BASE}/api/plugins/openfox-automate/settings`)
+    const data = (await res.json()) as { values: Record<string, unknown> }
+    expect(data.values['batch.maxConcurrency']).toBe(5)
+    await setPluginSetting('batch.maxConcurrency', 3)
   })
 })
 
