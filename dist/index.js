@@ -196,10 +196,16 @@ async function spawnEntry(rt, entry) {
         const session = await spawnSessionFor(updated, { context: rt.context });
         if (session.id)
             updated.sessionId = session.id;
-        await rt.store.update(updated);
         if (chain.length > 0) {
-            startChain(updated, createLaunchDriver(rt), { sessionId: updated.sessionId ?? '' });
+            // startChain returns a stack with the first workflow marked running —
+            // assign it back so subsequent reads (RPC, hooks, store) see the
+            // running status immediately, before the workflow fires its first
+            // workflow.execution.changed event.
+            updated.executionStack = startChain(updated, createLaunchDriver(rt), {
+                sessionId: updated.sessionId ?? '',
+            });
         }
+        await rt.store.update(updated);
     }
     catch (e) {
         const err = e instanceof Error ? e.message : String(e);

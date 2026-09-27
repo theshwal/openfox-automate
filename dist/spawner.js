@@ -9,8 +9,13 @@ export function buildSessionTitle(entry) {
     return `[issue #${entry.issueNumber}] ${entry.title}`.slice(0, 200);
 }
 export async function spawnSessionFor(entry, deps = {}) {
+    // The host's sessionManager requires a real projectId (UUID). The plugin
+    // resolves repoKey → host-projectId when the entry is added
+    // (see `repos.mapping`), so by spawn time `entry.projectId` is the value
+    // the host understands.
+    const hostProjectId = entry.projectId;
     if (deps.createSession) {
-        return deps.createSession(entry.repoKey, buildSessionTitle(entry));
+        return deps.createSession(hostProjectId, buildSessionTitle(entry));
     }
     const internal = await getHostInternal(deps.context);
     if (!internal) {
@@ -18,12 +23,12 @@ export async function spawnSessionFor(entry, deps = {}) {
     }
     if (internal.kind === 'facade') {
         const s = await internal.facade.sessions.create({
-            projectId: entry.repoKey,
+            projectId: hostProjectId,
             title: buildSessionTitle(entry),
         });
         return { id: s.sessionId, ...(s.workdir !== undefined ? { workdir: s.workdir } : {}) };
     }
-    return await internal.legacy.sessionManager.createSession(entry.repoKey, buildSessionTitle(entry));
+    return await internal.legacy.sessionManager.createSession(hostProjectId, buildSessionTitle(entry));
 }
 export async function stopSession(sessionId, deps = {}) {
     if (deps.stopSession) {

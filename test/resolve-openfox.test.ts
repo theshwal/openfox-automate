@@ -52,7 +52,9 @@ afterEach(() => _resetForTesting())
 describe('getHostInternal', () => {
   it('returns facade when context.host is provided', async () => {
     const facade = makeFacade()
-    const internal = await getHostInternal({ host: facade } as unknown as Parameters<typeof getHostInternal>[0])
+    const internal = await getHostInternal({ host: facade } as unknown as Parameters<
+      typeof getHostInternal
+    >[0])
     expect(internal).not.toBeNull()
     expect(internal?.kind).toBe('facade')
     if (internal?.kind === 'facade') {
