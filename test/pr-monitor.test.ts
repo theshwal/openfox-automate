@@ -126,7 +126,7 @@ describe('monitorPRs', () => {
       expect.objectContaining({
         level: 'warning',
         actions: expect.arrayContaining([
-          expect.objectContaining({ onActivate: expect.objectContaining({ method: 'reprocess' }) }),
+          expect.objectContaining({ onActivate: expect.objectContaining({ method: 'automate.reprocess' }) }),
         ]),
       }),
     )

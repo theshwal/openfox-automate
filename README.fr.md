@@ -145,7 +145,7 @@ Ouvrez le panneau **Issue Queue** pour :
 | `tools` | `issue_queue_list`, `issue_queue_status` |
 | `settings` | Formulaire de settings auto-rendu |
 | `ui` | `issue-queue-panel`, action header |
-| `rpc` | `scan_now`, `start_issue`, `cancel_issue`, `reprocess`, `health`, `getQueue`, `getHistory`, `getMetrics`, `ping` |
+| `rpc` | `automate.scanNow`, `automate.startIssue`, `automate.cancelIssue`, `automate.reprocess`, `automate.health`, `automate.getQueue`, `automate.getHistory`, `automate.getMetrics`, `automate.ping` |
 | `hooks` | `workflow.execution.changed`, `task.completed`, `session.created`, `tool.completed` |
 | `notifications` | Toasts : entrée ajoutée, chaîne terminée, retry, erreurs |
 

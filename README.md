@@ -180,7 +180,7 @@ Open the **Issue Queue** panel to:
 | `tools` | `issue_queue_list`, `issue_queue_status` |
 | `settings` | Auto-rendered settings form |
 | `ui` | `issue-queue-panel`, header action |
-| `rpc` | `scan_now`, `start_issue`, `cancel_issue`, `reprocess`, `health`, `getQueue`, `getHistory`, `getMetrics`, `ping` |
+| `rpc` | `automate.scanNow`, `automate.startIssue`, `automate.cancelIssue`, `automate.reprocess`, `automate.health`, `automate.getQueue`, `automate.getHistory`, `automate.getMetrics`, `automate.ping` |
 | `hooks` | `workflow.execution.changed`, `task.completed`, `session.created`, `tool.completed` |
 | `notifications` | Toasts on entry added, chain done, retries, errors |
 

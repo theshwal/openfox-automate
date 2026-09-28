@@ -19,6 +19,7 @@ import type { QueueEntry } from './types.js'
 import type { GitHubPullRequest } from './github.js'
 import { getPullRequest, type RateLimitInfo } from './github.js'
 import type { QueueStore } from './queue.js'
+import { RPC_NAMESPACE } from './constants.js'
 
 export interface PRMonitorDeps {
   token: string
@@ -131,7 +132,7 @@ export async function monitorPRs(deps: PRMonitorDeps): Promise<PRMonitorResult> 
         actions: [
           {
             label: { en: 'Rebuild', fr: 'Reconstruire' },
-            onActivate: { kind: 'rpc', method: 'reprocess', params: { queueId: entry.id } },
+            onActivate: { kind: 'rpc', method: `${RPC_NAMESPACE}reprocess`, params: { queueId: entry.id } },
           },
         ],
       })

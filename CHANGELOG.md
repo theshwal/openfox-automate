@@ -32,9 +32,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   overrides, scan interval + startup behaviour + ignore labels, batch concurrency
   (global + per repo), ordering strategy + dependency pattern, dry-run toggle,
   history retention, post-process toggles, PR monitor toggle + regex.
-- 14 RPC methods: `scan_now`, `health`, `get_queue`, `get_history`, `get_metrics`,
-  `start_issue`, `cancel_issue`, `remove_issue`, `reprocess`, `add_issue_by_url`,
-  `add_issue_raw`, `pause_auto_scan`, `resume_auto_scan`, `ping`.
+- 14 RPC methods: `automate.scanNow`, `automate.health`, `automate.getQueue`, `automate.getHistory`, `automate.getMetrics`,
+  `automate.startIssue`, `automate.cancelIssue`, `automate.removeIssue`, `automate.reprocess`, `automate.addIssueByUrl`,
+  `automate.addIssueRaw`, `automate.pauseAutoScan`, `automate.resumeAutoScan`, `automate.ping`.
 - 2 LLM-callable tools: `issue_queue_list`, `issue_queue_status`.
 - 3 hooks: `workflow.execution.changed`, `task.completed`, `tool.completed`.
 - 4 notification levels (info / success / warning / error) on entry add,

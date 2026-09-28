@@ -77,20 +77,20 @@ describe('openfox-automate (stub build)', () => {
     const rpcNames = calls.rpc.map((r) => r.name)
     expect(rpcNames).toEqual(
       expect.arrayContaining([
-        'ping',
-        'scan_now',
-        'health',
-        'get_queue',
-        'get_history',
-        'get_metrics',
-        'start_issue',
-        'cancel_issue',
-        'remove_issue',
-        'reprocess',
-        'add_issue_by_url',
-        'add_issue_raw',
-        'pause_auto_scan',
-        'resume_auto_scan',
+        'automate.ping',
+        'automate.scanNow',
+        'automate.health',
+        'automate.getQueue',
+        'automate.getHistory',
+        'automate.getMetrics',
+        'automate.startIssue',
+        'automate.cancelIssue',
+        'automate.removeIssue',
+        'automate.reprocess',
+        'automate.addIssueByUrl',
+        'automate.addIssueRaw',
+        'automate.pauseAutoScan',
+        'automate.resumeAutoScan',
       ]),
     )
     expect(calls.uiAction).toHaveLength(1)
@@ -131,7 +131,7 @@ describe('openfox-automate (stub build)', () => {
     )
   })
 
-  it('ping RPC returns ok + plugin id + version + timestamp', async () => {
+  it('automate.ping RPC returns ok + plugin id + version + timestamp', async () => {
     const { registry, calls } = makeFakeRegistry()
     register(registry)
 
@@ -161,7 +161,7 @@ describe('openfox-automate (stub build)', () => {
     expect(hook).toBeDefined()
     const fn = (hook as { fn: (p: unknown) => Promise<void> }).fn
 
-    const addRaw = calls.rpc.find((r) => r.name === 'add_issue_raw')
+    const addRaw = calls.rpc.find((r) => r.name === 'automate.addIssueRaw')
     expect(addRaw).toBeDefined()
     await addRaw!.fn({ repoKey: 'o/r', title: 'T', body: '' }, {})
 

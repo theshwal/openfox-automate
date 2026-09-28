@@ -15,6 +15,7 @@
  * entries reference the same PR.
  */
 import { getPullRequest } from './github.js';
+import { RPC_NAMESPACE } from './constants.js';
 export async function monitorPRs(deps) {
     const result = { checked: 0, failed: 0, completed: 0, errors: [], rateLimit: null };
     const signal = deps.signal;
@@ -97,7 +98,7 @@ export async function monitorPRs(deps) {
                 actions: [
                     {
                         label: { en: 'Rebuild', fr: 'Reconstruire' },
-                        onActivate: { kind: 'rpc', method: 'reprocess', params: { queueId: entry.id } },
+                        onActivate: { kind: 'rpc', method: `${RPC_NAMESPACE}reprocess`, params: { queueId: entry.id } },
                     },
                 ],
             });

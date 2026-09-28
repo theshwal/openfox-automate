@@ -16,6 +16,7 @@ import { getHostInternal } from './resolve-openfox.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
 import { DEFAULT_SETTINGS } from './types.js';
+import { RPC_NAMESPACE } from './constants.js';
 let currentRt = null;
 /**
  * Test-only lifecycle helpers. They are exported because the test suite
@@ -402,15 +403,15 @@ export function register(registry) {
         url: 'dist/panel.html',
     });
     registry.registerAsset('dist/panel.html');
-    registry.registerRpc('ping', async () => ({
+    registry.registerRpc(`${RPC_NAMESPACE}ping`, async () => ({
         ok: true,
         plugin: context.id,
         version: context.version,
         timestamp: new Date().toISOString(),
     }));
-    registry.registerRpc('scan_now', async () => scanAll(rt));
-    registry.registerRpc('health', async () => healthCheck(rt, context));
-    registry.registerRpc('get_queue', async (params) => {
+    registry.registerRpc(`${RPC_NAMESPACE}scanNow`, async () => scanAll(rt));
+    registry.registerRpc(`${RPC_NAMESPACE}health`, async () => healthCheck(rt, context));
+    registry.registerRpc(`${RPC_NAMESPACE}getQueue`, async (params) => {
         const p = (params ?? {});
         const active = await rt.store.loadActive();
         const text = p.filter?.toLowerCase() ?? '';
@@ -419,18 +420,18 @@ export function register(registry) {
             .filter((e) => statuses.size === 0 || statuses.has(e.status))
             .filter((e) => !text || `${e.title} ${e.body} ${e.url}`.toLowerCase().includes(text));
     });
-    registry.registerRpc('get_history', async (params) => {
+    registry.registerRpc(`${RPC_NAMESPACE}getHistory`, async (params) => {
         const p = (params ?? {});
         const history = await rt.store.loadHistory();
         const limit = p.limit ?? 100;
         const offset = p.offset ?? 0;
         return history.slice(offset, offset + limit);
     });
-    registry.registerRpc('get_metrics', async () => {
+    registry.registerRpc(`${RPC_NAMESPACE}getMetrics`, async () => {
         const history = await rt.store.loadHistory();
         return computeMetrics(history);
     });
-    registry.registerRpc('start_issue', async (params) => {
+    registry.registerRpc(`${RPC_NAMESPACE}startIssue`, async (params) => {
         const { queueId } = (params ?? {});
         const entry = await rt.store.findById(queueId);
         if (!entry)
@@ -439,7 +440,7 @@ export function register(registry) {
             throw new Error(`cannot start entry in status ${entry.status}`);
         return await spawnEntry(rt, entry);
     });
-    registry.registerRpc('cancel_issue', async (params) => {
+    registry.registerRpc(`${RPC_NAMESPACE}cancelIssue`, async (params) => {
         const { queueId } = (params ?? {});
         const entry = await rt.store.findById(queueId);
         if (!entry)
@@ -449,17 +450,17 @@ export function register(registry) {
                 await rt.orchestration.stopSession(entry.sessionId);
             }
             catch (err) {
-                context.logger.warn(`cancel_issue: stopSession failed: ${err instanceof Error ? err.message : String(err)}`);
+                context.logger.warn(`automate.cancelIssue: stopSession failed: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
         return await rt.store.transitionTo(queueId, 'cancelled', { finishedAt: new Date().toISOString() });
     });
-    registry.registerRpc('remove_issue', async (params) => {
+    registry.registerRpc(`${RPC_NAMESPACE}removeIssue`, async (params) => {
         const { queueId } = (params ?? {});
         await rt.store.remove(queueId);
         return { ok: true };
     });
-    registry.registerRpc('reprocess', async (params) => {
+    registry.registerRpc(`${RPC_NAMESPACE}reprocess`, async (params) => {
         const { queueId } = (params ?? {});
         const settings = readSettingsFromContext(context);
         const entry = await rt.store.findById(queueId);
@@ -482,7 +483,7 @@ export function register(registry) {
         await pickAndSpawnNext(rt);
         return updated;
     });
-    registry.registerRpc('add_issue_by_url', async (params) => {
+    registry.registerRpc(`${RPC_NAMESPACE}addIssueByUrl`, async (params) => {
         const { url } = (params ?? {});
         const m = url.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
         if (!m)
@@ -526,7 +527,7 @@ export function register(registry) {
         await orderAndStore(rt);
         return added[0] ?? entry;
     });
-    registry.registerRpc('add_issue_raw', async (params) => {
+    registry.registerRpc(`${RPC_NAMESPACE}addIssueRaw`, async (params) => {
         const p = (params ?? {});
         const settings = readSettingsFromContext(context);
         const repos = parseRepoMapping(settings['repos.mapping']);
@@ -552,12 +553,12 @@ export function register(registry) {
         await orderAndStore(rt);
         return added[0] ?? entry;
     });
-    registry.registerRpc('pause_auto_scan', async () => {
+    registry.registerRpc(`${RPC_NAMESPACE}pauseAutoScan`, async () => {
         rt.paused = true;
         publishQueue(rt, await rt.store.loadActive());
         return { paused: true };
     });
-    registry.registerRpc('resume_auto_scan', async () => {
+    registry.registerRpc(`${RPC_NAMESPACE}resumeAutoScan`, async () => {
         rt.paused = false;
         publishQueue(rt, await rt.store.loadActive());
         return { paused: false };
