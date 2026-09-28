@@ -6,6 +6,8 @@
  * "queue", "history", "scan_state", "executions".
  */
 import type { PluginRegistry } from 'openfox/plugin';
+export declare function _resetLifecycleForTesting(): void;
+export declare function _hasActiveRuntimeForTesting(): boolean;
 export declare function register(registry: PluginRegistry): void;
 export declare function deactivate(): void;
 declare const _default: {

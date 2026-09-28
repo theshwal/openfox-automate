@@ -21,39 +21,65 @@ function parseRateLimit(headers) {
     return { remaining, resetAt };
 }
 async function ghFetch(token, url, init) {
-    const res = await fetch(url, {
-        ...init,
-        headers: {
-            Accept: 'application/vnd.github+json',
-            Authorization: `Bearer ${token}`,
-            'X-GitHub-Api-Version': '2022-11-28',
-            'User-Agent': 'openfox-automate/0.1.0',
-            ...(init?.headers ?? {}),
-        },
-    });
-    const rateLimit = parseRateLimit(res.headers);
-    if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        return { ok: false, status: res.status, error: text || res.statusText, rateLimit };
+    const { signal, ...rest } = init ?? {};
+    try {
+        const res = await fetch(url, {
+            ...rest,
+            ...(signal ? { signal } : {}),
+            headers: {
+                Accept: 'application/vnd.github+json',
+                Authorization: `Bearer ${token}`,
+                'X-GitHub-Api-Version': '2022-11-28',
+                'User-Agent': 'openfox-automate/0.1.0',
+                ...(rest.headers ?? {}),
+            },
+        });
+        if (signal?.aborted) {
+            return { ok: false, status: 0, error: 'aborted', rateLimit: { remaining: 0, resetAt: null } };
+        }
+        const rateLimit = parseRateLimit(res.headers);
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            return { ok: false, status: res.status, error: text || res.statusText, rateLimit };
+        }
+        const data = (await res.json());
+        return { ok: true, status: res.status, data, rateLimit };
     }
-    const data = (await res.json());
-    return { ok: true, status: res.status, data, rateLimit };
+    catch (e) {
+        if (signal?.aborted || (e instanceof Error && e.name === 'AbortError')) {
+            return { ok: false, status: 0, error: 'aborted', rateLimit: { remaining: 0, resetAt: null } };
+        }
+        throw e;
+    }
 }
-export async function validateToken(token) {
-    const res = await ghFetch(token, `${GH_API}/user`);
+export async function validateToken(token, signal) {
+    const res = await ghFetch(token, `${GH_API}/user`, signal ? { signal } : undefined);
     return { valid: res.ok, rateLimit: res.rateLimit };
 }
 export async function listOpenIssues(token, owner, repo, opts = {}) {
     const perPage = opts.perPage ?? 100;
     const page = opts.page ?? 1;
-    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues?state=open&per_page=${perPage}&page=${page}`);
+    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues?state=open&per_page=${perPage}&page=${page}`, opts.signal ? { signal: opts.signal } : undefined);
 }
-export async function fetchAllOpenIssues(token, owner, repo, perPage = 100) {
+export async function fetchAllOpenIssues(token, owner, repo, perPageOrOpts, maybeSignal) {
+    let perPage = 100;
+    let signal;
+    if (typeof perPageOrOpts === 'number') {
+        perPage = perPageOrOpts;
+        signal = maybeSignal;
+    }
+    else if (perPageOrOpts && typeof perPageOrOpts === 'object') {
+        perPage = perPageOrOpts.perPage ?? 100;
+        signal = perPageOrOpts.signal;
+    }
     const collected = [];
     let page = 1;
     let lastRateLimit = { remaining: 0, resetAt: null };
     while (true) {
-        const res = await listOpenIssues(token, owner, repo, { perPage, page });
+        if (signal?.aborted) {
+            return { ok: false, status: 0, error: 'aborted', rateLimit: lastRateLimit };
+        }
+        const res = await listOpenIssues(token, owner, repo, { perPage, page, ...(signal ? { signal } : {}) });
         lastRateLimit = res.rateLimit;
         if (!res.ok)
             return { ok: false, status: res.status, error: res.error, rateLimit: res.rateLimit };
@@ -66,44 +92,51 @@ export async function fetchAllOpenIssues(token, owner, repo, perPage = 100) {
     }
     return { ok: true, status: 200, data: collected, rateLimit: lastRateLimit };
 }
-export async function getIssue(token, owner, repo, issueNumber) {
-    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}`);
+export async function getIssue(token, owner, repo, issueNumber, signal) {
+    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}`, signal ? { signal } : undefined);
 }
-export async function listIssueComments(token, owner, repo, issueNumber) {
-    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`);
+export async function listIssueComments(token, owner, repo, issueNumber, signal) {
+    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`, signal ? { signal } : undefined);
 }
-export async function getPullRequest(token, owner, repo, prNumber) {
-    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/pulls/${prNumber}`);
+export async function getPullRequest(token, owner, repo, prNumber, signal) {
+    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/pulls/${prNumber}`, signal ? { signal } : undefined);
 }
-export async function createIssueComment(token, owner, repo, issueNumber, body) {
+export async function createIssueComment(token, owner, repo, issueNumber, body, signal) {
     return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ body }),
+        ...(signal ? { signal } : {}),
     });
 }
-export async function addIssueLabel(token, owner, repo, issueNumber, label) {
+export async function addIssueLabel(token, owner, repo, issueNumber, label, signal) {
     return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ labels: [label] }),
+        ...(signal ? { signal } : {}),
     });
 }
-export async function removeIssueLabel(token, owner, repo, issueNumber, label) {
-    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`, { method: 'DELETE' });
+export async function removeIssueLabel(token, owner, repo, issueNumber, label, signal) {
+    return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`, {
+        method: 'DELETE',
+        ...(signal ? { signal } : {}),
+    });
 }
-export async function setIssueState(token, owner, repo, issueNumber, state) {
+export async function setIssueState(token, owner, repo, issueNumber, state, signal) {
     return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ state }),
+        ...(signal ? { signal } : {}),
     });
 }
-export async function assignIssue(token, owner, repo, issueNumber, assignees) {
+export async function assignIssue(token, owner, repo, issueNumber, assignees, signal) {
     return ghFetch(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/assignees`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ assignees }),
+        ...(signal ? { signal } : {}),
     });
 }
 export function issueHasIgnoredLabel(issue, ignoreLabels) {

@@ -64,28 +64,47 @@ function parseRateLimit(headers: Headers): RateLimitInfo {
   return { remaining, resetAt }
 }
 
-async function ghFetch<T>(token: string, url: string, init?: RequestInit): Promise<FetchResult<T>> {
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${token}`,
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'openfox-automate/0.1.0',
-      ...(init?.headers ?? {}),
-    },
-  })
-  const rateLimit = parseRateLimit(res.headers)
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    return { ok: false, status: res.status, error: text || res.statusText, rateLimit }
+async function ghFetch<T>(
+  token: string,
+  url: string,
+  init?: RequestInit & { signal?: AbortSignal },
+): Promise<FetchResult<T>> {
+  const { signal, ...rest } = init ?? {}
+  try {
+    const res = await fetch(url, {
+      ...rest,
+      ...(signal ? { signal } : {}),
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'openfox-automate/0.1.0',
+        ...(rest.headers ?? {}),
+      },
+    })
+    if (signal?.aborted) {
+      return { ok: false, status: 0, error: 'aborted', rateLimit: { remaining: 0, resetAt: null } }
+    }
+    const rateLimit = parseRateLimit(res.headers)
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      return { ok: false, status: res.status, error: text || res.statusText, rateLimit }
+    }
+    const data = (await res.json()) as T
+    return { ok: true, status: res.status, data, rateLimit }
+  } catch (e) {
+    if (signal?.aborted || (e instanceof Error && e.name === 'AbortError')) {
+      return { ok: false, status: 0, error: 'aborted', rateLimit: { remaining: 0, resetAt: null } }
+    }
+    throw e
   }
-  const data = (await res.json()) as T
-  return { ok: true, status: res.status, data, rateLimit }
 }
 
-export async function validateToken(token: string): Promise<{ valid: boolean; rateLimit: RateLimitInfo }> {
-  const res = await ghFetch<{ login: string }>(token, `${GH_API}/user`)
+export async function validateToken(
+  token: string,
+  signal?: AbortSignal,
+): Promise<{ valid: boolean; rateLimit: RateLimitInfo }> {
+  const res = await ghFetch<{ login: string }>(token, `${GH_API}/user`, signal ? { signal } : undefined)
   return { valid: res.ok, rateLimit: res.rateLimit }
 }
 
@@ -93,13 +112,14 @@ export async function listOpenIssues(
   token: string,
   owner: string,
   repo: string,
-  opts: { perPage?: number; page?: number } = {},
+  opts: { perPage?: number; page?: number; signal?: AbortSignal } = {},
 ): Promise<FetchResult<GitHubIssue[]>> {
   const perPage = opts.perPage ?? 100
   const page = opts.page ?? 1
   return ghFetch<GitHubIssue[]>(
     token,
     `${GH_API}/repos/${owner}/${repo}/issues?state=open&per_page=${perPage}&page=${page}`,
+    opts.signal ? { signal: opts.signal } : undefined,
   )
 }
 
@@ -107,13 +127,26 @@ export async function fetchAllOpenIssues(
   token: string,
   owner: string,
   repo: string,
-  perPage = 100,
+  perPageOrOpts?: number | { perPage?: number; signal?: AbortSignal },
+  maybeSignal?: AbortSignal,
 ): Promise<FetchResult<GitHubIssue[]>> {
+  let perPage = 100
+  let signal: AbortSignal | undefined
+  if (typeof perPageOrOpts === 'number') {
+    perPage = perPageOrOpts
+    signal = maybeSignal
+  } else if (perPageOrOpts && typeof perPageOrOpts === 'object') {
+    perPage = perPageOrOpts.perPage ?? 100
+    signal = perPageOrOpts.signal
+  }
   const collected: GitHubIssue[] = []
   let page = 1
   let lastRateLimit: RateLimitInfo = { remaining: 0, resetAt: null }
   while (true) {
-    const res = await listOpenIssues(token, owner, repo, { perPage, page })
+    if (signal?.aborted) {
+      return { ok: false, status: 0, error: 'aborted', rateLimit: lastRateLimit }
+    }
+    const res = await listOpenIssues(token, owner, repo, { perPage, page, ...(signal ? { signal } : {}) })
     lastRateLimit = res.rateLimit
     if (!res.ok) return { ok: false, status: res.status, error: res.error, rateLimit: res.rateLimit }
     if (!res.data || res.data.length === 0) break
@@ -129,8 +162,13 @@ export async function getIssue(
   owner: string,
   repo: string,
   issueNumber: number,
+  signal?: AbortSignal,
 ): Promise<FetchResult<GitHubIssue>> {
-  return ghFetch<GitHubIssue>(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}`)
+  return ghFetch<GitHubIssue>(
+    token,
+    `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}`,
+    signal ? { signal } : undefined,
+  )
 }
 
 export async function listIssueComments(
@@ -138,8 +176,13 @@ export async function listIssueComments(
   owner: string,
   repo: string,
   issueNumber: number,
+  signal?: AbortSignal,
 ): Promise<FetchResult<GitHubComment[]>> {
-  return ghFetch<GitHubComment[]>(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`)
+  return ghFetch<GitHubComment[]>(
+    token,
+    `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
+    signal ? { signal } : undefined,
+  )
 }
 
 export async function getPullRequest(
@@ -147,8 +190,13 @@ export async function getPullRequest(
   owner: string,
   repo: string,
   prNumber: number,
+  signal?: AbortSignal,
 ): Promise<FetchResult<GitHubPullRequest>> {
-  return ghFetch<GitHubPullRequest>(token, `${GH_API}/repos/${owner}/${repo}/pulls/${prNumber}`)
+  return ghFetch<GitHubPullRequest>(
+    token,
+    `${GH_API}/repos/${owner}/${repo}/pulls/${prNumber}`,
+    signal ? { signal } : undefined,
+  )
 }
 
 export async function createIssueComment(
@@ -157,6 +205,7 @@ export async function createIssueComment(
   repo: string,
   issueNumber: number,
   body: string,
+  signal?: AbortSignal,
 ): Promise<FetchResult<{ html_url: string }>> {
   return ghFetch<{ html_url: string }>(
     token,
@@ -165,6 +214,7 @@ export async function createIssueComment(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
+      ...(signal ? { signal } : {}),
     },
   )
 }
@@ -175,11 +225,13 @@ export async function addIssueLabel(
   repo: string,
   issueNumber: number,
   label: string,
+  signal?: AbortSignal,
 ): Promise<FetchResult<unknown>> {
   return ghFetch<unknown>(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ labels: [label] }),
+    ...(signal ? { signal } : {}),
   })
 }
 
@@ -189,11 +241,15 @@ export async function removeIssueLabel(
   repo: string,
   issueNumber: number,
   label: string,
+  signal?: AbortSignal,
 ): Promise<FetchResult<unknown>> {
   return ghFetch<unknown>(
     token,
     `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`,
-    { method: 'DELETE' },
+    {
+      method: 'DELETE',
+      ...(signal ? { signal } : {}),
+    },
   )
 }
 
@@ -203,11 +259,13 @@ export async function setIssueState(
   repo: string,
   issueNumber: number,
   state: 'open' | 'closed',
+  signal?: AbortSignal,
 ): Promise<FetchResult<GitHubIssue>> {
   return ghFetch<GitHubIssue>(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state }),
+    ...(signal ? { signal } : {}),
   })
 }
 
@@ -217,11 +275,13 @@ export async function assignIssue(
   repo: string,
   issueNumber: number,
   assignees: string[],
+  signal?: AbortSignal,
 ): Promise<FetchResult<GitHubIssue>> {
   return ghFetch<GitHubIssue>(token, `${GH_API}/repos/${owner}/${repo}/issues/${issueNumber}/assignees`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ assignees }),
+    ...(signal ? { signal } : {}),
   })
 }
 

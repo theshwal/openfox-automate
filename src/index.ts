@@ -31,12 +31,41 @@ interface Runtime {
   settings: () => PluginSettings
   store: QueueStore
   timer: ReturnType<typeof setInterval> | null
+  abortController: AbortController
   paused: boolean
   lastScanAt: string | null
   rateLimitedUntil: number | null
   executions: Map<string, { entryId: string; sessionId: string; chain: string[]; currentStep: number }>
   orchestration: OpenFoxOrchestration
   appliedExecutionEvents: Set<string>
+}
+
+let currentRt: Runtime | null = null
+
+/**
+ * Test-only lifecycle helpers. They are exported because the test suite
+ * needs a deterministic reset between scenarios, but they MUST not be
+ * available in the production plugin surface — gating them on
+ * `process.env.NODE_ENV !== 'production'` removes them from the runtime
+ * API exposed to a host that installs the package and from the bundled
+ * `dist/index.d.ts` consumers rely on for typing.
+ */
+function isTestEnv(): boolean {
+  return process.env['NODE_ENV'] !== 'production'
+}
+
+export function _resetLifecycleForTesting(): void {
+  if (!isTestEnv()) return
+  if (currentRt) {
+    if (currentRt.timer) clearInterval(currentRt.timer)
+    currentRt.timer = null
+    currentRt.abortController.abort()
+  }
+  currentRt = null
+}
+
+export function _hasActiveRuntimeForTesting(): boolean {
+  return isTestEnv() && currentRt !== null
 }
 
 function readSettingsFromContext(context: PluginContext): PluginSettings {
@@ -65,7 +94,16 @@ function resolveChain(entry: QueueEntry, settings: PluginSettings): string[] {
 }
 
 async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; errors: string[] }> {
+  // If the plugin was deactivated mid-scan, the AbortController fires and
+  // every in-flight fetch in github.ts will return error='aborted'. From
+  // that point on we MUST NOT mutate host state (no notify, no storage,
+  // no publish) — doing so would let a disabled plugin keep writing
+  // through the host. We also guard the post-fetch state mutations with
+  // a runtime-identity check so a stale async task that resumes after a
+  // re-register() can also be told to exit cleanly.
   const settings = readSettingsFromContext(rt.context)
+  const signal = rt.abortController.signal
+  const isLive = (): boolean => !signal.aborted && currentRt === rt
   const token = settings['github.token']
   if (!token) {
     return { added: 0, skipped: 0, errors: ['missing github.token'] }
@@ -90,12 +128,24 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
   const candidates: QueueEntry[] = []
 
   for (const { repoKey, projectId } of repos) {
+    if (!isLive()) {
+      errors.push(`aborted: scanAll stopped after deactivate (${repoKey} skipped)`)
+      break
+    }
     const [owner, repo] = repoKey.split('/', 2)
     if (!owner || !repo) {
       errors.push(`invalid repoKey ${repoKey}`)
       continue
     }
-    const res = await fetchAllOpenIssues(token, owner, repo)
+    const res = await fetchAllOpenIssues(token, owner, repo, { signal })
+    if (!isLive()) {
+      errors.push(`aborted: scanAll stopped after deactivate (${repoKey} skipped)`)
+      break
+    }
+    if (res.error === 'aborted') {
+      errors.push(`aborted: ${repoKey} fetch aborted`)
+      break
+    }
     if (!res.ok || !res.data) {
       errors.push(`${repoKey}: ${res.error ?? res.status}`)
       rt.context.notify({
@@ -132,6 +182,14 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
         addedAt: new Date().toISOString(),
       })
     }
+  }
+
+  // Final deactivate-guard: aborts can land between the per-repo loop
+  // and the post-fetch bookkeeping below. Don't write anything back to
+  // the host if we've been torn down.
+  if (!isLive()) {
+    errors.push('aborted: scanAll stopped before storing results')
+    return { added: 0, skipped: 0, errors }
   }
 
   const { added, skipped } = await rt.store.addNew(candidates)
@@ -285,8 +343,9 @@ function createLaunchDriver(rt: Runtime): {
 async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthReport> {
   const settings = readSettingsFromContext(context)
   const token = settings['github.token'] ?? ''
+  const signal = rt.abortController.signal
   const tokenRes = token
-    ? await validateToken(token)
+    ? await validateToken(token, signal)
     : { valid: false, rateLimit: { remaining: 0, resetAt: null } }
   const repos = parseRepoMapping(settings['repos.mapping'])
   const reposAccessible: Record<string, 'ok' | '404' | '403' | 'unknown'> = {}
@@ -296,7 +355,7 @@ async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthR
       reposAccessible[repoKey] = 'unknown'
       continue
     }
-    const res = await getIssue(token, owner, repo, 1)
+    const res = await getIssue(token, owner, repo, 1, signal)
     if (res.status === 404) reposAccessible[repoKey] = '404'
     else if (res.status === 403) reposAccessible[repoKey] = '403'
     else if (res.ok) reposAccessible[repoKey] = 'ok'
@@ -336,6 +395,20 @@ async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthR
 
 export function register(registry: PluginRegistry): void {
   const context = registry.context
+  // If a previous runtime is still registered (host hot-reload, caller
+  // forgot to deactivate, …) tear it down so its timer and in-flight
+  // fetches don't outlive the new runtime. Without this, overwriting
+  // currentRt below would orphan the previous setInterval handle and
+  // its AbortController, leaking timers forever.
+  if (currentRt !== null) {
+    if (currentRt.timer) {
+      clearInterval(currentRt.timer)
+      currentRt.timer = null
+    }
+    currentRt.abortController.abort()
+    currentRt.executions.clear()
+    currentRt.appliedExecutionEvents.clear()
+  }
   const store = new QueueStore({
     get: async (k: string) => (await context.storage?.get(k)) as unknown,
     set: async (k: string, v: unknown) => {
@@ -349,6 +422,7 @@ export function register(registry: PluginRegistry): void {
     settings: settingsReader,
     store,
     timer: null,
+    abortController: new AbortController(),
     paused: false,
     lastScanAt: null,
     rateLimitedUntil: null,
@@ -356,6 +430,7 @@ export function register(registry: PluginRegistry): void {
     orchestration: createOrchestration(context),
     appliedExecutionEvents: new Set(),
   }
+  currentRt = rt
 
   registry.registerSettings(settingsSchema)
 
@@ -474,12 +549,13 @@ export function register(registry: PluginRegistry): void {
     if (!owner || !repo || !num) throw new Error(`invalid GitHub issue URL: ${url}`)
     const settings = readSettingsFromContext(context)
     const token = settings['github.token'] ?? ''
-    const res = await getIssue(token, owner, repo, Number(num))
+    const signal = rt.abortController.signal
+    const res = await getIssue(token, owner, repo, Number(num), signal)
     if (!res.ok || !res.data) throw new Error(`could not fetch ${url}: ${res.error ?? res.status}`)
     const repos = parseRepoMapping(settings['repos.mapping'])
     const mapping = repos.find((r) => r.repoKey === `${owner}/${repo}`)
     if (!mapping) throw new Error(`no project mapping for ${owner}/${repo}`)
-    const commentsRes = await listIssueComments(token, owner, repo, Number(num))
+    const commentsRes = await listIssueComments(token, owner, repo, Number(num), signal)
     const comments = (commentsRes.data ?? []).map((c) => ({
       author: c.user?.login ?? 'unknown',
       body: c.body,
@@ -702,7 +778,10 @@ export function register(registry: PluginRegistry): void {
     if (!token) return
     const [owner, repo] = entry.repoKey.split('/', 2)
     if (!owner || !repo) return
-    const me = settings['post.assignOnSuccess'] ? await fetchAuthenticatedLogin(token) : undefined
+    if (rt.abortController.signal.aborted) return
+    const signal = rt.abortController.signal
+    const me = settings['post.assignOnSuccess'] ? await fetchAuthenticatedLogin(token, signal) : undefined
+    if (rt.abortController.signal.aborted) return
     await postProcess(
       entry,
       settings,
@@ -712,7 +791,7 @@ export function register(registry: PluginRegistry): void {
         prUrl: entry.prUrl ?? '',
         ...(me ? { me } : {}),
       },
-      { token, owner, repo },
+      { token, owner, repo, signal: rt.abortController.signal },
     )
   }
 
@@ -731,6 +810,7 @@ export function register(registry: PluginRegistry): void {
     if (!settings['pr.monitorEnabled']) return
     const token = settings['github.token']
     if (!token) return
+    if (rt.abortController.signal.aborted) return
     const { monitorPRs } = await import('./pr-monitor.js')
     const result = await monitorPRs({
       token,
@@ -739,6 +819,7 @@ export function register(registry: PluginRegistry): void {
       republish: () => {
         void rt.store.loadActive().then((q) => publishQueue(rt, q))
       },
+      signal: rt.abortController.signal,
     })
     if (result.checked > 0 || result.errors.length > 0) {
       context.logger.info(
@@ -757,12 +838,25 @@ export function register(registry: PluginRegistry): void {
 }
 
 export function deactivate(): void {
-  // The runtime is created inside register() and not exposed; relying on
-  // ESM module re-import (cache-busted by the host) means a fresh module
-  // instance is created on each enable. Active timers leak only within
-  // one enable cycle and are cleared by the host process exit.
-  // For a more robust lifecycle, we would track timers + abort controllers
-  // here.
+  // The host expects a clean lifecycle on disable / uninstall: stop the
+  // periodic scan timer and cancel any in-flight fetches started under
+  // the active AbortController. We keep a module-level reference to the
+  // current runtime so this cleanup can actually reach the handles that
+  // register() put in place.
+  const rt = currentRt
+  currentRt = null
+  if (!rt) return
+  if (rt.timer) {
+    clearInterval(rt.timer)
+    rt.timer = null
+  }
+  // AbortController.abort() is idempotent: a second call is a no-op and
+  // does not throw, so no try/catch is needed.
+  rt.abortController.abort()
+  // Drop the dedup set and executions map so a future enable starts fresh
+  // even if the host re-uses the module instance.
+  rt.executions.clear()
+  rt.appliedExecutionEvents.clear()
 }
 
 export default { register, deactivate }

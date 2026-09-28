@@ -55,25 +55,29 @@ export interface FetchResult<T> {
     error?: string | undefined;
     rateLimit: RateLimitInfo;
 }
-export declare function validateToken(token: string): Promise<{
+export declare function validateToken(token: string, signal?: AbortSignal): Promise<{
     valid: boolean;
     rateLimit: RateLimitInfo;
 }>;
 export declare function listOpenIssues(token: string, owner: string, repo: string, opts?: {
     perPage?: number;
     page?: number;
+    signal?: AbortSignal;
 }): Promise<FetchResult<GitHubIssue[]>>;
-export declare function fetchAllOpenIssues(token: string, owner: string, repo: string, perPage?: number): Promise<FetchResult<GitHubIssue[]>>;
-export declare function getIssue(token: string, owner: string, repo: string, issueNumber: number): Promise<FetchResult<GitHubIssue>>;
-export declare function listIssueComments(token: string, owner: string, repo: string, issueNumber: number): Promise<FetchResult<GitHubComment[]>>;
-export declare function getPullRequest(token: string, owner: string, repo: string, prNumber: number): Promise<FetchResult<GitHubPullRequest>>;
-export declare function createIssueComment(token: string, owner: string, repo: string, issueNumber: number, body: string): Promise<FetchResult<{
+export declare function fetchAllOpenIssues(token: string, owner: string, repo: string, perPageOrOpts?: number | {
+    perPage?: number;
+    signal?: AbortSignal;
+}, maybeSignal?: AbortSignal): Promise<FetchResult<GitHubIssue[]>>;
+export declare function getIssue(token: string, owner: string, repo: string, issueNumber: number, signal?: AbortSignal): Promise<FetchResult<GitHubIssue>>;
+export declare function listIssueComments(token: string, owner: string, repo: string, issueNumber: number, signal?: AbortSignal): Promise<FetchResult<GitHubComment[]>>;
+export declare function getPullRequest(token: string, owner: string, repo: string, prNumber: number, signal?: AbortSignal): Promise<FetchResult<GitHubPullRequest>>;
+export declare function createIssueComment(token: string, owner: string, repo: string, issueNumber: number, body: string, signal?: AbortSignal): Promise<FetchResult<{
     html_url: string;
 }>>;
-export declare function addIssueLabel(token: string, owner: string, repo: string, issueNumber: number, label: string): Promise<FetchResult<unknown>>;
-export declare function removeIssueLabel(token: string, owner: string, repo: string, issueNumber: number, label: string): Promise<FetchResult<unknown>>;
-export declare function setIssueState(token: string, owner: string, repo: string, issueNumber: number, state: 'open' | 'closed'): Promise<FetchResult<GitHubIssue>>;
-export declare function assignIssue(token: string, owner: string, repo: string, issueNumber: number, assignees: string[]): Promise<FetchResult<GitHubIssue>>;
+export declare function addIssueLabel(token: string, owner: string, repo: string, issueNumber: number, label: string, signal?: AbortSignal): Promise<FetchResult<unknown>>;
+export declare function removeIssueLabel(token: string, owner: string, repo: string, issueNumber: number, label: string, signal?: AbortSignal): Promise<FetchResult<unknown>>;
+export declare function setIssueState(token: string, owner: string, repo: string, issueNumber: number, state: 'open' | 'closed', signal?: AbortSignal): Promise<FetchResult<GitHubIssue>>;
+export declare function assignIssue(token: string, owner: string, repo: string, issueNumber: number, assignees: string[], signal?: AbortSignal): Promise<FetchResult<GitHubIssue>>;
 export declare function issueHasIgnoredLabel(issue: GitHubIssue, ignoreLabels: string[]): boolean;
 export declare function extractLabels(issue: GitHubIssue): string[];
 export declare function isPullRequest(issue: GitHubIssue): boolean;

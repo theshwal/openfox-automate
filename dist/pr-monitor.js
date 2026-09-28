@@ -17,12 +17,20 @@
 import { getPullRequest } from './github.js';
 export async function monitorPRs(deps) {
     const result = { checked: 0, failed: 0, completed: 0, errors: [], rateLimit: null };
+    const signal = deps.signal;
+    const isLive = () => !signal?.aborted;
     const active = await deps.store.loadActive();
+    if (!isLive())
+        return result;
     const withPR = active.filter((e) => e.prUrl && e.status !== 'done' && e.status !== 'failed' && e.status !== 'cancelled');
     if (withPR.length === 0)
         return result;
     const cache = new Map();
     for (const entry of withPR) {
+        if (!isLive()) {
+            result.errors.push('aborted: monitorPRs stopped mid-loop');
+            break;
+        }
         const prUrl = entry.prUrl;
         const m = prUrl.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
         if (!m)
@@ -34,7 +42,15 @@ export async function monitorPRs(deps) {
         let cached = cache.get(cacheKey);
         if (!cached) {
             try {
-                const res = await getPullRequest(deps.token, owner, repo, Number(num));
+                const res = await getPullRequest(deps.token, owner, repo, Number(num), signal);
+                if (!isLive()) {
+                    result.errors.push(`aborted: ${cacheKey} fetch aborted`);
+                    break;
+                }
+                if (res.error === 'aborted') {
+                    result.errors.push(`aborted: ${cacheKey}`);
+                    break;
+                }
                 if (!res.ok || !res.data) {
                     result.errors.push(`${cacheKey}: ${res.error ?? res.status}`);
                     continue;
@@ -86,6 +102,10 @@ export async function monitorPRs(deps) {
                 ],
             });
         }
+    }
+    if (!isLive()) {
+        result.errors.push('aborted: monitorPRs stopped before republish');
+        return result;
     }
     deps.republish();
     return result;

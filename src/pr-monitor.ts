@@ -33,6 +33,8 @@ export interface PRMonitorDeps {
     }>
   }) => void
   republish: () => void
+  /** AbortSignal forwarded into GitHub fetches. */
+  signal?: AbortSignal
 }
 
 export interface PRMonitorResult {
@@ -45,8 +47,11 @@ export interface PRMonitorResult {
 
 export async function monitorPRs(deps: PRMonitorDeps): Promise<PRMonitorResult> {
   const result: PRMonitorResult = { checked: 0, failed: 0, completed: 0, errors: [], rateLimit: null }
+  const signal = deps.signal
+  const isLive = (): boolean => !signal?.aborted
 
   const active = await deps.store.loadActive()
+  if (!isLive()) return result
   const withPR = active.filter(
     (e) => e.prUrl && e.status !== 'done' && e.status !== 'failed' && e.status !== 'cancelled',
   )
@@ -55,6 +60,10 @@ export async function monitorPRs(deps: PRMonitorDeps): Promise<PRMonitorResult> 
   const cache = new Map<string, { pr: GitHubPullRequest; rateLimit: RateLimitInfo }>()
 
   for (const entry of withPR) {
+    if (!isLive()) {
+      result.errors.push('aborted: monitorPRs stopped mid-loop')
+      break
+    }
     const prUrl = entry.prUrl!
     const m = prUrl.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
     if (!m) continue
@@ -65,7 +74,15 @@ export async function monitorPRs(deps: PRMonitorDeps): Promise<PRMonitorResult> 
     let cached = cache.get(cacheKey)
     if (!cached) {
       try {
-        const res = await getPullRequest(deps.token, owner, repo, Number(num))
+        const res = await getPullRequest(deps.token, owner, repo, Number(num), signal)
+        if (!isLive()) {
+          result.errors.push(`aborted: ${cacheKey} fetch aborted`)
+          break
+        }
+        if (res.error === 'aborted') {
+          result.errors.push(`aborted: ${cacheKey}`)
+          break
+        }
         if (!res.ok || !res.data) {
           result.errors.push(`${cacheKey}: ${res.error ?? res.status}`)
           continue
@@ -119,6 +136,11 @@ export async function monitorPRs(deps: PRMonitorDeps): Promise<PRMonitorResult> 
         ],
       })
     }
+  }
+
+  if (!isLive()) {
+    result.errors.push('aborted: monitorPRs stopped before republish')
+    return result
   }
 
   deps.republish()

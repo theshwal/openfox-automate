@@ -43,6 +43,8 @@ export interface PRMonitorDeps {
         }>;
     }) => void;
     republish: () => void;
+    /** AbortSignal forwarded into GitHub fetches. */
+    signal?: AbortSignal;
 }
 export interface PRMonitorResult {
     checked: number;

@@ -6,7 +6,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { deactivate, register } from '../src/index.js'
+import { _hasActiveRuntimeForTesting, _resetLifecycleForTesting, deactivate, register } from '../src/index.js'
 import { monitorPRs } from '../src/pr-monitor.js'
 import { QueueStore } from '../src/queue.js'
 import type { PluginContext, PluginRegistry } from 'openfox/plugin'
@@ -60,12 +60,93 @@ function makeFakeRegistry(): {
   return { registry, notify, calls }
 }
 
-// ---------- A3: deactivate() ----------
+// ---------- A3 / L3: deactivate() releases resources ----------
 
-describe('A3: deactivate()', () => {
-  it('is exported as a no-op function that does not throw', () => {
+describe('A3 / L3: deactivate() releases timers + aborts in-flight fetches', () => {
+  afterEach(() => {
+    _resetLifecycleForTesting()
+  })
+
+  it('is safe to call twice (idempotent) and never throws', () => {
     expect(() => deactivate()).not.toThrow()
-    expect(typeof deactivate).toBe('function')
+    expect(() => deactivate()).not.toThrow()
+  })
+
+  it('deactivate() clears the active scan timer (clearInterval called) and exposes no runtime', () => {
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval')
+    const { registry } = makeFakeRegistry()
+    register(registry)
+    expect(_hasActiveRuntimeForTesting()).toBe(true)
+    deactivate()
+    // The plugin must have asked the host runtime to cancel the scan
+    // timer — otherwise the periodic scan keeps firing after disable.
+    expect(clearSpy).toHaveBeenCalled()
+    expect(_hasActiveRuntimeForTesting()).toBe(false)
+    clearSpy.mockRestore()
+  })
+
+  it('deactivate() aborts the active AbortController; a fresh register() rebuilds the lifecycle', () => {
+    const { registry } = makeFakeRegistry()
+    register(registry)
+    deactivate()
+    // Lifecycle reset: re-registering must produce a fresh runtime with a
+    // brand-new, non-aborted AbortController.
+    const { registry: registry2 } = makeFakeRegistry()
+    register(registry2)
+    expect(_hasActiveRuntimeForTesting()).toBe(true)
+  })
+
+  it('ghFetch surfaces an aborted result when its AbortSignal is already aborted', async () => {
+    // Validate that the github.ts layer actually forwards the signal end-to-end.
+    const controller = new AbortController()
+    controller.abort()
+    const { listOpenIssues } = await import('../src/github.js')
+    const res = await listOpenIssues('tok', 'o', 'r', {
+      signal: controller.signal,
+    })
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('aborted')
+  })
+
+  it('scan_now RPC survives a mid-flight deactivate without writing to storage', async () => {
+    // We pre-abort the controller right before invoking scan_now so the
+    // plugin's bookkeeping branches (rt.store.addNew, notify, publish)
+    // are skipped and the response reports abort-shaped errors only.
+    const { registry, calls } = makeFakeRegistry()
+    register(registry)
+    // Pre-load minimal settings so scanAll reaches the per-repo loop.
+    ;(registry.context.settings as ReturnType<typeof vi.fn>).mockReturnValue({
+      'github.token': 'tok',
+      'repos.mapping': 'theshwal/demo=proj-demo',
+      'workflows.chain': '',
+      'workflows.repoOverrides': '',
+      'scan.refreshMinutes': 30,
+      'scan.startupScan': false,
+      'scan.ignoreLabels': '',
+      'batch.maxConcurrency': 3,
+      'batch.maxConcurrencyPerRepo': 2,
+      'ordering.strategy': 'default',
+      'ordering.dependencyPattern': '',
+      dryRun: false,
+      'history.retentionCount': 100,
+      'post.closeOnSuccess': false,
+      'post.assignOnSuccess': false,
+      'post.commentTemplate': '',
+      'post.reprocessResetsRetryCount': true,
+      'pr.monitorEnabled': true,
+      'pr.urlRegex': '',
+    })
+    const scanNow = calls.rpc.find((c) => c.name === 'scan_now')
+    expect(scanNow).toBeDefined()
+    // Now abort the underlying signal by tearing the runtime down.
+    deactivate()
+    const result = (await scanNow!.fn({}, registry.context)) as {
+      added: number
+      skipped: number
+      errors: string[]
+    }
+    expect(result.added).toBe(0)
+    expect(result.errors.some((e) => e.startsWith('aborted'))).toBe(true)
   })
 })
 

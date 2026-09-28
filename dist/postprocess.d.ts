@@ -32,6 +32,7 @@ export declare function postProcess(entry: QueueEntry, settings: PluginSettings,
     token: string;
     owner: string;
     repo: string;
+    signal?: AbortSignal;
 }): Promise<PostProcessResult>;
-export declare function fetchAuthenticatedLogin(token: string): Promise<string | null>;
+export declare function fetchAuthenticatedLogin(token: string, signal?: AbortSignal): Promise<string | null>;
 //# sourceMappingURL=postprocess.d.ts.map
