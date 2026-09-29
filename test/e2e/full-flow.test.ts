@@ -98,7 +98,7 @@ async function listHostSessions(projectId: string): Promise<Array<{ id: string; 
 }
 
 async function readEntry(queueId: string): Promise<QueueEntryLike | undefined> {
-  const queue = (await rpc('get_queue', {})) as QueueEntryLike[]
+  const queue = (await rpc('automate.getQueue', {})) as QueueEntryLike[]
   return queue.find((e) => e.id === queueId)
 }
 
@@ -129,9 +129,12 @@ async function seedQueue(
   samples: Array<{ title: string; body: string; labels: string[]; issueNumber: number }>,
 ): Promise<void> {
   for (const s of samples) {
-    await rpc('add_issue_raw', { repoKey: REPO, title: s.title, body: s.body, labels: s.labels }).catch(
-      () => undefined,
-    )
+    await rpc('automate.addIssueRaw', {
+      repoKey: REPO,
+      title: s.title,
+      body: s.body,
+      labels: s.labels,
+    }).catch(() => undefined)
   }
 }
 
@@ -141,7 +144,7 @@ async function addFunctionalSeed(): Promise<QueueEntryLike> {
   // (default: `#(\d+)|depends on #(\d+)|blocked by #(\d+)`) doesn't latch
   // onto the seed string and mark the entry as blocked.
   const title = `Functional chain ${stamp}`
-  const added = (await rpc('add_issue_raw', {
+  const added = (await rpc('automate.addIssueRaw', {
     repoKey: REPO,
     title,
     body: 'Functional test seed body.',
@@ -156,7 +159,7 @@ describe.skipIf(!SHOULD_RUN)(
   'openfox-automate e2e — RPC surface + queue lifecycle (M6/M6-bis/M6-ter)',
   () => {
     it('health() returns the documented shape and reports all 3 host surfaces ok', async () => {
-      const health = (await rpc('health')) as {
+      const health = (await rpc('automate.health')) as {
         github: { tokenValid: boolean }
         openFoxInternals: { sessionManager: string; launchWorkflowRun: string; host: string }
         workflows: Record<string, string>
@@ -172,7 +175,7 @@ describe.skipIf(!SHOULD_RUN)(
     })
 
     it('ping() returns ok + plugin id', async () => {
-      const result = (await rpc('ping')) as { ok: boolean; plugin: string }
+      const result = (await rpc('automate.ping')) as { ok: boolean; plugin: string }
       expect(result.ok).toBe(true)
       expect(result.plugin).toBe('openfox-automate')
     })
@@ -193,7 +196,7 @@ describe.skipIf(!SHOULD_RUN)(
           labels: ['documentation'],
         },
       ])
-      const queue = (await rpc('get_queue', {})) as QueueEntryLike[]
+      const queue = (await rpc('automate.getQueue', {})) as QueueEntryLike[]
       expect(queue.length).toBeGreaterThanOrEqual(3)
       const titles = queue.map((e) => e.title)
       const bugIdx = titles.findIndex((t) => t.includes('Bug'))
@@ -207,7 +210,7 @@ describe.skipIf(!SHOULD_RUN)(
     })
 
     it('getQueue({statusFilter:["failed"]}) returns filtered result (M6-ter)', async () => {
-      const failed = (await rpc('get_queue', { statusFilter: ['failed'] })) as QueueEntryLike[]
+      const failed = (await rpc('automate.getQueue', { statusFilter: ['failed'] })) as QueueEntryLike[]
       expect(Array.isArray(failed)).toBe(true)
       for (const entry of failed) {
         expect(entry.status).toBe('failed')
@@ -215,7 +218,7 @@ describe.skipIf(!SHOULD_RUN)(
     })
 
     it('get_metrics() returns the documented shape with 7-day sparkline (M6, MT1-MT3)', async () => {
-      const metrics = (await rpc('get_metrics')) as {
+      const metrics = (await rpc('automate.getMetrics')) as {
         total: number
         today: number
         thisWeek: number
@@ -237,7 +240,7 @@ describe.skipIf(!SHOULD_RUN)(
     })
 
     it('reprocess({queueId}) is permission-gated by entry status (M6-ter)', async () => {
-      const queue = (await rpc('get_queue', {})) as QueueEntryLike[]
+      const queue = (await rpc('automate.getQueue', {})) as QueueEntryLike[]
       const target = queue.find(
         (e) =>
           e.status === 'failed' ||
@@ -247,7 +250,7 @@ describe.skipIf(!SHOULD_RUN)(
       )
       expect(target).toBeDefined()
       if (target!.status === 'queued') return
-      const updated = (await rpc('reprocess', { queueId: target!.id })) as QueueEntryLike
+      const updated = (await rpc('automate.reprocess', { queueId: target!.id })) as QueueEntryLike
       expect(updated.status).toBe('queued')
     })
 
@@ -336,7 +339,7 @@ describe.skipIf(!SHOULD_RUN)(
 
     it('start_issue → host.session.create (via PluginHost facade) → entry.executionStack[0]=running', async () => {
       expect(spawnedQueueId).not.toBeNull()
-      const updated = (await rpc('start_issue', { queueId: spawnedQueueId })) as QueueEntryLike
+      const updated = (await rpc('automate.startIssue', { queueId: spawnedQueueId })) as QueueEntryLike
       expect(updated.status).toBe('running')
       expect(updated.sessionId).toBeTruthy()
       expect(typeof updated.sessionId).toBe('string')
@@ -370,7 +373,7 @@ describe.skipIf(!SHOULD_RUN)(
       // rpc() throws on `data.error` — that's exactly what we want here: the
       // plugin's start_issue handler refuses non-`queued` entries, surfacing
       // a structured error rather than silently re-spawning.
-      await expect(rpc('start_issue', { queueId: spawnedQueueId })).rejects.toThrow(
+      await expect(rpc('automate.startIssue', { queueId: spawnedQueueId })).rejects.toThrow(
         /cannot start entry in status running/,
       )
     })
@@ -385,7 +388,7 @@ describe.skipIf(!SHOULD_RUN)(
 
     it('cancel_issue stops the host session and transitions the entry to cancelled', async () => {
       expect(spawnedQueueId).not.toBeNull()
-      const updated = (await rpc('cancel_issue', { queueId: spawnedQueueId })) as QueueEntryLike
+      const updated = (await rpc('automate.cancelIssue', { queueId: spawnedQueueId })) as QueueEntryLike
       expect(updated.status).toBe('cancelled')
       // The host session is asked to stop via PluginHost.sessions.stop — the
       // /api/sessions listing should reflect a stopped session shortly after.
@@ -408,7 +411,7 @@ describe.skipIf(!SHOULD_RUN)(
       expect(spawnedChainSize).not.toBeNull()
       expect(spawnedChainSize).toBeGreaterThan(0)
       // Default chain has 3 workflows; verify against plugin health report.
-      const health = (await rpc('health')) as { workflows: Record<string, string> }
+      const health = (await rpc('automate.health')) as { workflows: Record<string, string> }
       expect(Object.keys(health.workflows).length).toBe(spawnedChainSize)
     })
   },

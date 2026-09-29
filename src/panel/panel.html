@@ -248,6 +248,8 @@
         const params = new URLSearchParams(location.search)
         const token = params.get('token') || ''
         const authHeaders = token ? { Authorization: 'Bearer ' + token } : {}
+        // MUST match `RPC_NAMESPACE` in src/constants.ts (panel.html is not transformed by tsc)
+        const RPC_NAMESPACE = 'automate.'
 
         let queue = []
         let history = []
@@ -389,10 +391,12 @@
         document.getElementById('filterStatus').addEventListener('change', renderActive)
         document
           .getElementById('scanNow')
-          .addEventListener('click', () => rpc('scan_now').catch((e) => alert('scan_now: ' + e.message)))
+          .addEventListener('click', () =>
+            rpc(`${RPC_NAMESPACE}scanNow`).catch((e) => alert('automate.scanNow: ' + e.message)),
+          )
         document.getElementById('healthCheck').addEventListener('click', async () => {
           try {
-            const h = await rpc('health')
+            const h = await rpc(`${RPC_NAMESPACE}health`)
             const lines = [
               'github.tokenValid: ' + h.github.tokenValid,
               'github.rateLimitRemaining: ' + h.github.rateLimitRemaining,
@@ -404,7 +408,7 @@
             ]
             alert(lines.join('\n'))
           } catch (e) {
-            alert('health: ' + e.message)
+            alert('automate.health: ' + e.message)
           }
         })
         document.getElementById('historyTable').addEventListener('click', async (ev) => {
@@ -412,19 +416,19 @@
           if (!btn) return
           const id = btn.dataset.id
           try {
-            await rpc('reprocess', { queueId: id })
+            await rpc(`${RPC_NAMESPACE}reprocess`, { queueId: id })
             await refresh()
           } catch (e) {
-            alert('reprocess: ' + e.message)
+            alert('automate.reprocess: ' + e.message)
           }
         })
 
         async function refresh() {
           try {
             const [q, h, m] = await Promise.all([
-              rpc('get_queue'),
-              rpc('get_history', { limit: 50, offset: 0 }),
-              rpc('get_metrics'),
+              rpc(`${RPC_NAMESPACE}getQueue`),
+              rpc(`${RPC_NAMESPACE}getHistory`, { limit: 50, offset: 0 }),
+              rpc(`${RPC_NAMESPACE}getMetrics`),
             ])
             queue = Array.isArray(q) ? q : []
             history = Array.isArray(h) ? h : []

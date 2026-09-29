@@ -108,8 +108,8 @@ describe('A3 / L3: deactivate() releases timers + aborts in-flight fetches', () 
     expect(res.error).toBe('aborted')
   })
 
-  it('scan_now RPC survives a mid-flight deactivate without writing to storage', async () => {
-    // We pre-abort the controller right before invoking scan_now so the
+  it('automate.scanNow RPC survives a mid-flight deactivate without writing to storage', async () => {
+    // We pre-abort the controller right before invoking automate.scanNow so the
     // plugin's bookkeeping branches (rt.store.addNew, notify, publish)
     // are skipped and the response reports abort-shaped errors only.
     const { registry, calls } = makeFakeRegistry()
@@ -136,7 +136,7 @@ describe('A3 / L3: deactivate() releases timers + aborts in-flight fetches', () 
       'pr.monitorEnabled': true,
       'pr.urlRegex': '',
     })
-    const scanNow = calls.rpc.find((c) => c.name === 'scan_now')
+    const scanNow = calls.rpc.find((c) => c.name === 'automate.scanNow')
     expect(scanNow).toBeDefined()
     // Now abort the underlying signal by tearing the runtime down.
     deactivate()
@@ -299,7 +299,7 @@ describe('J3: session.created and tool.completed are observational', () => {
     const toolCompleted = calls.hook.find((h) => h.h === 'tool.completed')?.fn
     expect(toolCompleted).toBeDefined()
 
-    const addRaw = calls.rpc.find((r) => r.name === 'add_issue_raw')
+    const addRaw = calls.rpc.find((r) => r.name === 'automate.addIssueRaw')
     expect(addRaw).toBeDefined()
     await addRaw!.fn({ repoKey: 'o/r', title: 'T', body: '' }, {})
     const stored = backing.get('queue') as Array<{ id: string; sessionId?: string; prUrl?: string }>
@@ -386,7 +386,7 @@ describe('PR2/3/4: monitorPRs regression', () => {
         level: 'warning',
         actions: expect.arrayContaining([
           expect.objectContaining({
-            onActivate: expect.objectContaining({ method: 'reprocess' }),
+            onActivate: expect.objectContaining({ method: 'automate.reprocess' }),
           }),
         ]),
       }),
