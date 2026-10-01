@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/theshwal/openfox-automate/schemas/delivery-policy-v1.schema.json",
+  "title": "Delivery Policy v1",
+  "type": "object",
+  "required": ["version", "repository"],
+  "properties": {
+    "version": { "const": 1 },
+    "repository": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["product", "plugin", "tool", "experiment", "working-fork"] },
+        "default_base": { "type": "string", "minLength": 1 },
+        "upstream": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+            "base": { "type": "string", "minLength": 1 }
+          },
+          "required": ["repository", "base"],
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "pr": { "type": "object", "additionalProperties": true },
+    "quality": { "type": "object", "additionalProperties": true },
+    "publish": { "type": "object", "additionalProperties": true },
+    "merge": { "type": "object", "additionalProperties": true },
+    "conflicts": { "type": "object", "additionalProperties": true },
+    "post_merge": { "type": "object", "additionalProperties": true },
+    "human": { "type": "object", "additionalProperties": true },
+    "delivery": { "type": "object", "additionalProperties": true },
+    "modes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}
