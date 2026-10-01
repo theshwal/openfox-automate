@@ -82,7 +82,7 @@ describe('state machine — production code (processWorkflowEvent)', () => {
   beforeEach(() => {})
 
   it('full chain: workflow 1 → 2 → 3 → entry done', () => {
-    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2'])
+    const entry = entryWithStack(['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1'])
     startChain(entry)
 
     const seen = new Set<string>()
@@ -92,54 +92,54 @@ describe('state machine — production code (processWorkflowEvent)', () => {
       entry.executionStack![curIdx]!.status = 'running'
       curIdx++
     }
-    all.push(...feed(entry, [{ workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' }], seen))
-    all.push(...feed(entry, [{ workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' }], seen))
+    all.push(...feed(entry, [{ workflowId: 'plan-issue-v3', status: 'running', executionId: 'e1' }], seen))
+    all.push(...feed(entry, [{ workflowId: 'plan-issue-v3', status: 'done', executionId: 'e2' }], seen))
     promote()
     all.push(
-      ...feed(entry, [{ workflowId: 'Build & Verify Auto v2', status: 'done', executionId: 'e3' }], seen),
+      ...feed(entry, [{ workflowId: 'build-verify-v3', status: 'done', executionId: 'e3' }], seen),
     )
     promote()
-    all.push(...feed(entry, [{ workflowId: 'Delivery v2', status: 'done', executionId: 'e4' }], seen))
+    all.push(...feed(entry, [{ workflowId: 'publish-pr-v1', status: 'done', executionId: 'e4' }], seen))
 
     expect(all[0]!.launches).toHaveLength(0)
-    expect(all[1]!.launches.map((l) => l.workflowId)).toEqual(['Build & Verify Auto v2'])
-    expect(all[2]!.launches.map((l) => l.workflowId)).toEqual(['Delivery v2'])
+    expect(all[1]!.launches.map((l) => l.workflowId)).toEqual(['build-verify-v3'])
+    expect(all[2]!.launches.map((l) => l.workflowId)).toEqual(['publish-pr-v1'])
     expect(all[3]!.launches).toHaveLength(0)
     expect(all[3]!.finished).toBe(true)
     expect(all[3]!.transitionTo).toBe('done')
   })
 
   it('duplicate done event with same executionId does NOT re-launch (idempotency)', () => {
-    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2'])
+    const entry = entryWithStack(['plan-issue-v3', 'build-verify-v3'])
     startChain(entry)
 
     const seen = new Set<string>()
     feed(
       entry,
       [
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
-        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'e1' },
+        { workflowId: 'plan-issue-v3', status: 'done', executionId: 'e2' },
       ],
       seen,
     )
     entry.executionStack![1]!.status = 'running'
 
-    const dup = feed(entry, [{ workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' }], seen)
+    const dup = feed(entry, [{ workflowId: 'plan-issue-v3', status: 'done', executionId: 'e2' }], seen)
 
     expect(dup[0]!.deduplicated).toBe(true)
     expect(dup[0]!.launches).toHaveLength(0)
   })
 
   it('same executionId with different status is NOT deduplicated (running then done)', () => {
-    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2'])
+    const entry = entryWithStack(['plan-issue-v3', 'build-verify-v3'])
     startChain(entry)
 
     const seen = new Set<string>()
     const results = feed(
       entry,
       [
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'exec-1' },
-        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'exec-1' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'exec-1' },
+        { workflowId: 'plan-issue-v3', status: 'done', executionId: 'exec-1' },
       ],
       seen,
     )
@@ -147,19 +147,19 @@ describe('state machine — production code (processWorkflowEvent)', () => {
     expect(results[0]!.deduplicated).toBe(false)
     expect(results[1]!.deduplicated).toBe(false)
     expect(results[1]!.launches).toHaveLength(1)
-    expect(results[1]!.launches[0]?.workflowId).toBe('Build & Verify Auto v2')
+    expect(results[1]!.launches[0]?.workflowId).toBe('build-verify-v3')
   })
 
   it('duplicate done with different executionIds but same workflowId triggers re-launch', () => {
-    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2'])
+    const entry = entryWithStack(['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1'])
     startChain(entry)
 
     const seen = new Set<string>()
     feed(
       entry,
       [
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
-        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'e1' },
+        { workflowId: 'plan-issue-v3', status: 'done', executionId: 'e2' },
       ],
       seen,
     )
@@ -169,33 +169,33 @@ describe('state machine — production code (processWorkflowEvent)', () => {
     const results = feed(
       entry,
       [
-        { workflowId: 'Build & Verify Auto v2', status: 'running', executionId: 'e1b' },
-        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e3' },
+        { workflowId: 'build-verify-v3', status: 'running', executionId: 'e1b' },
+        { workflowId: 'plan-issue-v3', status: 'done', executionId: 'e3' },
       ],
       seen2,
     )
     entry.executionStack![2]!.status = 'running'
 
-    expect(results[1]!.launches.map((l) => l.workflowId)).toEqual(['Delivery v2'])
+    expect(results[1]!.launches.map((l) => l.workflowId)).toEqual(['publish-pr-v1'])
   })
 
   it('blocked #1 → real retry (1 relaunch), blocked #2 → entry blocked (no launch)', () => {
-    const entry = entryWithStack(['Plan Issue v2'])
+    const entry = entryWithStack(['plan-issue-v3'])
     startChain(entry)
 
     const seen = new Set<string>()
     const results = feed(
       entry,
       [
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'b0' },
-        { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' },
-        { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b2' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'b0' },
+        { workflowId: 'plan-issue-v3', status: 'blocked', executionId: 'b1' },
+        { workflowId: 'plan-issue-v3', status: 'blocked', executionId: 'b2' },
       ],
       seen,
     )
 
     expect(results[1]!.launches).toHaveLength(1)
-    expect(results[1]!.launches[0]?.workflowId).toBe('Plan Issue v2')
+    expect(results[1]!.launches[0]?.workflowId).toBe('plan-issue-v3')
     expect(results[1]!.transitionTo).toBeUndefined()
 
     expect(results[2]!.launches).toHaveLength(0)
@@ -203,37 +203,37 @@ describe('state machine — production code (processWorkflowEvent)', () => {
   })
 
   it('duplicate blocked event with same executionId does NOT trigger extra retry', () => {
-    const entry = entryWithStack(['Plan Issue v2'])
+    const entry = entryWithStack(['plan-issue-v3'])
     startChain(entry)
 
     const seen = new Set<string>()
     feed(
       entry,
       [
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'b0' },
-        { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' },
-        { workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b2' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'b0' },
+        { workflowId: 'plan-issue-v3', status: 'blocked', executionId: 'b1' },
+        { workflowId: 'plan-issue-v3', status: 'blocked', executionId: 'b2' },
       ],
       seen,
     )
 
-    const dup = feed(entry, [{ workflowId: 'Plan Issue v2', status: 'blocked', executionId: 'b1' }], seen)
+    const dup = feed(entry, [{ workflowId: 'plan-issue-v3', status: 'blocked', executionId: 'b1' }], seen)
 
     expect(dup[0]!.deduplicated).toBe(true)
     expect(dup[0]!.launches).toHaveLength(0)
   })
 
   it('waiting does NOT launch; running after waiting is also a no-op', () => {
-    const entry = entryWithStack(['Plan Issue v2'])
+    const entry = entryWithStack(['plan-issue-v3'])
     startChain(entry)
 
     const seen = new Set<string>()
     const results = feed(
       entry,
       [
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'r0' },
-        { workflowId: 'Plan Issue v2', status: 'waiting', executionId: 'w1' },
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'r1' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'r0' },
+        { workflowId: 'plan-issue-v3', status: 'waiting', executionId: 'w1' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'r1' },
       ],
       seen,
     )
@@ -244,13 +244,13 @@ describe('state machine — production code (processWorkflowEvent)', () => {
   })
 
   it('event without executionId is rejected (logged) and not processed', () => {
-    const entry = entryWithStack(['Plan Issue v2'])
+    const entry = entryWithStack(['plan-issue-v3'])
     startChain(entry)
 
     let logged = ''
     const r = processWorkflowEvent(
       entry,
-      { workflowId: 'Plan Issue v2', status: 'done', sessionId: entry.sessionId ?? '' },
+      { workflowId: 'plan-issue-v3', status: 'done', sessionId: entry.sessionId ?? '' },
       {
         appliedExecutionEvents: new Set<string>(),
         log: (msg) => {
@@ -268,22 +268,22 @@ describe('state machine — production code (processWorkflowEvent)', () => {
   })
 
   it('chain advance populates content and params via buildIssueContext/buildIssueParams', () => {
-    const entry = entryWithStack(['Plan Issue v2', 'Build & Verify Auto v2'])
+    const entry = entryWithStack(['plan-issue-v3', 'build-verify-v3'])
     startChain(entry)
 
     const seen = new Set<string>()
     const results = feed(
       entry,
       [
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
-        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'e1' },
+        { workflowId: 'plan-issue-v3', status: 'done', executionId: 'e2' },
       ],
       seen,
     )
 
     const launch = results[1]!.launches[0]!
     expect(launch.sessionId).toBe('sess-1')
-    expect(launch.workflowId).toBe('Build & Verify Auto v2')
+    expect(launch.workflowId).toBe('build-verify-v3')
     expect(launch.content).toContain('**Title:** test issue')
     expect(launch.params.issue_url).toBe('https://github.com/o/r/issues/42')
     expect(launch.params.issue_number).toBe('42')
@@ -292,15 +292,15 @@ describe('state machine — production code (processWorkflowEvent)', () => {
   })
 
   it('last workflow done → entry transitions to done', () => {
-    const entry = entryWithStack(['Plan Issue v2'])
+    const entry = entryWithStack(['plan-issue-v3'])
     startChain(entry)
 
     const seen = new Set<string>()
     const results = feed(
       entry,
       [
-        { workflowId: 'Plan Issue v2', status: 'running', executionId: 'e1' },
-        { workflowId: 'Plan Issue v2', status: 'done', executionId: 'e2' },
+        { workflowId: 'plan-issue-v3', status: 'running', executionId: 'e1' },
+        { workflowId: 'plan-issue-v3', status: 'done', executionId: 'e2' },
       ],
       seen,
     )

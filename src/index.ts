@@ -81,8 +81,22 @@ function hasAnyPostToggle(settings: PluginSettings): boolean {
   )
 }
 
+/**
+ * Default chain, in STABLE WORKFLOW IDs.
+ *
+ * The host resolves a launch by `metadata.id` (`findWorkflowById` in
+ * src/server/runner/orchestrator.ts), never by display name — a name like
+ * "Plan Issue v2" cannot be resolved and the launch throws. The previous
+ * default used display names, so the fallback chain was unlaunchable.
+ *
+ * V3: plan -> build+verify -> publish. There is deliberately no merge
+ * workflow in the chain: `publish-pr-v1` stops at the PR, and the merge
+ * policy (owner, mode, method) is read by OpenFox after publication.
+ */
+const DEFAULT_CHAIN = ['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1']
+
 function defaultChain(): string[] {
-  return ['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2']
+  return [...DEFAULT_CHAIN]
 }
 
 function resolveChain(entry: QueueEntry, settings: PluginSettings): string[] {
