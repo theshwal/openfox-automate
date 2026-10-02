@@ -61,6 +61,12 @@ export function buildIssueContext(entry: QueueEntry): string {
 
 export function buildIssueParams(entry: QueueEntry): Record<string, string> {
   return {
+    // `issue_ref` is a REQUIRED parameter of plan-issue / plan-issue-v3. The
+    // host refuses to launch a workflow whose required params are missing
+    // (src/server/runner/orchestrator.ts), so the chain could never start the
+    // planning step. The id is the stable, already-resolved target: the entry
+    // exists precisely because this issue was scanned and queued.
+    issue_ref: `${entry.repoKey}#${entry.issueNumber}`,
     issue_url: entry.url,
     issue_number: String(entry.issueNumber),
     issue_title: entry.title,
