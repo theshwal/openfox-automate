@@ -95,9 +95,7 @@ describe('state machine — production code (processWorkflowEvent)', () => {
     all.push(...feed(entry, [{ workflowId: 'plan-issue-v3', status: 'running', executionId: 'e1' }], seen))
     all.push(...feed(entry, [{ workflowId: 'plan-issue-v3', status: 'done', executionId: 'e2' }], seen))
     promote()
-    all.push(
-      ...feed(entry, [{ workflowId: 'build-verify-v3', status: 'done', executionId: 'e3' }], seen),
-    )
+    all.push(...feed(entry, [{ workflowId: 'build-verify-v3', status: 'done', executionId: 'e3' }], seen))
     promote()
     all.push(...feed(entry, [{ workflowId: 'publish-pr-v1', status: 'done', executionId: 'e4' }], seen))
 
