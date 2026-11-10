@@ -87,6 +87,8 @@ export interface PluginSettings {
     'pr.urlRegex'?: string;
     'budget.maxTokensPerIssue'?: number;
     'control.leaseMinutes'?: number;
+    'host.baseUrl'?: string;
+    'host.sessionToken'?: string;
 }
-export declare const DEFAULT_SETTINGS: Required<Omit<PluginSettings, 'github.token' | 'repos.mapping' | 'workflows.repoOverrides' | 'post.commentTemplate' | 'ordering.dependencyPattern' | 'pr.urlRegex'>>;
+export declare const DEFAULT_SETTINGS: Required<Omit<PluginSettings, 'github.token' | 'repos.mapping' | 'workflows.repoOverrides' | 'post.commentTemplate' | 'ordering.dependencyPattern' | 'pr.urlRegex' | 'host.baseUrl' | 'host.sessionToken'>>;
 //# sourceMappingURL=types.d.ts.map

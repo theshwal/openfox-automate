@@ -85,6 +85,8 @@ export interface HostSession {
   id: string
   title?: string
   projectId?: string
+  /** The host returns the session's working directory. */
+  workdir?: string
 }
 
 export interface HostWorkflowInfo {

@@ -180,6 +180,26 @@ export const settingsSchema = {
             default: 'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)',
         },
         {
+            key: 'host.baseUrl',
+            type: 'text',
+            label: { en: 'OpenFox host base URL', fr: 'URL de base de l’hôte OpenFox' },
+            description: {
+                en: 'The host does not expose its port to a plugin, so it must be configured here. Only a loopback address is accepted. Leave empty to use the host default.',
+                fr: 'L’hôte n’expose pas son port au plugin : il doit être configuré ici. Seule une adresse loopback est acceptée. Laissez vide pour utiliser la valeur par défaut.',
+            },
+            default: '',
+        },
+        {
+            key: 'host.sessionToken',
+            type: 'password',
+            label: { en: 'OpenFox session token', fr: 'Jeton de session OpenFox' },
+            description: {
+                en: 'Only needed when the host requires network authentication. Sent as the x-session-token header, never in a URL.',
+                fr: 'Nécessaire uniquement si l’hôte exige l’authentification réseau. Envoyé en en-tête x-session-token, jamais dans une URL.',
+            },
+            secret: true,
+        },
+        {
             key: 'budget.maxTokensPerIssue',
             type: 'number',
             label: { en: 'Max tokens per issue (0 = unlimited)', fr: 'Tokens max par issue (0 = illimité)' },

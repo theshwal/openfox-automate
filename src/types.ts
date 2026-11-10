@@ -94,6 +94,8 @@ export interface PluginSettings {
   'pr.urlRegex'?: string
   'budget.maxTokensPerIssue'?: number
   'control.leaseMinutes'?: number
+  'host.baseUrl'?: string
+  'host.sessionToken'?: string
 }
 
 export const DEFAULT_SETTINGS: Required<
@@ -105,6 +107,8 @@ export const DEFAULT_SETTINGS: Required<
     | 'post.commentTemplate'
     | 'ordering.dependencyPattern'
     | 'pr.urlRegex'
+    | 'host.baseUrl'
+    | 'host.sessionToken'
   >
 > = {
   'workflows.chain': 'plan-issue-v3\nbuild-verify-v3\npublish-pr-v1',
