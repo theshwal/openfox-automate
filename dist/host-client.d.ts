@@ -90,6 +90,21 @@ export interface HostClientDeps {
  */
 export declare function buildWorkflowLaunchMessage(workflowId: string, params?: Record<string, string>, orderedParamIds?: string[]): string;
 /**
+ * Validate the operator-supplied host base URL.
+ *
+ * The OpenFox server listens on the loopback interface, so only a
+ * loopback origin is accepted. This keeps a mistyped or tampered setting
+ * from making the plugin send its session token to an arbitrary host, and
+ * it rules out an SSRF through the base URL.
+ */
+export declare function validateHostBaseUrl(baseUrl: string): {
+    ok: true;
+    origin: string;
+} | {
+    ok: false;
+    message: string;
+};
+/**
  * A thin, fail-closed client over the OpenFox local HTTP API.
  *
  * It is deliberately NOT constructed at import time: a plugin must opt in

@@ -120,6 +120,42 @@ function failure(reason: HostClientFailureReason, message: string, status?: numb
 }
 
 /**
+ * Validate the operator-supplied host base URL.
+ *
+ * The OpenFox server listens on the loopback interface, so only a
+ * loopback origin is accepted. This keeps a mistyped or tampered setting
+ * from making the plugin send its session token to an arbitrary host, and
+ * it rules out an SSRF through the base URL.
+ */
+export function validateHostBaseUrl(
+  baseUrl: string,
+): { ok: true; origin: string } | { ok: false; message: string } {
+  let parsed: URL
+  try {
+    parsed = new URL(baseUrl)
+  } catch {
+    return { ok: false, message: 'OpenFox host base URL is not a valid URL' }
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { ok: false, message: `unsupported scheme for the host base URL: ${parsed.protocol}` }
+  }
+  const host = parsed.hostname.toLowerCase()
+  const isLoopback =
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '::1' ||
+    host === '[::1]' ||
+    host.endsWith('.localhost')
+  if (!isLoopback) {
+    return {
+      ok: false,
+      message: `the OpenFox host must be on the loopback interface, got "${parsed.hostname}"`,
+    }
+  }
+  return { ok: true, origin: `${parsed.protocol}//${parsed.host}` }
+}
+
+/**
  * A thin, fail-closed client over the OpenFox local HTTP API.
  *
  * It is deliberately NOT constructed at import time: a plugin must opt in
@@ -147,7 +183,15 @@ export class HostClient {
     if (!base) {
       return failure('not-configured', 'OpenFox host base URL is not configured')
     }
-    const url = `${base.replace(/\/+$/, '')}${path}`
+    // The base URL is operator-supplied, so it is validated before any
+    // request: only a loopback HTTP(S) origin is accepted. Without this
+    // check a mistyped (or tampered) setting would make the plugin send
+    // the session token to an arbitrary host.
+    const validation = validateHostBaseUrl(base)
+    if (!validation.ok) {
+      return failure('bad-request', validation.message)
+    }
+    const url = `${validation.origin}${path}`
     const headers: Record<string, string> = { Accept: 'application/json' }
     if (body !== undefined) headers['Content-Type'] = 'application/json'
     if (this.config.token) headers['x-session-token'] = this.config.token
