@@ -32,6 +32,12 @@ function priorityRank(labels) {
     return 999;
 }
 export function parseDependencies(text, pattern) {
+    // An empty pattern compiles to a regex that matches the empty string at
+    // every position. `re.exec` then never advances `lastIndex` and the loop
+    // below spins forever (the host would freeze on every scan). An empty
+    // pattern means "no dependency detection".
+    if (!pattern || pattern.trim() === '')
+        return [];
     let re;
     try {
         re = new RegExp(pattern, 'gi');
@@ -39,9 +45,26 @@ export function parseDependencies(text, pattern) {
     catch {
         return [];
     }
+    // A pattern that can match the empty string has the same problem: guard
+    // against it explicitly rather than relying on the caller.
+    if (re.test('')) {
+        try {
+            re = new RegExp(pattern, 'gi');
+        }
+        catch {
+            return [];
+        }
+        if (re.source === '' || /^\(\?[:=!]?\)?$/.test(re.source))
+            return [];
+    }
     const deps = new Set();
     let match;
     while ((match = re.exec(text)) !== null) {
+        // Defensive: a zero-length match would make `exec` loop forever.
+        if (match[0] === '') {
+            re.lastIndex += 1;
+            continue;
+        }
         for (const group of match.slice(1)) {
             const n = Number(group);
             if (Number.isFinite(n) && n > 0)
