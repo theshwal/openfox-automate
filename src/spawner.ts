@@ -1,13 +1,23 @@
 /**
  * Session spawner.
  *
- * Uses `context.host` (Plugin API v2.1+) when available, with fallback
- * to `context.openFoxInternals` (legacy) and finally to a dynamic import.
+ * The plugin creates one session per issue. The host access goes through
+ * the ORCHESTRATION PORT (`src/orchestration.ts`), which resolves the
+ * host surface in order:
+ *
+ *   1. `context.host` — an in-process facade, when the host provides one;
+ *   2. `context.openFoxInternals` — the legacy in-process surface;
+ *   3. the SUPPORTED HTTP API (`src/host-client.ts`).
+ *
+ * This module used to resolve the host ITSELF, which meant it only knew
+ * about paths 1 and 2. On OpenFox 2.0.160 and 2.0.161 the host exposes
+ * NEITHER to a plugin, so the plugin could not create a session at all:
+ * the session creation failed with "OpenFox host orchestration is not
+ * available" even though the plugin already had a working HTTP client.
  */
 
-import type { PluginContext } from 'openfox/plugin'
 import type { QueueEntry } from './types.js'
-import { getHostInternal } from './resolve-openfox.js'
+import type { OpenFoxOrchestration } from './orchestration.js'
 
 export interface SessionLike {
   id: string
@@ -16,7 +26,9 @@ export interface SessionLike {
 
 export interface SpawnerDeps {
   createSession?: (projectId: string, title: string) => Promise<SessionLike>
-  context?: PluginContext
+  context?: unknown
+  /** The orchestration port; defaults to the host-backed one. */
+  orchestration?: OpenFoxOrchestration
 }
 
 export function buildSessionTitle(entry: QueueEntry): string {
@@ -29,48 +41,35 @@ export async function spawnSessionFor(entry: QueueEntry, deps: SpawnerDeps = {})
   // (see `repos.mapping`), so by spawn time `entry.projectId` is the value
   // the host understands.
   const hostProjectId = entry.projectId
+  const title = buildSessionTitle(entry)
   if (deps.createSession) {
-    return deps.createSession(hostProjectId, buildSessionTitle(entry))
+    return deps.createSession(hostProjectId, title)
   }
-  const internal = await getHostInternal(deps.context)
-  if (!internal) {
-    throw new Error(
-      'OpenFox host orchestration is not available. Either inject createSession for testing, or ensure the host exposes context.host or context.openFoxInternals.',
-    )
+  if (deps.orchestration) {
+    return await deps.orchestration.createSession(hostProjectId, title)
   }
-  if (internal.kind === 'facade') {
-    const s = await internal.facade.sessions.create({
-      projectId: hostProjectId,
-      title: buildSessionTitle(entry),
-    })
-    return { id: s.sessionId, ...(s.workdir !== undefined ? { workdir: s.workdir } : {}) }
-  }
-  return await internal.legacy.sessionManager.createSession(hostProjectId, buildSessionTitle(entry))
+  throw new Error(
+    'OpenFox host orchestration is not available; cannot create a session. ' +
+      'The orchestration port must be provided (it resolves context.host, ' +
+      'context.openFoxInternals, or the supported HTTP API).',
+  )
 }
 
 export async function stopSession(
   sessionId: string,
-  deps: { stopSession?: (id: string) => Promise<void>; context?: PluginContext } = {},
+  deps: {
+    stopSession?: (id: string) => Promise<void> | void
+    context?: unknown
+    orchestration?: OpenFoxOrchestration
+  } = {},
 ): Promise<void> {
   if (deps.stopSession) {
     await deps.stopSession(sessionId)
     return
   }
-  const internal = await getHostInternal(deps.context)
-  if (!internal) {
-    throw new Error('OpenFox host orchestration is not available')
-  }
-  if (internal.kind === 'facade') {
-    internal.facade.sessions.stop(sessionId)
+  if (deps.orchestration) {
+    await deps.orchestration.stopSession(sessionId)
     return
   }
-  const sm = internal.legacy.sessionManager as {
-    stopSession?: (id: string) => Promise<void> | void
-    setRunning?: (id: string, running: boolean) => void
-  }
-  if (sm.stopSession) {
-    await sm.stopSession(sessionId)
-  } else if (sm.setRunning) {
-    sm.setRunning(sessionId, false)
-  }
+  throw new Error('OpenFox host orchestration is not available; cannot stop the session.')
 }

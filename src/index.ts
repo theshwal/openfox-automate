@@ -32,6 +32,7 @@ import {
   markRunning,
   recordTokenUsage,
   reserve,
+  type ControlPlaneOptions,
 } from './control-plane.js'
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js'
 import { computeMetrics } from './metrics.js'
@@ -306,20 +307,96 @@ function nextScanAtIso(rt: Runtime): string | null {
  * FAIL CLOSED: an issue whose session cannot be created is marked failed
  * in the registry, and the slot is released for the next candidate.
  */
+/**
+ * Reserve ONE issue in the control plane.
+ *
+ * The reservation is exclusive and scoped to this issue: a bulk
+ * `reserve(state, options)` would reserve EVERY eligible issue, and the
+ * ones that were not started immediately would stay 'reserved' with no
+ * session — and since `reserve` only selects 'queued' items, they could
+ * never be scheduled again.
+ *
+ * Returns false when the issue is already held or the capacity is
+ * reached.
+ */
+async function reserveSingleIssue(
+  rt: Runtime,
+  entry: {
+    repoKey: string
+    projectId: string
+    issueNumber: number
+    title: string
+    url: string
+    labels: string[]
+    dependsOn: number[]
+  },
+  options: ControlPlaneOptions,
+): Promise<boolean> {
+  const key = `${entry.repoKey}#${entry.issueNumber}`
+  return await rt.controlPlane.mutate((state) => {
+    const existing = state.items[key]
+    if (existing?.status === 'reserved' || existing?.status === 'running') return false
+    // The issue may not be in the registry yet (it was added manually):
+    // admit it first so the reservation has something to attach to.
+    if (!existing) {
+      admit(state, [
+        {
+          repoKey: entry.repoKey,
+          projectId: entry.projectId,
+          issueNumber: entry.issueNumber,
+          title: entry.title,
+          url: entry.url,
+          labels: entry.labels,
+          dependsOn: entry.dependsOn,
+        },
+      ])
+    }
+    const item = state.items[key]
+    if (!item) return false
+    const active = Object.values(state.items).filter((i) => i.status === 'running' || i.status === 'reserved')
+    if (active.length >= options.maxWorkers) return false
+    if (active.filter((i) => i.repoKey === item.repoKey).length >= options.maxWorkersPerRepo) return false
+    item.status = 'reserved'
+    item.attempt += 1
+    item.leaseExpiresAt = Date.now() + options.leaseMs
+    item.updatedAt = new Date().toISOString()
+    state.updatedAt = item.updatedAt
+    return true
+  })
+}
+
+/**
+ * Reserve the worker slots and start the reserved work.
+ *
+ * The reservation is EXCLUSIVE and durable: it happens inside the
+ * control-plane store's serialized read-modify-write, so two concurrent
+ * callers cannot reserve the same issue. The chain engine is NOT touched:
+ * the control plane only decides WHAT runs, the engine advances the chain
+ * of a running session.
+ *
+ * FAIL CLOSED: an issue whose session cannot be created is marked failed
+ * in the registry, and the slot is released for the next candidate.
+ */
 async function scheduleControlPlane(rt: Runtime): Promise<number> {
   const settings = readSettingsFromContext(rt.context)
   const options = controlPlaneOptionsFromSettings(settings)
   const dryRun = Boolean(settings.dryRun)
+
+  // A dry run must NOT reserve anything: a reservation without a session
+  // is an orphan that blocks the queue once the dry run is turned off.
+  if (dryRun) {
+    const queued = await rt.controlPlane.read(
+      (state) => Object.values(state.items).filter((i) => i.status === 'queued').length,
+    )
+    rt.context.logger.info(`[DRY RUN] would schedule ${queued} issue(s); nothing was reserved`)
+    return 0
+  }
 
   const reserved = await rt.controlPlane.mutate((state) => reserve(state, options).reserved)
   if (reserved.length === 0) return 0
 
   let started = 0
   for (const item of reserved) {
-    if (dryRun) {
-      rt.context.logger.info(`[DRY RUN] would reserve ${item.key}`)
-      continue
-    }
     try {
       // The control plane must reuse the chain engine, not duplicate it:
       // the issue is written to the legacy queue and spawned through
@@ -444,50 +521,11 @@ async function pickAndSpawnNext(rt: Runtime): Promise<QueueEntry | null> {
     }
 
     // Reserve the issue in the control plane BEFORE creating the session.
-    // The reservation is exclusive: if another scheduler already holds it,
-    // this one skips the issue instead of creating a second session.
-    //
-    // The reservation is taken for THIS issue only. The previous code
-    // called `reserve(state, options)`, which reserved EVERY eligible issue
-    // in one pass; the ones that were not started here stayed 'reserved'
-    // with no session, and the control plane then refused to schedule them
-    // again — the queue starved.
+    // The reservation is exclusive and scoped to THIS issue only: a bulk
+    // reservation left the issues that were not started here 'reserved'
+    // with no session, and the queue could never be scheduled again.
     const key = `${entry.repoKey}#${entry.issueNumber}`
-    const reserved = await rt.controlPlane.mutate((state) => {
-      const existing = state.items[key]
-      const alreadyHeld = existing?.status === 'reserved' || existing?.status === 'running'
-      if (alreadyHeld) return false
-      // The issue may not be in the registry yet (it was added manually):
-      // admit it first so the reservation has something to attach to.
-      if (!existing) {
-        admit(state, [
-          {
-            repoKey: entry.repoKey,
-            projectId: entry.projectId,
-            issueNumber: entry.issueNumber,
-            title: entry.title,
-            url: entry.url,
-            labels: entry.labels,
-            dependsOn: entry.dependsOn,
-          },
-        ])
-      }
-      // Reserve ONLY this issue.
-      const item = state.items[key]
-      if (!item) return false
-      const running = Object.values(state.items).filter(
-        (i) => i.status === 'running' || i.status === 'reserved',
-      )
-      if (running.length >= options.maxWorkers) return false
-      const repoCount = running.filter((i) => i.repoKey === item.repoKey).length
-      if (repoCount >= options.maxWorkersPerRepo) return false
-      item.status = 'reserved'
-      item.attempt += 1
-      item.leaseExpiresAt = Date.now() + options.leaseMs
-      item.updatedAt = new Date().toISOString()
-      state.updatedAt = item.updatedAt
-      return true
-    })
+    const reserved = await reserveSingleIssue(rt, entry, options)
     if (!reserved) continue
 
     try {
@@ -521,7 +559,11 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
   await rt.store.update(updated)
 
   try {
-    const session = await spawnSessionFor(updated, { context: rt.context })
+    // The ORCHESTRATION PORT resolves the host: `context.host`, the
+    // legacy in-process surface, or the supported HTTP API. Passing the
+    // port here is what makes the session creation work on a real host,
+    // where no in-process surface exists.
+    const session = await spawnSessionFor(updated, { orchestration: rt.orchestration })
     if (session.id) updated.sessionId = session.id
     // The CONTROL PLANE is the authority for the scheduling state: the
     // issue becomes 'running' there, and the legacy entry mirrors it.
@@ -542,8 +584,31 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
     await rt.store.update(updated)
   } catch (e) {
     const err = e instanceof Error ? e.message : String(e)
-    updated.status = 'failed'
-    updated.error = err
+    // The CONTROL PLANE is the authority: it must learn about the failure
+    // too. Writing only the legacy entry left the control plane saying
+    // 'reserved' while the entry said 'failed' — a drift, and an orphan
+    // reservation that blocked the queue.
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    await rt.controlPlane.mutate((state) => {
+      if (!state.items[key]) {
+        admit(state, [
+          {
+            repoKey: entry.repoKey,
+            projectId: entry.projectId,
+            issueNumber: entry.issueNumber,
+            title: entry.title,
+            url: entry.url,
+            labels: entry.labels,
+            dependsOn: entry.dependsOn,
+          },
+        ])
+      }
+      completeItem(state, key, 'failed', { error: err })
+    })
+    const item = await rt.controlPlane.read((state) => state.items[key])
+    const patched = syncQueueStatus(updated, item)
+    updated.status = patched.status
+    updated.error = patched.error ?? err
     updated.finishedAt = new Date().toISOString()
     await rt.store.update(updated)
     rt.context.notify({
@@ -776,27 +841,9 @@ export function register(registry: PluginRegistry): void {
     const settings = readSettingsFromContext(context)
     const options = controlPlaneOptionsFromSettings(settings)
     const key = `${entry.repoKey}#${entry.issueNumber}`
-    const reserved = await rt.controlPlane.mutate((state) => {
-      const existing = state.items[key]
-      const alreadyHeld = existing?.status === 'reserved' || existing?.status === 'running'
-      if (alreadyHeld) return false
-      // The issue may not be in the registry yet (it was added manually):
-      // admit it first so the reservation has something to attach to.
-      if (!existing) {
-        admit(state, [
-          {
-            repoKey: entry.repoKey,
-            projectId: entry.projectId,
-            issueNumber: entry.issueNumber,
-            title: entry.title,
-            url: entry.url,
-            labels: entry.labels,
-            dependsOn: entry.dependsOn,
-          },
-        ])
-      }
-      return reserve(state, options).reserved.some((item) => item.key === key)
-    })
+    // The SAME single-item reservation as the legacy path: a bulk
+    // reservation here left the other issues 'reserved' with no session.
+    const reserved = await reserveSingleIssue(rt, entry, options)
     if (!reserved) {
       throw new Error(`issue ${key} is already reserved by the control plane`)
     }
