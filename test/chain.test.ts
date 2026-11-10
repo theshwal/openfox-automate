@@ -91,12 +91,22 @@ describe('chain builders', () => {
         'issue_comments',
         'issue_labels',
         'issue_number',
+        'issue_ref',
         'issue_title',
         'issue_url',
         'project_id',
         'repo_key',
       ].sort(),
     )
+  })
+
+  it('buildIssueParams supplies issue_ref, a REQUIRED param of the planner', () => {
+    // The host throws "Missing required parameter" when a required workflow
+    // parameter is absent (openfox src/server/runner/orchestrator.ts), so the
+    // whole chain used to be unlaunchable at its first step.
+    const params = buildIssueParams(entry({ repoKey: 'theshwal/visipdp', issueNumber: 2024 }))
+    expect(params['issue_ref']).toBe('theshwal/visipdp#2024')
+    expect('issue_ref' in params).toBe(true)
   })
 
   it('buildIssueContext embeds the URL and body', () => {

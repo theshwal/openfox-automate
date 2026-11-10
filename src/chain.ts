@@ -61,6 +61,12 @@ export function buildIssueContext(entry: QueueEntry): string {
 
 export function buildIssueParams(entry: QueueEntry): Record<string, string> {
   return {
+    // `issue_ref` is a REQUIRED parameter of plan-issue / plan-issue-v3. The
+    // host refuses to launch a workflow whose required params are missing
+    // (src/server/runner/orchestrator.ts), so the chain could never start the
+    // planning step. The id is the stable, already-resolved target: the entry
+    // exists precisely because this issue was scanned and queued.
+    issue_ref: `${entry.repoKey}#${entry.issueNumber}`,
     issue_url: entry.url,
     issue_number: String(entry.issueNumber),
     issue_title: entry.title,
@@ -86,28 +92,46 @@ export interface ChainOutcome {
   finished: boolean
   blocked: boolean
   waiting: boolean
+  /** The host cancelled the execution: terminal, and NOT a retryable block. */
+  cancelled: boolean
 }
+
+/**
+ * Status vocabulary of the chain engine.
+ *
+ * `done` and `cancelled` come from the host adapter
+ * (`src/host-events.ts`): the OpenFox host emits `completed` (normalised to
+ * `done`) and `cancelled` (kept distinct so it is terminal without
+ * triggering the retry-once path).
+ */
+export type ChainEventStatus = 'pending' | 'running' | 'done' | 'blocked' | 'waiting' | 'cancelled'
 
 export function applyExecutionEvent(
   stack: ExecutionStep[],
   currentIndex: number,
-  event: { status: 'pending' | 'running' | 'done' | 'blocked' | 'waiting' },
+  event: { status: ChainEventStatus },
 ): ChainOutcome {
   const step = stack[currentIndex]
-  if (!step) return { nextStepIndex: currentIndex, finished: true, blocked: false, waiting: false }
+  if (!step) {
+    return { nextStepIndex: currentIndex, finished: true, blocked: false, waiting: false, cancelled: false }
+  }
   // 'waiting' (e.g. a user step is awaiting input) does not advance the chain.
   // Subsequent 'running' / 'done' events on the same step clear the wait.
   if (event.status === 'waiting') {
     step.status = 'waiting'
-    return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: true }
+    return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: true, cancelled: false }
+  }
+  // The host cancelled the execution (user abort, session stopped, …).
+  // It is terminal and explicit: the step is marked blocked (never 'done')
+  // and it does NOT consume a retry of the retry-once path.
+  if (event.status === 'cancelled') {
+    step.status = 'blocked'
+    step.finishedAt = new Date().toISOString()
+    return { nextStepIndex: currentIndex, finished: true, blocked: false, waiting: false, cancelled: true }
   }
   // Resume the step from any non-waiting status (covers user choice clearing
   // the wait without forcing a full status overwrite on the existing entry).
-  if (step.status === 'waiting') {
-    step.status = event.status
-  } else {
-    step.status = event.status
-  }
+  step.status = event.status
   if (event.status === 'done') {
     step.finishedAt = new Date().toISOString()
     return {
@@ -115,18 +139,19 @@ export function applyExecutionEvent(
       finished: currentIndex + 1 >= stack.length,
       blocked: false,
       waiting: false,
+      cancelled: false,
     }
   }
   if (event.status === 'blocked') {
     step.retryCount += 1
     if (step.retryCount >= 2) {
       step.finishedAt = new Date().toISOString()
-      return { nextStepIndex: currentIndex, finished: true, blocked: true, waiting: false }
+      return { nextStepIndex: currentIndex, finished: true, blocked: true, waiting: false, cancelled: false }
     }
     step.status = 'running'
-    return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: false }
+    return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: false, cancelled: false }
   }
-  return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: false }
+  return { nextStepIndex: currentIndex, finished: false, blocked: false, waiting: false, cancelled: false }
 }
 
 export function startChain(
@@ -161,7 +186,7 @@ export interface WorkflowExecutionChange {
   sessionId?: string | undefined
   workflowId?: string | undefined
   executionId?: string | undefined
-  status?: 'pending' | 'running' | 'done' | 'blocked' | undefined
+  status?: ChainEventStatus | undefined
 }
 
 export interface ProcessLaunch {
@@ -239,22 +264,41 @@ export function processWorkflowEvent(
   if (idx < 0) {
     return { launches: [], dedupKey, deduplicated: false }
   }
-  const prevRetry = stack[idx]!.retryCount
+  // Relevance guard: the host emits events for every workflow running in the
+  // session. Only the workflow the chain is currently running may drive the
+  // chain — an unrelated workflowId must not advance it.
+  const currentStep = stack[idx]!
+  if (event.workflowId && event.workflowId !== currentStep.workflowId) {
+    deps.log?.(
+      `[openfox-automate] workflow.execution.changed for a workflow outside the chain: workflowId=${event.workflowId} (running=${currentStep.workflowId}) status=${event.status}; ignored`,
+    )
+    return { launches: [], dedupKey, deduplicated: false }
+  }
+  const prevRetry = currentStep.retryCount
   const outcome = applyExecutionEvent(stack, idx, { status: event.status })
 
   const launches: ProcessLaunch[] = []
   let transitionTo: 'done' | 'blocked' | undefined
   let blockedReason: string | undefined
 
-  if (outcome.finished && !outcome.blocked) {
+  if (outcome.cancelled) {
+    // The host cancelled the execution: the entry is blocked explicitly so
+    // an operator can reprocess it. It is never reported as 'done'.
+    transitionTo = 'blocked'
+    blockedReason = `workflow ${event.workflowId ?? currentStep.workflowId} cancelled`
+  } else if (outcome.finished && !outcome.blocked) {
     transitionTo = 'done'
   } else if (outcome.blocked) {
     transitionTo = 'blocked'
-    blockedReason = `workflow ${event.workflowId ?? stack[idx]!.workflowId} blocked`
+    blockedReason = `workflow ${event.workflowId ?? currentStep.workflowId} blocked`
   } else if (event.status === 'done' && idx + 1 < stack.length) {
-    // Chain advance: launch the next workflow
+    // Chain advance: launch the next workflow. The next step becomes the
+    // 'running' step of the stack, otherwise the engine would no longer find
+    // a running step on the following event and the chain would stall.
     const nextStep = stack[idx + 1]!
     if (entry.sessionId) {
+      nextStep.status = 'running'
+      nextStep.startedAt = new Date().toISOString()
       launches.push({
         sessionId: entry.sessionId,
         workflowId: nextStep.workflowId,
@@ -267,7 +311,7 @@ export function processWorkflowEvent(
     if (entry.sessionId) {
       launches.push({
         sessionId: entry.sessionId,
-        workflowId: stack[idx]!.workflowId,
+        workflowId: currentStep.workflowId,
         content: deps.buildIssueContext(entry),
         params: deps.buildIssueParams(entry),
       })

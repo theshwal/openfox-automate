@@ -5,6 +5,7 @@ import {
   parseRepoOverrides,
   parseIgnoreLabels,
   readSettings,
+  settingsSchema,
 } from '../src/settings.js'
 import { DEFAULT_SETTINGS } from '../src/types.js'
 
@@ -43,6 +44,36 @@ describe('parseChain', () => {
   it('returns empty for undefined or empty', () => {
     expect(parseChain(undefined)).toEqual([])
     expect(parseChain('')).toEqual([])
+  })
+
+  it('default chain is the V3 chain, in stable workflow IDs', () => {
+    expect(parseChain(DEFAULT_SETTINGS['workflows.chain'])).toEqual([
+      'plan-issue-v3',
+      'build-verify-v3',
+      'publish-pr-v1',
+    ])
+  })
+
+  it('default chain carries no merge workflow', () => {
+    // publish-pr-v1 stops at the PR; the merge policy is read after publication.
+    const chain = parseChain(DEFAULT_SETTINGS['workflows.chain'])
+    expect(chain.some((id) => /merge|delivery/i.test(id))).toBe(false)
+  })
+
+  it('default chain is consistent with the settings schema default', () => {
+    const field = settingsSchema.fields.find((f) => f.key === 'workflows.chain')
+    expect(parseChain(typeof field?.default === 'string' ? field.default : undefined)).toEqual(
+      parseChain(DEFAULT_SETTINGS['workflows.chain']),
+    )
+  })
+
+  it('default chain uses IDs, not display names', () => {
+    // The host resolves launches with findWorkflowById(metadata.id); a display
+    // name such as "Plan Issue v2" cannot be resolved and the launch throws.
+    for (const id of parseChain(DEFAULT_SETTINGS['workflows.chain'])) {
+      expect(id).toBe(id.toLowerCase())
+      expect(id).not.toMatch(/\s/)
+    }
   })
 })
 

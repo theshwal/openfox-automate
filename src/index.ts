@@ -21,6 +21,7 @@ import { spawnSessionFor } from './spawner.js'
 import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent } from './chain.js'
 import { createOrchestration, type OpenFoxOrchestration } from './orchestration.js'
 import { getHostInternal } from './resolve-openfox.js'
+import { extractToolOutputText, normalizeWorkflowExecutionPayload, readSessionId } from './host-events.js'
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js'
 import { computeMetrics } from './metrics.js'
 import type { HealthReport, PluginSettings, QueueEntry } from './types.js'
@@ -81,8 +82,22 @@ function hasAnyPostToggle(settings: PluginSettings): boolean {
   )
 }
 
+/**
+ * Default chain, in STABLE WORKFLOW IDs.
+ *
+ * The host resolves a launch by `metadata.id` (`findWorkflowById` in
+ * src/server/runner/orchestrator.ts), never by display name — a name like
+ * "Plan Issue v2" cannot be resolved and the launch throws. The previous
+ * default used display names, so the fallback chain was unlaunchable.
+ *
+ * V3: plan -> build+verify -> publish. There is deliberately no merge
+ * workflow in the chain: `publish-pr-v1` stops at the PR, and the merge
+ * policy (owner, mode, method) is read by OpenFox after publication.
+ */
+const DEFAULT_CHAIN = ['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1']
+
 function defaultChain(): string[] {
-  return ['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2']
+  return [...DEFAULT_CHAIN]
 }
 
 function resolveChain(entry: QueueEntry, settings: PluginSettings): string[] {
@@ -636,14 +651,17 @@ export function register(registry: PluginRegistry): void {
   registry.registerHook(
     'tool.completed',
     safeHook('tool.completed', async (payload: unknown) => {
-      const p = payload as { sessionId?: string; output?: string }
-      if (!p.sessionId || !p.output) return
+      // The host nests the tool output under `data.result.output`; the
+      // adapter also accepts the legacy flat `{ sessionId, output }` shape.
+      const sessionId = readSessionId(payload)
+      const output = extractToolOutputText(payload)
+      if (!sessionId || !output) return
       const settings = readSettingsFromContext(context)
       const re = new RegExp(settings['pr.urlRegex'] ?? 'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)', 'i')
-      const match = re.exec(p.output)
+      const match = re.exec(output)
       if (!match) return
       const active = await rt.store.loadActive()
-      const entry = active.find((e) => e.sessionId === p.sessionId)
+      const entry = active.find((e) => e.sessionId === sessionId)
       if (!entry || entry.prUrl) return
       entry.prUrl = match[0]
       await rt.store.update(entry)
@@ -654,24 +672,23 @@ export function register(registry: PluginRegistry): void {
   registry.registerHook(
     'workflow.execution.changed',
     safeHook('workflow.execution.changed', async (payload: unknown) => {
-      const p = payload as {
-        sessionId?: string
-        workflowId?: string
-        status?: string
-        executionId?: string
-        currentStepId?: string
-      }
+      // The host nests the workflow fields under `data` and uses the status
+      // vocabulary 'running' | 'waiting' | 'completed' | 'cancelled' |
+      // 'blocked'. The adapter normalises it; an incomplete payload is
+      // ignored without launching anything.
+      const normalized = normalizeWorkflowExecutionPayload(payload)
+      if (!normalized) return
       const active = await rt.store.loadActive()
-      const entry = active.find((e) => e.sessionId === p.sessionId)
+      const entry = active.find((e) => e.sessionId === normalized.sessionId)
       if (!entry) return
 
       const outcome = processWorkflowEvent(
         entry,
         {
-          sessionId: p.sessionId,
-          workflowId: p.workflowId,
-          executionId: p.executionId,
-          status: p.status as 'pending' | 'running' | 'done' | 'blocked' | undefined,
+          sessionId: normalized.sessionId,
+          workflowId: normalized.workflowId,
+          executionId: normalized.executionId,
+          status: normalized.status,
         },
         {
           appliedExecutionEvents: rt.appliedExecutionEvents,
@@ -702,7 +719,7 @@ export function register(registry: PluginRegistry): void {
       } else if (outcome.transitionTo === 'blocked') {
         await rt.store.transitionTo(entry.id, 'blocked', {
           executionStack: entry.executionStack ?? [],
-          error: outcome.blockedReason ?? `workflow ${p.workflowId} blocked`,
+          error: outcome.blockedReason ?? `workflow ${normalized.workflowId} blocked`,
         })
         context.notify({
           title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },

@@ -34,10 +34,10 @@ export const settingsSchema: PluginSettingsSchema = {
       type: 'textarea',
       label: { en: 'Workflow chain', fr: 'Chaîne de workflows' },
       description: {
-        en: 'Ordered workflow IDs, one per line. Default: Plan Issue v2 → Build & Verify Auto v2 → Delivery v2.',
-        fr: 'Identifiants de workflows ordonnés, un par ligne. Défaut : Plan Issue v2 → Build & Verify Auto v2 → Delivery v2.',
+        en: 'Ordered stable workflow IDs, one per line — not display names, which the host cannot resolve. Default: plan-issue-v3 → build-verify-v3 → publish-pr-v1. There is no merge workflow: publish stops at the PR and the merge policy is read afterwards.',
+        fr: 'Identifiants de workflows stables ordonnés, un par ligne — pas les noms d’affichage, que l’hôte ne sait pas résoudre. Défaut : plan-issue-v3 → build-verify-v3 → publish-pr-v1. Aucun workflow de merge : publish s’arrête à la PR et la policy de merge est lue ensuite.',
       },
-      default: 'Plan Issue v2\nBuild & Verify Auto v2\nDelivery v2',
+      default: 'plan-issue-v3\nbuild-verify-v3\npublish-pr-v1',
     },
     {
       key: 'workflows.repoOverrides',
@@ -144,8 +144,8 @@ export const settingsSchema: PluginSettingsSchema = {
       type: 'textarea',
       label: { en: 'Comment template', fr: 'Modèle de commentaire' },
       description: {
-        en: 'Supports {{title}}, {{summary}}, {{sessionUrl}}, {{prUrl}}. Empty by default (Delivery v2 handles comments).',
-        fr: 'Supporte {{title}}, {{summary}}, {{sessionUrl}}, {{prUrl}}. Vide par défaut (Delivery v2 gère les commentaires).',
+        en: 'Supports {{title}}, {{summary}}, {{sessionUrl}}, {{prUrl}}. Empty by default (the publish workflow handles comments).',
+        fr: 'Supporte {{title}}, {{summary}}, {{sessionUrl}}, {{prUrl}}. Vide par défaut (le workflow de publication gère les commentaires).',
       },
       default: '',
     },
