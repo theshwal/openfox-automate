@@ -209,8 +209,14 @@ export function admit(
  * Reclaim expired leases.
  *
  * A reservation whose lease expired (the host crashed, the session died)
- * goes back to `queued` so it can be scheduled again. Without this, a
- * crash would permanently leak a worker slot.
+ * is BLOCKED, not silently re-queued.
+ *
+ * The distinction matters: the host session may STILL be running (the
+ * plugin lost track of it, but the host did not). Re-queueing the issue
+ * would let a second session start for the same issue while the first one
+ * is still working on it — a duplicate run, two agents editing the same
+ * code. Blocking keeps the issue visible and requires an operator to
+ * confirm the host session is really gone before it runs again.
  */
 export function reclaimExpiredLeases(state: ControlPlaneState, options: { now?: number } = {}): WorkItem[] {
   const now = options.now ?? Date.now()
@@ -218,10 +224,11 @@ export function reclaimExpiredLeases(state: ControlPlaneState, options: { now?: 
   for (const item of Object.values(state.items)) {
     if (item.status === 'reserved' || item.status === 'running') {
       if (item.leaseExpiresAt !== undefined && item.leaseExpiresAt <= now) {
-        item.status = 'queued'
-        item.sessionId = undefined
+        item.status = 'blocked'
         item.leaseExpiresAt = undefined
-        item.error = 'lease expired — reclaimed after an interrupted run'
+        item.error =
+          'lease expired — the host session may still be running; ' +
+          'confirm it is gone before reprocessing (prevents a duplicate session)'
         item.updatedAt = new Date(now).toISOString()
         reclaimed.push(item)
       }
@@ -379,7 +386,7 @@ export function recordTokenUsage(
   state: ControlPlaneState,
   sessionId: string,
   usage: Partial<TokenUsage>,
-  options: { now?: number } = {},
+  options: { now?: number; maxTokensPerIssue?: number } = {},
 ): WorkItem | null {
   const item = Object.values(state.items).find((i) => i.sessionId === sessionId)
   if (!item) return null
@@ -392,6 +399,17 @@ export function recordTokenUsage(
   item.tokens.llmCalls += usage.llmCalls ?? 0
   item.updatedAt = new Date(now).toISOString()
   state.updatedAt = item.updatedAt
+
+  // The budget is enforced on the LIVE run too, not only at reservation:
+  // a run that was already reserved keeps spending tokens, and the budget
+  // must stop it instead of only blocking the NEXT reservation.
+  const budget = options.maxTokensPerIssue ?? 0
+  if (budget > 0 && item.tokens.totalTokens >= budget && item.status === 'running') {
+    item.status = 'blocked'
+    item.error = `token budget exceeded (${item.tokens.totalTokens}/${budget})`
+    item.updatedAt = new Date(now).toISOString()
+    state.updatedAt = item.updatedAt
+  }
   return item
 }
 

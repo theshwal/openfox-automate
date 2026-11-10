@@ -132,8 +132,14 @@ export declare function admit(state: ControlPlaneState, candidates: AdmissionCan
  * Reclaim expired leases.
  *
  * A reservation whose lease expired (the host crashed, the session died)
- * goes back to `queued` so it can be scheduled again. Without this, a
- * crash would permanently leak a worker slot.
+ * is BLOCKED, not silently re-queued.
+ *
+ * The distinction matters: the host session may STILL be running (the
+ * plugin lost track of it, but the host did not). Re-queueing the issue
+ * would let a second session start for the same issue while the first one
+ * is still working on it — a duplicate run, two agents editing the same
+ * code. Blocking keeps the issue visible and requires an operator to
+ * confirm the host session is really gone before it runs again.
  */
 export declare function reclaimExpiredLeases(state: ControlPlaneState, options?: {
     now?: number;
@@ -186,6 +192,7 @@ export declare function completeItem(state: ControlPlaneState, key: string, stat
  */
 export declare function recordTokenUsage(state: ControlPlaneState, sessionId: string, usage: Partial<TokenUsage>, options?: {
     now?: number;
+    maxTokensPerIssue?: number;
 }): WorkItem | null;
 export interface ControlPlaneMetrics {
     total: number;

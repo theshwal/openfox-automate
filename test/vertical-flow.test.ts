@@ -420,10 +420,7 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
     await new Promise((r) => setTimeout(r, 0))
 
     const addRaw = sim.calls.rpc.find((r) => r.name === 'automate.addIssueRaw')!
-    const first = (await addRaw.fn(
-      { repoKey: 'acme/widgets', title: 'A', body: '' },
-      sim.registry.context,
-    )) as QueueEntry
+    await addRaw.fn({ repoKey: 'acme/widgets', title: 'A', body: '' }, sim.registry.context)
     // `add_issue_raw` derives its issue number from Date.now(), so a second
     // call in the same millisecond would collide with the first one and be
     // deduplicated away. The queue is therefore seeded through the scan
@@ -454,13 +451,25 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
     const scanNow = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
     await scanNow.fn({}, sim.registry.context)
 
-    const startIssue = sim.calls.rpc.find((r) => r.name === 'automate.startIssue')!
-    await startIssue.fn({ queueId: first.id }, sim.registry.context)
+    // The ceiling is 1, so the CONTROL PLANE owns the scheduling: it
+    // reserves and starts exactly one issue. The legacy `startIssue` path
+    // must then refuse the other one — that is the guarantee that a single
+    // scheduler owns the queue.
+    const schedule = sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!
+    const scheduled = (await schedule.fn({}, sim.registry.context)) as { started: number }
+    expect(scheduled.started).toBe(1)
 
-    // One session is running: the ceiling of 1 is reached, so the second
-    // issue must stay queued.
+    // The second issue is still queued: the ceiling of 1 is respected.
     const entries = readJson<QueueEntry[]>(sim.backing, 'queue')!
     expect(entries.filter((e) => e.status === 'running')).toHaveLength(1)
     expect(entries.filter((e) => e.status === 'queued')).toHaveLength(1)
+
+    // Asking the legacy path to start the queued one is refused: the
+    // control plane already holds the only slot.
+    const queuedEntry = entries.find((e) => e.status === 'queued')!
+    const startIssue = sim.calls.rpc.find((r) => r.name === 'start_issue')!
+    await expect(startIssue.fn({ queueId: queuedEntry.id }, sim.registry.context)).rejects.toThrow(
+      /already reserved by the control plane/,
+    )
   })
 })

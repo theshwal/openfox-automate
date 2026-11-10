@@ -60,7 +60,11 @@ export const settingsSchema = {
             key: 'scan.startupScan',
             type: 'boolean',
             label: { en: 'Run a scan immediately on plugin start', fr: 'Lancer un scan au démarrage du plugin' },
-            default: true,
+            description: {
+                en: 'Off by default. A startup scan only READS GitHub; it never creates a session by itself.',
+                fr: 'Désactivé par défaut. Un scan au démarrage ne fait que LIRE GitHub ; il ne crée jamais de session.',
+            },
+            default: false,
         },
         {
             key: 'scan.ignoreLabels',
@@ -117,7 +121,11 @@ export const settingsSchema = {
                 en: 'Dry run (no sessions created, no GitHub writes)',
                 fr: 'Simulation (aucune session créée, aucune écriture GitHub)',
             },
-            default: false,
+            description: {
+                en: 'ON by default: enabling the plugin never creates a session, never writes to GitHub and never launches a workflow until you turn this off.',
+                fr: 'ACTIVÉ par défaut : activer le plugin ne crée aucune session, n’écrit rien sur GitHub et ne lance aucun workflow tant que vous ne l’avez pas désactivé.',
+            },
+            default: true,
         },
         {
             key: 'history.retentionCount',

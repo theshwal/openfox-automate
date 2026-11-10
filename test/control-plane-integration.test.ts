@@ -326,8 +326,15 @@ describe('AC12 — the host mechanisms are reused, not duplicated', () => {
     await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
 
     // The scheduler reserved the issue and started a session, but it did
-    // NOT launch a workflow: the chain engine owns that.
-    expect(sim.launched).toHaveLength(0)
+    // The scheduler reserved the issue and delegated to the CHAIN ENGINE:
+    // exactly ONE workflow is launched, and it is the first step of the
+    // chain. The control plane does not run a workflow of its own — it
+    // reuses the existing engine (regression: the scheduler used to create
+    // a session directly, producing a session the chain engine could never
+    // see, and the legacy path could then start a SECOND session for the
+    // same issue).
+    expect(sim.launched).toHaveLength(1)
+    expect(sim.launched[0]?.workflowId).toBe('plan-issue-v3')
     expect(controlPlaneOf(sim).items['acme/widgets#1']?.status).toBe('running')
   })
 

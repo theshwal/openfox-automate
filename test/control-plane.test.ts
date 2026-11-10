@@ -181,7 +181,12 @@ describe('reservation and capacity', () => {
 })
 
 describe('lease and crash recovery', () => {
-  it('reclaims an expired lease so a crash does not leak a slot', () => {
+  it('BLOCKS an expired lease instead of re-queueing it (no duplicate session)', () => {
+    // The host session may STILL be running when the lease expires: the
+    // plugin lost track of it, the host did not. Re-queueing the issue
+    // would start a SECOND session for the same issue while the first one
+    // is still working on it. The issue is therefore blocked and needs an
+    // explicit operator decision.
     const state = emptyControlPlaneState()
     admit(state, [candidate(1), candidate(2)], { now: T0 })
     reserve(state, {
@@ -200,21 +205,22 @@ describe('lease and crash recovery', () => {
     })
     expect(early.reserved).toHaveLength(0)
 
-    // After the lease expires, EVERY expired reservation is reclaimed.
+    // After the lease expires, the expired reservation is BLOCKED.
     const reclaimed = reclaimExpiredLeases(state, { now: T0 + 2000 })
     expect(reclaimed.length).toBeGreaterThanOrEqual(1)
     for (const item of reclaimed) {
-      expect(item.status).toBe('queued')
-      expect(item.sessionId).toBeUndefined()
+      expect(item.status).toBe('blocked')
+      expect(item.error).toContain('lease expired')
     }
 
+    // A blocked item is never re-reserved: no duplicate session.
     const after = reserve(state, {
       ...DEFAULT_CONTROL_PLANE_OPTIONS,
       maxWorkersPerRepo: 5,
       leaseMs: 1000,
       now: T0 + 2000,
     })
-    expect(after.reserved.length).toBeGreaterThanOrEqual(1)
+    expect(after.reserved.map((i) => i.key)).not.toContain('acme/widgets#1')
   })
 
   it('does not reclaim a live lease', () => {
@@ -230,9 +236,12 @@ describe('lease and crash recovery', () => {
     admit(state, [candidate(1)], { now: T0 })
     reserve(state, { ...DEFAULT_CONTROL_PLANE_OPTIONS, leaseMs: 1000, now: T0 })
     expect(state.items['acme/widgets#1']?.attempt).toBe(1)
+    // After the lease expires the issue is BLOCKED (not re-queued), so it
+    // is not reserved again: an operator must release it explicitly.
     reclaimExpiredLeases(state, { now: T0 + 2000 })
     reserve(state, { ...DEFAULT_CONTROL_PLANE_OPTIONS, leaseMs: 1000, now: T0 + 2000 })
-    expect(state.items['acme/widgets#1']?.attempt).toBe(2)
+    expect(state.items['acme/widgets#1']?.attempt).toBe(1)
+    expect(state.items['acme/widgets#1']?.status).toBe('blocked')
   })
 })
 
@@ -266,33 +275,27 @@ describe('budget and token accounting', () => {
     expect(recordTokenUsage(state, 'sess-unknown', { totalTokens: 10 }, { now: T0 })).toBeNull()
   })
 
-  it('blocks an item that exceeded its token budget', () => {
+  it('blocks a RUNNING item as soon as it exceeds its token budget', () => {
+    // The budget must stop the LIVE run, not only the next reservation.
     const state = emptyControlPlaneState()
     admit(state, [candidate(1)], { now: T0 })
     reserve(state, { ...DEFAULT_CONTROL_PLANE_OPTIONS, now: T0 })
     markRunning(state, 'acme/widgets#1', 'sess-1', { now: T0 })
-    recordTokenUsage(state, 'sess-1', { totalTokens: 5000 }, { now: T0 })
-    completeItem(state, 'acme/widgets#1', 'queued', { now: T0 })
 
-    const result = reserve(state, {
-      ...DEFAULT_CONTROL_PLANE_OPTIONS,
-      maxTokensPerIssue: 1000,
-      now: T0,
-    })
-    expect(result.reserved).toHaveLength(0)
+    recordTokenUsage(state, 'sess-1', { totalTokens: 5000 }, { now: T0, maxTokensPerIssue: 1000 })
+
     expect(state.items['acme/widgets#1']?.status).toBe('blocked')
     expect(state.items['acme/widgets#1']?.error).toContain('token budget')
   })
 
-  it('never blocks on the budget when it is unlimited', () => {
+  it('does not block on the budget when it is unlimited', () => {
     const state = emptyControlPlaneState()
     admit(state, [candidate(1)], { now: T0 })
     reserve(state, { ...DEFAULT_CONTROL_PLANE_OPTIONS, now: T0 })
     markRunning(state, 'acme/widgets#1', 'sess-1', { now: T0 })
-    recordTokenUsage(state, 'sess-1', { totalTokens: 500_000 }, { now: T0 })
-    completeItem(state, 'acme/widgets#1', 'queued', { now: T0 })
-    const result = reserve(state, { ...DEFAULT_CONTROL_PLANE_OPTIONS, maxTokensPerIssue: 0, now: T0 })
-    expect(result.reserved).toHaveLength(1)
+    recordTokenUsage(state, 'sess-1', { totalTokens: 500_000 }, { now: T0, maxTokensPerIssue: 0 })
+
+    expect(state.items['acme/widgets#1']?.status).toBe('running')
   })
 })
 

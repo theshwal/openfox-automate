@@ -138,20 +138,34 @@ export function processWorkflowEvent(entry, event, deps) {
         deps.log?.(`[openfox-automate] workflow.execution.changed without executionId: status=${event.status} workflowId=${event.workflowId ?? '?'} sessionId=${event.sessionId}; ignored`);
         return { launches: [], dedupKey: null, deduplicated: false };
     }
+    // The dedup key is (executionId, status).
+    //
+    // The host reuses the SAME executionId when a paused execution resumes
+    // (`resumeWorkflow` emits 'running' with the execution id it already
+    // has), so the 'running' marker is DROPPED when the step goes to
+    // 'waiting'. Without that, the resume was swallowed as a duplicate and
+    // the chain stalled forever on a user step.
     const dedupKey = `${event.executionId}:${event.status}`;
     if (deps.appliedExecutionEvents.has(dedupKey)) {
         return { launches: [], dedupKey, deduplicated: true };
     }
+    if (event.status === 'waiting') {
+        // A pause invalidates the 'running' marker: the next 'running' for
+        // this execution is the RESUME, not a duplicate of the start.
+        deps.appliedExecutionEvents.delete(`${event.executionId}:running`);
+    }
     deps.appliedExecutionEvents.add(dedupKey);
+    // The current step is the one that is running OR waiting: a paused step
+    // is resumed in place, so it must stay selectable while it waits.
     const stack = entry.executionStack ?? [];
-    const idx = stack.findIndex((s) => s.status === 'running');
+    const idx = stack.findIndex((s) => s.status === 'running' || s.status === 'waiting');
     if (idx < 0) {
         return { launches: [], dedupKey, deduplicated: false };
     }
+    const currentStep = stack[idx];
     // Relevance guard: the host emits events for every workflow running in the
     // session. Only the workflow the chain is currently running may drive the
     // chain — an unrelated workflowId must not advance it.
-    const currentStep = stack[idx];
     if (event.workflowId && event.workflowId !== currentStep.workflowId) {
         deps.log?.(`[openfox-automate] workflow.execution.changed for a workflow outside the chain: workflowId=${event.workflowId} (running=${currentStep.workflowId}) status=${event.status}; ignored`);
         return { launches: [], dedupKey, deduplicated: false };

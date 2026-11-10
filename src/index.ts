@@ -13,6 +13,7 @@ import {
   parseChain,
   parseRepoOverrides,
   parseIgnoreLabels,
+  clampSettings,
 } from './settings.js'
 import { QueueStore, isTerminated, newEntryId } from './queue.js'
 import { orderQueue, findMissingDependencies } from './ordering.js'
@@ -84,7 +85,11 @@ export function _hasActiveRuntimeForTesting(): boolean {
 function readSettingsFromContext(context: PluginContext): PluginSettings {
   const raw = (context.settings ? context.settings() : {}) as Record<string, unknown>
   const merged: Record<string, unknown> = { ...DEFAULT_SETTINGS, ...raw }
-  return merged as PluginSettings
+  // The clamps are applied on the REAL path: the host validates the
+  // settings form, but a value set through another route (or a future
+  // host version) must not be able to push the worker count past its
+  // ceiling.
+  return clampSettings(merged as PluginSettings)
 }
 
 function hasAnyPostToggle(settings: PluginSettings): boolean {
@@ -315,29 +320,43 @@ async function scheduleControlPlane(rt: Runtime): Promise<number> {
       continue
     }
     try {
-      const session = await spawnSessionFor(
-        {
-          id: item.key,
-          repoKey: item.repoKey,
-          projectId: item.projectId,
-          issueNumber: item.issueNumber,
-          title: item.title,
-          body: '',
-          url: item.url,
-          labels: [],
-          comments: [],
-          dependsOn: item.dependsOn,
-          status: 'running',
-          position: 0,
-          addedAt: new Date().toISOString(),
-        },
-        { context: rt.context },
-      )
-      const sessionId = session.id
-      await rt.controlPlane.mutate((state) => {
-        markRunning(state, item.key, sessionId)
-      })
-      started += 1
+      // The control plane must reuse the chain engine, not duplicate it:
+      // the issue is written to the legacy queue and spawned through
+      // `spawnEntry`, which creates the session AND launches the chain.
+      // Spawning the session directly here produced a session the chain
+      // engine could never see.
+      //
+      // The control plane keys an issue by `<repoKey>#<issueNumber>` while
+      // the legacy queue uses its own entry id. The EXISTING queue entry is
+      // reused when there is one, so the two views stay consistent.
+      const active = await rt.store.loadActive()
+      const existing = active.find((e) => e.repoKey === item.repoKey && e.issueNumber === item.issueNumber)
+      const queueEntry: QueueEntry = existing ?? {
+        id: item.key,
+        repoKey: item.repoKey,
+        projectId: item.projectId,
+        issueNumber: item.issueNumber,
+        title: item.title,
+        body: '',
+        url: item.url,
+        labels: [],
+        comments: [],
+        dependsOn: item.dependsOn,
+        status: 'queued',
+        position: 0,
+        addedAt: new Date().toISOString(),
+      }
+      if (!existing) {
+        await rt.store.update(queueEntry)
+      }
+      const spawned = await spawnEntry(rt, { ...queueEntry, status: 'queued' })
+      if (spawned.status === 'running') {
+        started += 1
+      } else {
+        await rt.controlPlane.mutate((state) => {
+          completeItem(state, item.key, 'failed', { error: spawned.error ?? 'could not start' })
+        })
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       // Fail closed: the slot is released, the issue is recorded as failed.
@@ -350,15 +369,43 @@ async function scheduleControlPlane(rt: Runtime): Promise<number> {
   return started
 }
 
+/**
+ * Spawn the next queued issue, honouring the control plane.
+ *
+ * The control plane is the ONLY scheduler. The legacy path used to spawn
+ * on its own, so an issue could get TWO sessions: one from the control
+ * plane and one from here (both schedulers saw the same queue). The
+ * reservation is now taken BEFORE the session is created and is released
+ * if the creation fails, so a second caller finds the issue already
+ * reserved and skips it.
+ */
+/**
+ * Allocate a unique issue number for a manually added issue.
+ *
+ * The number must be unique per repository: the control plane keys an
+ * issue by `<repoKey>#<issueNumber>`, so two manual entries sharing a
+ * number would be treated as the same issue.
+ */
+async function nextManualIssueNumber(rt: Runtime, repoKey: string): Promise<number> {
+  const active = await rt.store.loadActive()
+  const used = new Set(active.filter((e) => e.repoKey === repoKey).map((e) => e.issueNumber))
+  // Start from the current time (stable and sortable) and walk forward
+  // until the number is free.
+  let candidate = Date.now()
+  while (used.has(candidate)) {
+    candidate += 1
+  }
+  return candidate
+}
+
 async function pickAndSpawnNext(rt: Runtime): Promise<QueueEntry | null> {
   const settings = readSettingsFromContext(rt.context)
-  const maxGlobal = settings['batch.maxConcurrency'] ?? 3
-  const maxPerRepo = settings['batch.maxConcurrencyPerRepo'] ?? 2
+  const options = controlPlaneOptionsFromSettings(settings)
   const dryRun = Boolean(settings.dryRun)
 
   const active = await rt.store.loadActive()
   const runningCount = active.filter((e) => e.status === 'running').length
-  if (runningCount >= maxGlobal) return null
+  if (runningCount >= options.maxWorkers) return null
   const runningByRepo = new Map<string, number>()
   for (const e of active) {
     if (e.status === 'running') runningByRepo.set(e.repoKey, (runningByRepo.get(e.repoKey) ?? 0) + 1)
@@ -366,13 +413,35 @@ async function pickAndSpawnNext(rt: Runtime): Promise<QueueEntry | null> {
 
   for (const entry of active) {
     if (entry.status !== 'queued') continue
+    const perRepoCount = runningByRepo.get(entry.repoKey) ?? 0
+    if (perRepoCount >= options.maxWorkersPerRepo) continue
     if (dryRun) {
       rt.context.logger.info(`[DRY RUN] would spawn session for ${entry.repoKey}#${entry.issueNumber}`)
       return entry
     }
-    const perRepoCount = runningByRepo.get(entry.repoKey) ?? 0
-    if (perRepoCount >= maxPerRepo) continue
-    return await spawnEntry(rt, entry)
+
+    // Reserve the issue in the control plane BEFORE creating the session.
+    // The reservation is exclusive: if another scheduler already holds it,
+    // this one skips the issue instead of creating a second session.
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    const reserved = await rt.controlPlane.mutate((state) => {
+      const alreadyHeld = state.items[key]?.status === 'reserved' || state.items[key]?.status === 'running'
+      if (alreadyHeld) return false
+      const result = reserve(state, options)
+      return result.reserved.some((item) => item.key === key)
+    })
+    if (!reserved) continue
+
+    try {
+      return await spawnEntry(rt, entry)
+    } catch (err) {
+      // Fail closed: release the reservation so the issue is not stuck.
+      const message = err instanceof Error ? err.message : String(err)
+      await rt.controlPlane.mutate((state) => {
+        completeItem(state, key, 'failed', { error: message })
+      })
+      throw err
+    }
   }
   return null
 }
@@ -396,6 +465,14 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
   try {
     const session = await spawnSessionFor(updated, { context: rt.context })
     if (session.id) updated.sessionId = session.id
+    // Keep the control plane in sync with the chain engine: the issue is
+    // now attached to a live session, so the budget and the lease can be
+    // attributed to it.
+    if (session.id) {
+      await rt.controlPlane.mutate((state) => {
+        markRunning(state, `${entry.repoKey}#${entry.issueNumber}`, session.id)
+      })
+    }
     if (chain.length > 0) {
       // startChain returns a stack with the first workflow marked running —
       // assign it back so subsequent reads (RPC, hooks, store) see the
@@ -625,7 +702,46 @@ export function register(registry: PluginRegistry): void {
     const entry = await rt.store.findById(queueId)
     if (!entry) throw new Error(`queue entry not found: ${queueId}`)
     if (entry.status !== 'queued') throw new Error(`cannot start entry in status ${entry.status}`)
-    return await spawnEntry(rt, entry)
+    // The control plane is the only scheduler: the reservation is taken
+    // BEFORE the session is created, so an issue already handled by the
+    // control plane is never started a second time.
+    const settings = readSettingsFromContext(context)
+    const options = controlPlaneOptionsFromSettings(settings)
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    const reserved = await rt.controlPlane.mutate((state) => {
+      const existing = state.items[key]
+      const alreadyHeld = existing?.status === 'reserved' || existing?.status === 'running'
+      if (alreadyHeld) return false
+      // The issue may not be in the registry yet (it was added manually):
+      // admit it first so the reservation has something to attach to.
+      if (!existing) {
+        admit(state, [
+          {
+            repoKey: entry.repoKey,
+            projectId: entry.projectId,
+            issueNumber: entry.issueNumber,
+            title: entry.title,
+            url: entry.url,
+            labels: entry.labels,
+            dependsOn: entry.dependsOn,
+          },
+        ])
+      }
+      return reserve(state, options).reserved.some((item) => item.key === key)
+    })
+    if (!reserved) {
+      throw new Error(`issue ${key} is already reserved by the control plane`)
+    }
+    // `spawnEntry` reports a failure in the returned entry rather than
+    // throwing, so the reservation is released here when the entry did not
+    // start: the issue must not stay reserved forever.
+    const spawned = await spawnEntry(rt, entry)
+    if (spawned.status !== 'running') {
+      await rt.controlPlane.mutate((state) => {
+        completeItem(state, key, 'failed', { error: spawned.error ?? 'could not start' })
+      })
+    }
+    return spawned
   })
 
   registry.registerRpc(`${RPC_NAMESPACE}cancelIssue`, async (params: unknown) => {
@@ -722,11 +838,17 @@ export function register(registry: PluginRegistry): void {
     const repos = parseRepoMapping(settings['repos.mapping'])
     const mapping = repos.find((r) => r.repoKey === p.repoKey)
     if (!mapping) throw new Error(`no project mapping for ${p.repoKey}`)
+    // A manual entry has no GitHub issue number. `Date.now()` was used, but
+    // two calls in the same millisecond produced the SAME number — and the
+    // control plane keys an issue by `<repoKey>#<issueNumber>`, so the
+    // second entry was seen as a duplicate of the first and could never
+    // be scheduled. A monotonic counter keeps the keys unique.
+    const issueNumber = await nextManualIssueNumber(rt, p.repoKey)
     const entry: QueueEntry = {
       id: newEntryId(),
       repoKey: p.repoKey,
       projectId: mapping.projectId,
-      issueNumber: Date.now(),
+      issueNumber,
       title: p.title,
       body: p.body,
       url: '',
@@ -897,15 +1019,21 @@ export function register(registry: PluginRegistry): void {
         const value = Number(data[key])
         return Number.isFinite(value) ? value : 0
       }
+      const budget = controlPlaneOptionsFromSettings(readSettingsFromContext(context)).maxTokensPerIssue
       await rt.controlPlane.mutate((state) => {
-        recordTokenUsage(state, sessionId, {
-          promptTokens: num('promptTokens'),
-          completionTokens: num('completionTokens'),
-          totalTokens: num('totalTokens'),
-          cachedPromptTokens: num('cachedPromptTokens'),
-          cacheWriteTokens: num('cacheWriteTokens'),
-          llmCalls: 1,
-        })
+        recordTokenUsage(
+          state,
+          sessionId,
+          {
+            promptTokens: num('promptTokens'),
+            completionTokens: num('completionTokens'),
+            totalTokens: num('totalTokens'),
+            cachedPromptTokens: num('cachedPromptTokens'),
+            cacheWriteTokens: num('cacheWriteTokens'),
+            llmCalls: 1,
+          },
+          { maxTokensPerIssue: budget },
+        )
       })
     }),
   )
