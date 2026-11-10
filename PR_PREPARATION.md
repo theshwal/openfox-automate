@@ -28,13 +28,13 @@ tests address the namespaced methods. The `dist/*` conflicts were
 resolved by regenerating `dist/` from source, which is the correct
 resolution for build output.
 
-**Preparation branch:** `feat/host-event-adapters-v2` @ `e10e7b6`
+**Preparation branch:** `feat/host-event-adapters-v2` @ `a246b16`
 (worktree `/tmp/ofx-worktrees/rebase`).
 
 ## 2. Final diff
 
 ```
-60 files changed, 6265 insertions(+), 189 deletions(-)
+74 files changed, 7755 insertions(+), 403 deletions(-)
 ```
 
 Source only (the rest is `dist/`, which is committed build output):
@@ -50,8 +50,10 @@ Source only (the rest is `dist/`, which is committed build output):
 | `src/ordering.ts` | +20 — empty-pattern hang fix |
 | `src/settings.ts` | +60/−… — safe defaults, new settings, clamps |
 | `src/types.ts` | +17/−… — new settings keys and defaults |
+| `src/state-ownership.ts` | NEW (103) — single authority for the scheduling state |
+| `src/resolve-openfox.ts` | −119/+… — the fragile internals import removed |
 
-## 3. Commits (7, in review order)
+## 3. Commits (9, in review order)
 
 | # | Commit | Scope |
 |---|---|---|
@@ -62,6 +64,8 @@ Source only (the rest is `dist/`, which is committed build output):
 | 5 | `64c95a0` `fix(safety)` | one scheduler, no duplicate session, fail-closed lease and budget |
 | 6 | `8c21237` `feat(host-contract)` | pin the 2.0.161 host contracts; harden the base URL |
 | 7 | `e10e7b6` `test` | adapt the RPC names to the namespaced convention of main |
+| 8 | `b963c72` `refactor(state)` | one source of truth; the fragile internals import removed |
+| 9 | `a246b16` `docs` | the resolver header describes the resolver as it now is |
 
 ## 4. Recommended PR segmentation
 
@@ -110,8 +114,18 @@ board is not reachable from a plugin, so this is a *functional* duplicate
 of the host's scheduling — deliberate, and documented in the module.
 
 ### PR 3 — `fix: single scheduler, fail-closed safety, safe defaults`
-Commits 5 + 6 + 7. 1 220 insertions / 134 deletions. *Hardening; can be
+Commits 5 + 6 + 7 + 8 + 9. *Hardening and structural cleanup; can be
 merged last or squashed into PR 2.*
+- one scheduler, no duplicate session;
+- expired lease blocks instead of duplicating;
+- the token budget stops a live run;
+- safe defaults (`dryRun` on, no startup scan);
+- the host contract tests and the base-URL hardening;
+- the RPC names follow the namespace introduced on `main`;
+- **one source of truth** for the scheduling state (`src/state-ownership.ts`);
+- **the fragile internals import removed** (`resolve-openfox.ts` used to
+  import `dist/server/session` / `dist/server/runner`, paths that do not
+  exist in the published package).
 - One scheduler only: the control plane writes to the legacy queue and
   spawns through the chain engine; `start_issue` and the legacy path
   refuse an issue the control plane already holds. A test showed **2
@@ -147,8 +161,8 @@ merged last or squashed into PR 2.*
 Run in the isolated worktree only. No daemon, no port, no network.
 
 ```bash
-npm test        # Test Files 21 passed | 1 skipped (22)
-                # Tests      218 passed | 16 skipped (234)
+npm test        # Test Files 22 passed | 1 skipped (23)
+                # Tests      227 passed | 16 skipped (243)
 npm run typecheck   # tsc --noEmit — clean
 npm run lint       # eslint . --ext .ts — clean
 npm run format     # prettier --check . — All matched files use Prettier code style!
@@ -165,7 +179,7 @@ The 16 skipped tests are the `OPENFOX_E2E`-gated suite (`test/e2e/`).
 |---|---|---|
 | The host contract is pinned to **2.0.161**; the devDependency is still `2.0.160` | Medium | The payload shapes were verified on **both**; the devDependency should be bumped to `2.0.161` in a follow-up (not done here — it would change the lockfile). |
 | The plugin cannot create a session or launch a workflow on its own: `PluginContext` exposes no such API | **High (pre-existing)** | `src/host-client.ts` uses the host's documented HTTP API. The host's **port** and **network token** are not exposed to a plugin, so the base URL must be configured and the token supplied when the host's auth strategy is `network`. **This is the main precondition below.** |
-| The control plane duplicates the host's task board functionally | Medium | Deliberate and documented: the host's task board is not reachable from a plugin. Not a duplication of the *runner*. |
+| The control plane duplicates the host's task board functionally | Medium | Deliberate and documented in `COMPONENT_JUSTIFICATION.md`: the host's task board is not reachable from a plugin. Not a duplication of the *runner*. `UPSTREAM_PROPOSAL.md` proposes exposing it, which would let the plugin delete its own scheduler. |
 | The user workflows `plan-issue-v3` / `build-verify-v3` / `publish-pr-v1` could not be read | Medium | Their content is **unverified** (access to `~/.config/openfox` was refused). The `issue_ref` parameter is required by `plan-issue-v3` per a code comment, not against the file itself. **Must be confirmed before enabling the plugin for real.** |
 | The `dist/` conflicts were resolved by regeneration | Low | `npm run build` is now reproducible and the packaging test proves the artefact matches the source. |
 
