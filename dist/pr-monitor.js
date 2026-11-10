@@ -15,7 +15,60 @@
  * entries reference the same PR.
  */
 import { getPullRequest } from './github.js';
+import { completeItem } from './control-plane.js';
+import { syncQueueStatus } from './state-ownership.js';
 import { RPC_NAMESPACE } from './constants.js';
+/**
+ * Move an entry to a terminal status, through the control plane.
+ *
+ * The control plane is the authority: it is updated FIRST, and the legacy
+ * queue entry is then written from it. Writing the legacy entry alone
+ * (the previous behaviour) left the two views disagreeing — the control
+ * plane still said 'running' while the entry said 'done', so the issue
+ * could never be scheduled again.
+ */
+async function transitionThroughControlPlane(deps, entry, status, error) {
+    if (!deps.controlPlane) {
+        await deps.store.transitionTo(entry.id, status, {
+            finishedAt: new Date().toISOString(),
+            ...(error ? { error } : {}),
+        });
+        return;
+    }
+    const key = `${entry.repoKey}#${entry.issueNumber}`;
+    await deps.controlPlane.mutate((state) => {
+        if (!state.items[key]) {
+            state.items[key] = {
+                key,
+                repoKey: entry.repoKey,
+                projectId: '',
+                issueNumber: entry.issueNumber,
+                title: '',
+                url: '',
+                status: 'queued',
+                priority: 0,
+                dependsOn: [],
+                attempt: 0,
+                tokens: {
+                    promptTokens: 0,
+                    completionTokens: 0,
+                    totalTokens: 0,
+                    cachedPromptTokens: 0,
+                    cacheWriteTokens: 0,
+                    llmCalls: 0,
+                },
+                updatedAt: new Date().toISOString(),
+            };
+        }
+        completeItem(state, key, status, error ? { error } : {});
+    });
+    const item = await deps.controlPlane.mutate((state) => state.items[key]);
+    const patched = syncQueueStatus(entry, item);
+    await deps.store.transitionTo(entry.id, patched.status, {
+        finishedAt: new Date().toISOString(),
+        ...(patched.error ? { error: patched.error } : {}),
+    });
+}
 export async function monitorPRs(deps) {
     const result = { checked: 0, failed: 0, completed: 0, errors: [], rateLimit: null };
     const signal = deps.signal;
@@ -68,9 +121,7 @@ export async function monitorPRs(deps) {
         result.checked += 1;
         const pr = cached.pr;
         if (pr.merged) {
-            await deps.store.transitionTo(entry.id, 'done', {
-                finishedAt: new Date().toISOString(),
-            });
+            await transitionThroughControlPlane(deps, entry, 'done');
             result.completed += 1;
             deps.notify({
                 title: { en: 'PR merged', fr: 'PR fusionnée' },
@@ -83,10 +134,7 @@ export async function monitorPRs(deps) {
             continue;
         }
         if (pr.state === 'open' && pr.mergeable === false) {
-            await deps.store.transitionTo(entry.id, 'failed', {
-                finishedAt: new Date().toISOString(),
-                error: 'pr_conflicts',
-            });
+            await transitionThroughControlPlane(deps, entry, 'failed', 'pr_conflicts');
             result.failed += 1;
             deps.notify({
                 title: { en: 'PR has conflicts', fr: 'PR en conflit' },

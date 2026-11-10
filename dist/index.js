@@ -15,7 +15,7 @@ import { createOrchestration } from './orchestration.js';
 import { getHostInternal } from './resolve-openfox.js';
 import { extractToolOutputText, normalizeWorkflowExecutionPayload, readSessionId } from './host-events.js';
 import { ControlPlaneStore, controlPlaneOptionsFromSettings } from './control-plane-store.js';
-import { syncQueueStatus } from './state-ownership.js';
+import { findDivergence, syncQueueStatus } from './state-ownership.js';
 import { admit, completeItem, computeControlPlaneMetrics, markRunning, recordTokenUsage, reserve, } from './control-plane.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
@@ -342,6 +342,29 @@ async function nextManualIssueNumber(rt, repoKey) {
     }
     return candidate;
 }
+/**
+ * Report every divergence between the control plane (the authority) and
+ * the legacy queue (the mirror).
+ *
+ * The detector existed but was never called from the runtime, so a drift
+ * was invisible in production. It is called on every status read and
+ * logged as a warning.
+ */
+async function collectDivergences(rt) {
+    const active = await rt.store.loadActive();
+    const state = await rt.controlPlane.read((s) => s);
+    const divergences = [];
+    for (const entry of active) {
+        const key = `${entry.repoKey}#${entry.issueNumber}`;
+        const item = state.items[key];
+        if (!item)
+            continue;
+        const divergence = findDivergence(entry, item);
+        if (divergence)
+            divergences.push(`${key}: ${divergence}`);
+    }
+    return divergences;
+}
 async function pickAndSpawnNext(rt) {
     const settings = readSettingsFromContext(rt.context);
     const options = controlPlaneOptionsFromSettings(settings);
@@ -368,13 +391,49 @@ async function pickAndSpawnNext(rt) {
         // Reserve the issue in the control plane BEFORE creating the session.
         // The reservation is exclusive: if another scheduler already holds it,
         // this one skips the issue instead of creating a second session.
+        //
+        // The reservation is taken for THIS issue only. The previous code
+        // called `reserve(state, options)`, which reserved EVERY eligible issue
+        // in one pass; the ones that were not started here stayed 'reserved'
+        // with no session, and the control plane then refused to schedule them
+        // again — the queue starved.
         const key = `${entry.repoKey}#${entry.issueNumber}`;
         const reserved = await rt.controlPlane.mutate((state) => {
-            const alreadyHeld = state.items[key]?.status === 'reserved' || state.items[key]?.status === 'running';
+            const existing = state.items[key];
+            const alreadyHeld = existing?.status === 'reserved' || existing?.status === 'running';
             if (alreadyHeld)
                 return false;
-            const result = reserve(state, options);
-            return result.reserved.some((item) => item.key === key);
+            // The issue may not be in the registry yet (it was added manually):
+            // admit it first so the reservation has something to attach to.
+            if (!existing) {
+                admit(state, [
+                    {
+                        repoKey: entry.repoKey,
+                        projectId: entry.projectId,
+                        issueNumber: entry.issueNumber,
+                        title: entry.title,
+                        url: entry.url,
+                        labels: entry.labels,
+                        dependsOn: entry.dependsOn,
+                    },
+                ]);
+            }
+            // Reserve ONLY this issue.
+            const item = state.items[key];
+            if (!item)
+                return false;
+            const running = Object.values(state.items).filter((i) => i.status === 'running' || i.status === 'reserved');
+            if (running.length >= options.maxWorkers)
+                return false;
+            const repoCount = running.filter((i) => i.repoKey === item.repoKey).length;
+            if (repoCount >= options.maxWorkersPerRepo)
+                return false;
+            item.status = 'reserved';
+            item.attempt += 1;
+            item.leaseExpiresAt = Date.now() + options.leaseMs;
+            item.updatedAt = new Date().toISOString();
+            state.updatedAt = item.updatedAt;
+            return true;
         });
         if (!reserved)
             continue;
@@ -591,10 +650,18 @@ export function register(registry) {
     registry.registerRpc(`${RPC_NAMESPACE}controlPlaneStatus`, async () => {
         const settings = readSettingsFromContext(context);
         const options = controlPlaneOptionsFromSettings(settings);
+        // The divergence between the two views is reported, not silently
+        // tolerated: the control plane is the authority, so a drift means a
+        // writer bypassed it and must be fixed.
+        const divergences = await collectDivergences(rt);
+        if (divergences.length > 0) {
+            context.logger.warn(`control plane: ${divergences.length} divergence(s) between the control plane and the queue`, { divergences });
+        }
         return await rt.controlPlane.read((state) => ({
             options,
             metrics: computeControlPlaneMetrics(state, { maxWorkers: options.maxWorkers }),
             items: Object.values(state.items),
+            divergences,
         }));
     });
     // Run one scheduling pass: reserve the free worker slots and start the
@@ -686,7 +753,31 @@ export function register(registry) {
                 context.logger.warn(`automate.cancelIssue: stopSession failed: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
-        return await rt.store.transitionTo(queueId, 'cancelled', { finishedAt: new Date().toISOString() });
+        // The CONTROL PLANE is the authority for the scheduling state: the
+        // legacy entry is updated from it, never the other way round.
+        const key = `${entry.repoKey}#${entry.issueNumber}`;
+        await rt.controlPlane.mutate((state) => {
+            if (!state.items[key]) {
+                admit(state, [
+                    {
+                        repoKey: entry.repoKey,
+                        projectId: entry.projectId,
+                        issueNumber: entry.issueNumber,
+                        title: entry.title,
+                        url: entry.url,
+                        labels: entry.labels,
+                        dependsOn: entry.dependsOn,
+                    },
+                ]);
+            }
+            completeItem(state, key, 'cancelled');
+        });
+        const item = await rt.controlPlane.read((state) => state.items[key]);
+        const patched = syncQueueStatus(entry, item);
+        return await rt.store.transitionTo(queueId, patched.status, {
+            finishedAt: new Date().toISOString(),
+            ...(patched.error ? { error: patched.error } : {}),
+        });
     });
     registry.registerRpc(`${RPC_NAMESPACE}removeIssue`, async (params) => {
         const { queueId } = (params ?? {});
@@ -704,6 +795,33 @@ export function register(registry) {
         }
         const reset = settings['post.reprocessResetsRetryCount'];
         const executionStack = entry.executionStack?.map((s) => reset ? { ...s, retryCount: 0, status: 'pending' } : s);
+        // The CONTROL PLANE is the authority: the issue goes back to 'queued'
+        // THERE first. Without this the control plane kept the issue 'blocked'
+        // while the legacy entry said 'queued', and since `reserve` only
+        // selects 'queued' items the issue could never run again.
+        const key = `${entry.repoKey}#${entry.issueNumber}`;
+        await rt.controlPlane.mutate((state) => {
+            if (!state.items[key]) {
+                admit(state, [
+                    {
+                        repoKey: entry.repoKey,
+                        projectId: entry.projectId,
+                        issueNumber: entry.issueNumber,
+                        title: entry.title,
+                        url: entry.url,
+                        labels: entry.labels,
+                        dependsOn: entry.dependsOn,
+                    },
+                ]);
+            }
+            const item = state.items[key];
+            item.status = 'queued';
+            item.sessionId = undefined;
+            item.leaseExpiresAt = undefined;
+            delete item.error;
+            item.updatedAt = new Date().toISOString();
+            state.updatedAt = item.updatedAt;
+        });
         const updated = {
             ...entry,
             status: 'queued',
@@ -1053,6 +1171,9 @@ export function register(registry) {
                 void rt.store.loadActive().then((q) => publishQueue(rt, q));
             },
             signal: rt.abortController.signal,
+            // The PR monitor updates the control plane (the authority) and the
+            // legacy entry is written from it.
+            controlPlane: rt.controlPlane,
         });
         if (result.checked > 0 || result.errors.length > 0) {
             context.logger.info(`pr-monitor: checked=${result.checked} completed=${result.completed} failed=${result.failed} errors=${result.errors.length}`);
