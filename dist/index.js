@@ -15,6 +15,7 @@ import { createOrchestration } from './orchestration.js';
 import { getHostInternal } from './resolve-openfox.js';
 import { extractToolOutputText, normalizeWorkflowExecutionPayload, readSessionId } from './host-events.js';
 import { ControlPlaneStore, controlPlaneOptionsFromSettings } from './control-plane-store.js';
+import { syncQueueStatus } from './state-ownership.js';
 import { admit, completeItem, computeControlPlaneMetrics, markRunning, recordTokenUsage, reserve, } from './control-plane.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
@@ -410,9 +411,8 @@ async function spawnEntry(rt, entry) {
         const session = await spawnSessionFor(updated, { context: rt.context });
         if (session.id)
             updated.sessionId = session.id;
-        // Keep the control plane in sync with the chain engine: the issue is
-        // now attached to a live session, so the budget and the lease can be
-        // attributed to it.
+        // The CONTROL PLANE is the authority for the scheduling state: the
+        // issue becomes 'running' there, and the legacy entry mirrors it.
         if (session.id) {
             await rt.controlPlane.mutate((state) => {
                 markRunning(state, `${entry.repoKey}#${entry.issueNumber}`, session.id);
@@ -867,35 +867,56 @@ export function register(registry) {
                 content: launch.content,
             });
         }
-        if (outcome.transitionTo === 'done') {
-            await rt.store.transitionTo(entry.id, 'done', {
+        if (outcome.transitionTo === 'done' || outcome.transitionTo === 'blocked') {
+            // The CONTROL PLANE is the single authority for the scheduling
+            // state. The legacy queue entry is updated afterwards from that
+            // authority, so the two views cannot drift: there is one writer
+            // for `status`, not two.
+            const key = `${entry.repoKey}#${entry.issueNumber}`;
+            const status = outcome.transitionTo;
+            const reason = status === 'blocked'
+                ? (outcome.blockedReason ?? `workflow ${normalized.workflowId} blocked`)
+                : undefined;
+            await rt.controlPlane.mutate((state) => {
+                // The authority ADOPTS an issue it does not know yet (it was
+                // added manually, or the registry was lost): the scheduling
+                // state must never be written to the legacy queue alone.
+                if (!state.items[key]) {
+                    admit(state, [
+                        {
+                            repoKey: entry.repoKey,
+                            projectId: entry.projectId,
+                            issueNumber: entry.issueNumber,
+                            title: entry.title,
+                            url: entry.url,
+                            labels: entry.labels,
+                            dependsOn: entry.dependsOn,
+                        },
+                    ]);
+                }
+                completeItem(state, key, status, reason ? { error: reason } : {});
+            });
+            const item = await rt.controlPlane.read((state) => state.items[key]);
+            const patched = syncQueueStatus(entry, item);
+            await rt.store.transitionTo(entry.id, patched.status, {
                 executionStack: entry.executionStack ?? [],
                 finishedAt: new Date().toISOString(),
+                ...(patched.error ? { error: patched.error } : {}),
             });
-            await rt.controlPlane.mutate((state) => {
-                completeItem(state, `${entry.repoKey}#${entry.issueNumber}`, 'done');
-            });
-            await maybePostProcess(rt, entry);
-            await pickAndSpawnNext(rt);
-        }
-        else if (outcome.transitionTo === 'blocked') {
-            await rt.store.transitionTo(entry.id, 'blocked', {
-                executionStack: entry.executionStack ?? [],
-                error: outcome.blockedReason ?? `workflow ${normalized.workflowId} blocked`,
-            });
-            await rt.controlPlane.mutate((state) => {
-                completeItem(state, `${entry.repoKey}#${entry.issueNumber}`, 'blocked', {
-                    error: outcome.blockedReason ?? `workflow ${normalized.workflowId} blocked`,
+            if (status === 'done') {
+                await maybePostProcess(rt, entry);
+                await pickAndSpawnNext(rt);
+            }
+            else {
+                context.notify({
+                    title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
+                    body: {
+                        en: `Issue #${entry.issueNumber} needs intervention`,
+                        fr: `Issue #${entry.issueNumber} demande intervention`,
+                    },
+                    level: 'error',
                 });
-            });
-            context.notify({
-                title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
-                body: {
-                    en: `Issue #${entry.issueNumber} needs intervention`,
-                    fr: `Issue #${entry.issueNumber} demande intervention`,
-                },
-                level: 'error',
-            });
+            }
         }
         else {
             // Persist the mutated execution stack on EVERY path.

@@ -7,91 +7,39 @@
  * a dynamic import of the host's dist/server for hosts that don't expose
  * either.
  */
-let cachedFallback;
-async function tryDynamicImport() {
-    if (cachedFallback !== undefined)
-        return cachedFallback;
-    try {
-        const resolveFn = import.meta
-            .resolve;
-        if (typeof resolveFn !== 'function') {
-            cachedFallback = null;
-            return null;
-        }
-        const resolved = await resolveFn.call(import.meta, 'openfox');
-        const { fileURLToPath, pathToFileURL } = await import('node:url');
-        const { dirname, join } = await import('node:path');
-        const openfoxRoot = resolved.endsWith('package.json')
-            ? dirname(fileURLToPath(resolved))
-            : dirname(fileURLToPath(resolved));
-        const distUrl = pathToFileURL(join(openfoxRoot, 'dist', 'server') + '/').href;
-        const sessionMod = (await import(/* @vite-ignore */ new URL('./session/index.js', distUrl).href));
-        const runnerMod = (await import(/* @vite-ignore */ new URL('./runner/launch.js', distUrl).href));
-        const sessionManager = sessionMod.sessionManager ??
-            sessionMod.default?.sessionManager;
-        const launchWorkflowRun = runnerMod.launchWorkflowRun;
-        if (!sessionManager || !launchWorkflowRun) {
-            cachedFallback = null;
-            return null;
-        }
-        cachedFallback = {
-            kind: 'legacy',
-            legacy: {
-                sessionManager: sessionManager,
-                runWorkflow: (sessionId, payload) => {
-                    const args = payload;
-                    const runner = launchWorkflowRun;
-                    runner({
-                        sessionManager,
-                        sessionId,
-                        ...(args.workflowId ? { workflowId: args.workflowId } : {}),
-                        ...(args.params ? { params: args.params } : {}),
-                    }, payload);
-                },
-            },
-        };
-        return cachedFallback ?? null;
-    }
-    catch {
-        cachedFallback = null;
-        return null;
-    }
-}
+/**
+ * The dynamic-import fallback has been REMOVED.
+ *
+ * It resolved `openfox` and imported `dist/server/session/index.js` and
+ * `dist/server/runner/launch.js` — paths that do not exist in the
+ * published package (`openfox` only exports `createServer` /
+ * `createServerHandle`), so the fallback could never work. It also
+ * coupled the plugin to the host's internal module layout, which is not
+ * part of the package's `exports` map and moves between releases.
+ *
+ * The supported replacement is `src/host-client.ts`, which uses the
+ * host's documented local HTTP API.
+ */
 /** Resolve the orchestration surface. */
 export async function getHostInternal(context) {
     // Preferred: host exposes PluginHost facade via context.host
     const hostFacade = context?.host;
     if (hostFacade)
         return { kind: 'facade', facade: hostFacade };
-    // Legacy: context.openFoxInternals
+    // Legacy: context.openFoxInternals (kept for hosts that expose it)
     const legacy = context
         ?.openFoxInternals;
     if (legacy)
         return { kind: 'legacy', legacy };
-    // Last resort: dynamic import of the host's dist/server
-    return await tryDynamicImport();
-}
-/** Convenience: create session + launch each chain step. */
-export async function createSessionAndLaunch(context, entry, chain) {
-    const internal = await getHostInternal(context);
-    if (!internal)
-        return null;
-    if (internal.kind === 'facade') {
-        const session = await internal.facade.sessions.create({ projectId: entry.repoKey, title: entry.title });
-        for (const step of chain) {
-            internal.facade.workflows.launch({ sessionId: session.sessionId, workflowId: step.workflowId });
-        }
-        return { sessionId: session.sessionId };
-    }
-    for (const step of chain) {
-        internal.legacy.runWorkflow(/* sessionId will be set after create */ '', { workflowId: step.workflowId });
-    }
+    // No in-process surface: the caller must use the supported HTTP client
+    // (`src/host-client.ts`). Returning null here is FAIL CLOSED — the
+    // plugin must not invent an API or import the host's internals.
     return null;
 }
 export function getResolveError() {
     return null;
 }
 export function _resetForTesting() {
-    cachedFallback = undefined;
+    // Nothing is cached any more: the resolver is a pure lookup.
 }
 //# sourceMappingURL=resolve-openfox.js.map

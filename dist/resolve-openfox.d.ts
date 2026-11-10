@@ -55,17 +55,21 @@ export type PluginHostInternal = {
     kind: 'legacy';
     legacy: PluginOpenFoxInternalsLegacy;
 };
+/**
+ * The dynamic-import fallback has been REMOVED.
+ *
+ * It resolved `openfox` and imported `dist/server/session/index.js` and
+ * `dist/server/runner/launch.js` — paths that do not exist in the
+ * published package (`openfox` only exports `createServer` /
+ * `createServerHandle`), so the fallback could never work. It also
+ * coupled the plugin to the host's internal module layout, which is not
+ * part of the package's `exports` map and moves between releases.
+ *
+ * The supported replacement is `src/host-client.ts`, which uses the
+ * host's documented local HTTP API.
+ */
 /** Resolve the orchestration surface. */
 export declare function getHostInternal(context?: PluginContext): Promise<PluginHostInternal | null>;
-/** Convenience: create session + launch each chain step. */
-export declare function createSessionAndLaunch(context: PluginContext, entry: {
-    repoKey: string;
-    title: string;
-}, chain: Array<{
-    workflowId: string;
-}>): Promise<{
-    sessionId: string;
-} | null>;
 export declare function getResolveError(): string | null;
 export declare function _resetForTesting(): void;
 //# sourceMappingURL=resolve-openfox.d.ts.map
