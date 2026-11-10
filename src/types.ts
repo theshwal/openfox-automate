@@ -92,6 +92,8 @@ export interface PluginSettings {
   'post.reprocessResetsRetryCount'?: boolean
   'pr.monitorEnabled'?: boolean
   'pr.urlRegex'?: string
+  'budget.maxTokensPerIssue'?: number
+  'control.leaseMinutes'?: number
 }
 
 export const DEFAULT_SETTINGS: Required<
@@ -118,4 +120,6 @@ export const DEFAULT_SETTINGS: Required<
   'post.assignOnSuccess': false,
   'post.reprocessResetsRetryCount': true,
   'pr.monitorEnabled': true,
+  'budget.maxTokensPerIssue': 0,
+  'control.leaseMinutes': 10,
 }

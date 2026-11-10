@@ -15,5 +15,7 @@ export const DEFAULT_SETTINGS = {
     'post.assignOnSuccess': false,
     'post.reprocessResetsRetryCount': true,
     'pr.monitorEnabled': true,
+    'budget.maxTokensPerIssue': 0,
+    'control.leaseMinutes': 10,
 };
 //# sourceMappingURL=types.js.map

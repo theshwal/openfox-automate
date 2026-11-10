@@ -221,7 +221,7 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
     await new Promise((r) => setTimeout(r, 0))
 
     // ---- 1. qualification: scan GitHub ----
-    const scanNow = sim.calls.rpc.find((r) => r.name === 'scan_now')!
+    const scanNow = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
     const scanResult = (await scanNow.fn({}, sim.registry.context)) as {
       added: number
       skipped: number
@@ -237,7 +237,7 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
     expect(queued[0]?.status).toBe('queued')
 
     // ---- 2. reservation: the entry gets a session and the first workflow ----
-    const startIssue = sim.calls.rpc.find((r) => r.name === 'start_issue')!
+    const startIssue = sim.calls.rpc.find((r) => r.name === 'automate.startIssue')!
     await startIssue.fn({ queueId: queued[0]!.id }, sim.registry.context)
 
     expect(sim.launched).toHaveLength(1)
@@ -342,13 +342,13 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
     register(sim.registry)
     await new Promise((r) => setTimeout(r, 0))
 
-    const addRaw = sim.calls.rpc.find((r) => r.name === 'add_issue_raw')!
+    const addRaw = sim.calls.rpc.find((r) => r.name === 'automate.addIssueRaw')!
     const added = (await addRaw.fn(
       { repoKey: 'acme/widgets', title: 'Boom', body: '' },
       sim.registry.context,
     )) as QueueEntry
 
-    const startIssue = sim.calls.rpc.find((r) => r.name === 'start_issue')!
+    const startIssue = sim.calls.rpc.find((r) => r.name === 'automate.startIssue')!
     await startIssue.fn({ queueId: added.id }, sim.registry.context)
 
     // Nothing was launched: the plugin must not pretend it spawned a session.
@@ -363,12 +363,12 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
     register(sim.registry)
     await new Promise((r) => setTimeout(r, 0))
 
-    const addRaw = sim.calls.rpc.find((r) => r.name === 'add_issue_raw')!
+    const addRaw = sim.calls.rpc.find((r) => r.name === 'automate.addIssueRaw')!
     const added = (await addRaw.fn(
       { repoKey: 'acme/widgets', title: 'Boom', body: '' },
       sim.registry.context,
     )) as QueueEntry
-    const startIssue = sim.calls.rpc.find((r) => r.name === 'start_issue')!
+    const startIssue = sim.calls.rpc.find((r) => r.name === 'automate.startIssue')!
     await startIssue.fn({ queueId: added.id }, sim.registry.context)
 
     await hookOf(
@@ -419,7 +419,7 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
     register(sim.registry)
     await new Promise((r) => setTimeout(r, 0))
 
-    const addRaw = sim.calls.rpc.find((r) => r.name === 'add_issue_raw')!
+    const addRaw = sim.calls.rpc.find((r) => r.name === 'automate.addIssueRaw')!
     const first = (await addRaw.fn(
       { repoKey: 'acme/widgets', title: 'A', body: '' },
       sim.registry.context,
@@ -451,10 +451,10 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
       return new Response('{}', { status: 200 })
     })
     vi.stubGlobal('fetch', githubFetch as unknown as typeof fetch)
-    const scanNow = sim.calls.rpc.find((r) => r.name === 'scan_now')!
+    const scanNow = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
     await scanNow.fn({}, sim.registry.context)
 
-    const startIssue = sim.calls.rpc.find((r) => r.name === 'start_issue')!
+    const startIssue = sim.calls.rpc.find((r) => r.name === 'automate.startIssue')!
     await startIssue.fn({ queueId: first.id }, sim.registry.context)
 
     // One session is running: the ceiling of 1 is reached, so the second

@@ -85,6 +85,8 @@ export interface PluginSettings {
     'post.reprocessResetsRetryCount'?: boolean;
     'pr.monitorEnabled'?: boolean;
     'pr.urlRegex'?: string;
+    'budget.maxTokensPerIssue'?: number;
+    'control.leaseMinutes'?: number;
 }
 export declare const DEFAULT_SETTINGS: Required<Omit<PluginSettings, 'github.token' | 'repos.mapping' | 'workflows.repoOverrides' | 'post.commentTemplate' | 'ordering.dependencyPattern' | 'pr.urlRegex'>>;
 //# sourceMappingURL=types.d.ts.map

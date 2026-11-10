@@ -173,6 +173,26 @@ export const settingsSchema: PluginSettingsSchema = {
       label: { en: 'GitHub PR URL regex', fr: 'Regex des URL de PR GitHub' },
       default: 'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)',
     },
+    {
+      key: 'budget.maxTokensPerIssue',
+      type: 'number',
+      label: { en: 'Max tokens per issue (0 = unlimited)', fr: 'Tokens max par issue (0 = illimité)' },
+      description: {
+        en: 'When the cumulative token usage of an issue reaches this budget, the issue is blocked and needs intervention.',
+        fr: 'Lorsque l’usage cumulé de tokens d’une issue atteint ce budget, l’issue est bloquée et demande une intervention.',
+      },
+      default: 0,
+    },
+    {
+      key: 'control.leaseMinutes',
+      type: 'number',
+      label: { en: 'Reservation lease (minutes)', fr: 'Bail de réservation (minutes)' },
+      description: {
+        en: 'A reservation older than this lease is reclaimed after an interrupted run, so a crash never leaks a worker slot.',
+        fr: 'Une réservation plus ancienne que ce bail est récupérée après une exécution interrompue : un crash ne fuit donc jamais de slot.',
+      },
+      default: 10,
+    },
   ],
 }
 
@@ -220,6 +240,24 @@ export function clampSettings(settings: PluginSettings): PluginSettings {
     out['batch.maxConcurrencyPerRepo'] = 5
   } else {
     out['batch.maxConcurrencyPerRepo'] = Math.floor(perRepo)
+  }
+  // The control plane never runs more than 5 workers at once.
+  if (global > 5) {
+    out['batch.maxConcurrency'] = 5
+  }
+  const budget = Number(out['budget.maxTokensPerIssue'])
+  if (!Number.isFinite(budget) || budget < 0) {
+    out['budget.maxTokensPerIssue'] = 0
+  } else {
+    out['budget.maxTokensPerIssue'] = Math.floor(budget)
+  }
+  const lease = Number(out['control.leaseMinutes'])
+  if (!Number.isFinite(lease) || lease < 1) {
+    out['control.leaseMinutes'] = 10
+  } else if (lease > 1440) {
+    out['control.leaseMinutes'] = 1440
+  } else {
+    out['control.leaseMinutes'] = Math.floor(lease)
   }
   const retention = Number(out['history.retentionCount'])
   if (!Number.isFinite(retention) || retention < 10) {

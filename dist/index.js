@@ -14,6 +14,8 @@ import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent }
 import { createOrchestration } from './orchestration.js';
 import { getHostInternal } from './resolve-openfox.js';
 import { extractToolOutputText, normalizeWorkflowExecutionPayload, readSessionId } from './host-events.js';
+import { ControlPlaneStore, controlPlaneOptionsFromSettings } from './control-plane-store.js';
+import { admit, completeItem, computeControlPlaneMetrics, markRunning, recordTokenUsage, reserve, } from './control-plane.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
 import { DEFAULT_SETTINGS } from './types.js';
@@ -176,6 +178,19 @@ async function scanAll(rt) {
     }
     const { added, skipped } = await rt.store.addNew(candidates);
     const ordered = await orderAndStore(rt);
+    // Admit the same candidates into the durable control-plane registry, so
+    // the scheduler owns an exclusive, crash-safe view of what may run.
+    await rt.controlPlane.mutate((state) => {
+        admit(state, candidates.map((c) => ({
+            repoKey: c.repoKey,
+            projectId: c.projectId,
+            issueNumber: c.issueNumber,
+            title: c.title,
+            url: c.url,
+            labels: c.labels,
+            dependsOn: c.dependsOn,
+        })));
+    });
     rt.lastScanAt = new Date().toISOString();
     publishQueue(rt, ordered);
     if (added.length > 0 && !dryRun) {
@@ -217,6 +232,64 @@ function nextScanAtIso(rt) {
     const settings = readSettingsFromContext(rt.context);
     const minutes = settings['scan.refreshMinutes'] ?? 30;
     return new Date(Date.now() + minutes * 60_000).toISOString();
+}
+/**
+ * Reserve the worker slots and start the reserved work.
+ *
+ * The reservation is EXCLUSIVE and durable: it happens inside the
+ * control-plane store's serialized read-modify-write, so two concurrent
+ * callers cannot reserve the same issue. The chain engine is NOT touched:
+ * the control plane only decides WHAT runs, the engine advances the chain
+ * of a running session.
+ *
+ * FAIL CLOSED: an issue whose session cannot be created is marked failed
+ * in the registry, and the slot is released for the next candidate.
+ */
+async function scheduleControlPlane(rt) {
+    const settings = readSettingsFromContext(rt.context);
+    const options = controlPlaneOptionsFromSettings(settings);
+    const dryRun = Boolean(settings.dryRun);
+    const reserved = await rt.controlPlane.mutate((state) => reserve(state, options).reserved);
+    if (reserved.length === 0)
+        return 0;
+    let started = 0;
+    for (const item of reserved) {
+        if (dryRun) {
+            rt.context.logger.info(`[DRY RUN] would reserve ${item.key}`);
+            continue;
+        }
+        try {
+            const session = await spawnSessionFor({
+                id: item.key,
+                repoKey: item.repoKey,
+                projectId: item.projectId,
+                issueNumber: item.issueNumber,
+                title: item.title,
+                body: '',
+                url: item.url,
+                labels: [],
+                comments: [],
+                dependsOn: item.dependsOn,
+                status: 'running',
+                position: 0,
+                addedAt: new Date().toISOString(),
+            }, { context: rt.context });
+            const sessionId = session.id;
+            await rt.controlPlane.mutate((state) => {
+                markRunning(state, item.key, sessionId);
+            });
+            started += 1;
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            // Fail closed: the slot is released, the issue is recorded as failed.
+            await rt.controlPlane.mutate((state) => {
+                completeItem(state, item.key, 'failed', { error: message });
+            });
+            rt.context.logger.error(`control plane: could not start ${item.key}: ${message}`);
+        }
+    }
+    return started;
 }
 async function pickAndSpawnNext(rt) {
     const settings = readSettingsFromContext(rt.context);
@@ -386,6 +459,14 @@ export function register(registry) {
             await context.storage?.set(k, v);
         },
     });
+    // The durable control-plane registry lives under its own storage key, so
+    // its read-modify-write cycle never races the queue's.
+    const controlPlane = new ControlPlaneStore({
+        get: async (k) => (await context.storage?.get(k)),
+        set: async (k, v) => {
+            await context.storage?.set(k, v);
+        },
+    });
     const settingsReader = () => readSettingsFromContext(context);
     const rt = {
         context,
@@ -399,6 +480,7 @@ export function register(registry) {
         executions: new Map(),
         orchestration: createOrchestration(context),
         appliedExecutionEvents: new Set(),
+        controlPlane,
     };
     currentRt = rt;
     registry.registerSettings(settingsSchema);
@@ -425,6 +507,23 @@ export function register(registry) {
     }));
     registry.registerRpc(`${RPC_NAMESPACE}scanNow`, async () => scanAll(rt));
     registry.registerRpc(`${RPC_NAMESPACE}health`, async () => healthCheck(rt, context));
+    // Control-plane introspection: the durable registry and its metrics.
+    registry.registerRpc(`${RPC_NAMESPACE}controlPlaneStatus`, async () => {
+        const settings = readSettingsFromContext(context);
+        const options = controlPlaneOptionsFromSettings(settings);
+        return await rt.controlPlane.read((state) => ({
+            options,
+            metrics: computeControlPlaneMetrics(state, { maxWorkers: options.maxWorkers }),
+            items: Object.values(state.items),
+        }));
+    });
+    // Run one scheduling pass: reserve the free worker slots and start the
+    // reserved issues. Safe to call repeatedly — the reservation is
+    // exclusive, so a second call finds nothing left to reserve.
+    registry.registerRpc(`${RPC_NAMESPACE}controlPlaneSchedule`, async () => {
+        const started = await scheduleControlPlane(rt);
+        return { started };
+    });
     registry.registerRpc(`${RPC_NAMESPACE}getQueue`, async (params) => {
         const p = (params ?? {});
         const active = await rt.store.loadActive();
@@ -647,6 +746,9 @@ export function register(registry) {
                 executionStack: entry.executionStack ?? [],
                 finishedAt: new Date().toISOString(),
             });
+            await rt.controlPlane.mutate((state) => {
+                completeItem(state, `${entry.repoKey}#${entry.issueNumber}`, 'done');
+            });
             await maybePostProcess(rt, entry);
             await pickAndSpawnNext(rt);
         }
@@ -654,6 +756,11 @@ export function register(registry) {
             await rt.store.transitionTo(entry.id, 'blocked', {
                 executionStack: entry.executionStack ?? [],
                 error: outcome.blockedReason ?? `workflow ${normalized.workflowId} blocked`,
+            });
+            await rt.controlPlane.mutate((state) => {
+                completeItem(state, `${entry.repoKey}#${entry.issueNumber}`, 'blocked', {
+                    error: outcome.blockedReason ?? `workflow ${normalized.workflowId} blocked`,
+                });
             });
             context.notify({
                 title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
@@ -684,6 +791,30 @@ export function register(registry) {
     registry.registerHook('task.completed', safeHook('task.completed', async () => {
         await pickAndSpawnNext(rt);
         publishQueue(rt, await rt.store.loadActive());
+    }));
+    // Budget accounting. The host reports the token usage of every LLM call
+    // through `llm.completed`; the usage is attributed to the issue the
+    // session is working on, so the per-issue budget and the cache ratio can
+    // be observed without any extra LLM call.
+    registry.registerHook('llm.completed', safeHook('llm.completed', async (payload) => {
+        const sessionId = readSessionId(payload);
+        if (!sessionId)
+            return;
+        const data = payload?.data ?? {};
+        const num = (key) => {
+            const value = Number(data[key]);
+            return Number.isFinite(value) ? value : 0;
+        };
+        await rt.controlPlane.mutate((state) => {
+            recordTokenUsage(state, sessionId, {
+                promptTokens: num('promptTokens'),
+                completionTokens: num('completionTokens'),
+                totalTokens: num('totalTokens'),
+                cachedPromptTokens: num('cachedPromptTokens'),
+                cacheWriteTokens: num('cacheWriteTokens'),
+                llmCalls: 1,
+            });
+        });
     }));
     registry.registerTool({
         name: 'issue_queue_list',
