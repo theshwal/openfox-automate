@@ -11,7 +11,9 @@
     "README.fr.md"
   ],
   "scripts": {
-    "build": "test -f dist/index.js || tsc; test -f dist/panel.html || test -f src/panel/panel.html && cp src/panel/panel.html dist/panel.html",
+    "build": "npm run clean && tsc && npm run copy:assets",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "copy:assets": "node -e \"require('node:fs').copyFileSync('src/panel/panel.html','dist/panel.html')\"",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

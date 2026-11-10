@@ -13,6 +13,7 @@ import { spawnSessionFor } from './spawner.js';
 import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent } from './chain.js';
 import { createOrchestration } from './orchestration.js';
 import { getHostInternal } from './resolve-openfox.js';
+import { extractToolOutputText, normalizeWorkflowExecutionPayload, readSessionId } from './host-events.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
 import { DEFAULT_SETTINGS } from './types.js';
@@ -51,8 +52,21 @@ function readSettingsFromContext(context) {
 function hasAnyPostToggle(settings) {
     return Boolean(settings['post.commentTemplate'] || settings['post.closeOnSuccess'] || settings['post.assignOnSuccess']);
 }
+/**
+ * Default chain, in STABLE WORKFLOW IDs.
+ *
+ * The host resolves a launch by `metadata.id` (`findWorkflowById` in
+ * src/server/runner/orchestrator.ts), never by display name — a name like
+ * "Plan Issue v2" cannot be resolved and the launch throws. The previous
+ * default used display names, so the fallback chain was unlaunchable.
+ *
+ * V3: plan -> build+verify -> publish. There is deliberately no merge
+ * workflow in the chain: `publish-pr-v1` stops at the PR, and the merge
+ * policy (owner, mode, method) is read by OpenFox after publication.
+ */
+const DEFAULT_CHAIN = ['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1'];
 function defaultChain() {
-    return ['Plan Issue v2', 'Build & Verify Auto v2', 'Delivery v2'];
+    return [...DEFAULT_CHAIN];
 }
 function resolveChain(entry, settings) {
     const overrides = parseRepoOverrides(settings['workflows.repoOverrides']);
@@ -576,16 +590,19 @@ export function register(registry) {
         });
     }
     registry.registerHook('tool.completed', safeHook('tool.completed', async (payload) => {
-        const p = payload;
-        if (!p.sessionId || !p.output)
+        // The host nests the tool output under `data.result.output`; the
+        // adapter also accepts the legacy flat `{ sessionId, output }` shape.
+        const sessionId = readSessionId(payload);
+        const output = extractToolOutputText(payload);
+        if (!sessionId || !output)
             return;
         const settings = readSettingsFromContext(context);
         const re = new RegExp(settings['pr.urlRegex'] ?? 'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)', 'i');
-        const match = re.exec(p.output);
+        const match = re.exec(output);
         if (!match)
             return;
         const active = await rt.store.loadActive();
-        const entry = active.find((e) => e.sessionId === p.sessionId);
+        const entry = active.find((e) => e.sessionId === sessionId);
         if (!entry || entry.prUrl)
             return;
         entry.prUrl = match[0];
@@ -593,16 +610,22 @@ export function register(registry) {
         publishQueue(rt, await rt.store.loadActive());
     }));
     registry.registerHook('workflow.execution.changed', safeHook('workflow.execution.changed', async (payload) => {
-        const p = payload;
+        // The host nests the workflow fields under `data` and uses the status
+        // vocabulary 'running' | 'waiting' | 'completed' | 'cancelled' |
+        // 'blocked'. The adapter normalises it; an incomplete payload is
+        // ignored without launching anything.
+        const normalized = normalizeWorkflowExecutionPayload(payload);
+        if (!normalized)
+            return;
         const active = await rt.store.loadActive();
-        const entry = active.find((e) => e.sessionId === p.sessionId);
+        const entry = active.find((e) => e.sessionId === normalized.sessionId);
         if (!entry)
             return;
         const outcome = processWorkflowEvent(entry, {
-            sessionId: p.sessionId,
-            workflowId: p.workflowId,
-            executionId: p.executionId,
-            status: p.status,
+            sessionId: normalized.sessionId,
+            workflowId: normalized.workflowId,
+            executionId: normalized.executionId,
+            status: normalized.status,
         }, {
             appliedExecutionEvents: rt.appliedExecutionEvents,
             log: (msg) => context.logger.warn(msg),
@@ -630,7 +653,7 @@ export function register(registry) {
         else if (outcome.transitionTo === 'blocked') {
             await rt.store.transitionTo(entry.id, 'blocked', {
                 executionStack: entry.executionStack ?? [],
-                error: outcome.blockedReason ?? `workflow ${p.workflowId} blocked`,
+                error: outcome.blockedReason ?? `workflow ${normalized.workflowId} blocked`,
             });
             context.notify({
                 title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
@@ -641,7 +664,16 @@ export function register(registry) {
                 level: 'error',
             });
         }
-        else if (outcome.launches.length === 0) {
+        else {
+            // Persist the mutated execution stack on EVERY path.
+            //
+            // `processWorkflowEvent` mutates `entry.executionStack` in place. The
+            // chain-advance branch (a workflow completed, the next one launched)
+            // used to fall through without persisting it: with the real host
+            // storage (JSON round-trip) the in-place mutation was then LOST, so
+            // the next step stayed 'pending', the engine found no 'running' step
+            // on the following event, and the chain stalled after the first
+            // workflow.
             await rt.store.update({
                 ...entry,
                 ...(entry.executionStack ? { executionStack: entry.executionStack } : {}),

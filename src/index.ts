@@ -729,7 +729,16 @@ export function register(registry: PluginRegistry): void {
           },
           level: 'error',
         })
-      } else if (outcome.launches.length === 0) {
+      } else {
+        // Persist the mutated execution stack on EVERY path.
+        //
+        // `processWorkflowEvent` mutates `entry.executionStack` in place. The
+        // chain-advance branch (a workflow completed, the next one launched)
+        // used to fall through without persisting it: with the real host
+        // storage (JSON round-trip) the in-place mutation was then LOST, so
+        // the next step stayed 'pending', the engine found no 'running' step
+        // on the following event, and the chain stalled after the first
+        // workflow.
         await rt.store.update({
           ...entry,
           ...(entry.executionStack ? { executionStack: entry.executionStack } : {}),

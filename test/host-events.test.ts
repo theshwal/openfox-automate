@@ -44,9 +44,18 @@ function makeFakeRegistry(): {
     runtime: { mode: 'development' as const, configDirectory: '/tmp/openfox' },
     logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     storage: {
-      get: vi.fn(async (k: string) => backing.get(k)),
+      // The real host stores plugin values as JSON strings and parses them
+      // back on read (`setSetting(..., JSON.stringify(value))`). Reproducing
+      // that round-trip matters: it removes object aliasing between the
+      // stored snapshot and the arrays handed out by `loadActive()`, so the
+      // tests exercise the same semantics as production.
+      get: vi.fn(async (k: string) => {
+        const raw = backing.get(k)
+        if (raw === undefined) return undefined
+        return JSON.parse(raw as string) as unknown
+      }),
       set: vi.fn(async (k: string, v: unknown) => {
-        backing.set(k, v)
+        backing.set(k, JSON.stringify(v))
       }),
     },
     settings: vi.fn(() => ({})),
@@ -180,8 +189,8 @@ function seedRunningEntry(backing: Map<string, unknown>, overrides: Partial<Queu
     ],
     ...overrides,
   }
-  backing.set('queue', [entry])
-  backing.set('history', [])
+  backing.set('queue', JSON.stringify([entry]))
+  backing.set('history', JSON.stringify([]))
   return entry
 }
 
@@ -210,11 +219,13 @@ async function setup(overrides: Partial<QueueEntry> = {}): Promise<{
 }
 
 function queueOf(backing: Map<string, unknown>): QueueEntry[] {
-  return backing.get('queue') as QueueEntry[]
+  const raw = backing.get('queue')
+  return raw ? (JSON.parse(raw as string) as QueueEntry[]) : []
 }
 
 function historyOf(backing: Map<string, unknown>): QueueEntry[] {
-  return backing.get('history') as QueueEntry[]
+  const raw = backing.get('history')
+  return raw ? (JSON.parse(raw as string) as QueueEntry[]) : []
 }
 
 afterEach(() => {
@@ -240,6 +251,29 @@ describe('AC2 — workflow.execution.changed host payload contract', () => {
     expect(stored[0]?.executionStack?.[1]?.status).toBe('running')
     // The entry itself is not terminal yet: the chain still has 2 steps left.
     expect(stored[0]?.status).toBe('running')
+  })
+
+  it('PERSISTS the mutated execution stack across the chain advance (regression)', async () => {
+    // The host storage is a JSON round-trip, so the in-place mutation made
+    // by `processWorkflowEvent` is lost unless it is written back. The chain
+    // advance branch used to skip that write-back: the next step stayed
+    // 'pending' in the store and the chain stalled after the first workflow.
+    // This test reads the STORE (not an in-memory object) to prove the
+    // mutation is durable.
+    const { calls, backing } = await setup()
+
+    const fn = hookFn(calls, 'workflow.execution.changed')
+    await fn(
+      hostWorkflowEvent('sess-host-1', {
+        executionId: 'exec-1',
+        workflowId: 'plan-issue-v3',
+        status: 'completed',
+      }),
+    )
+
+    const stored = queueOf(backing)
+    expect(stored[0]?.executionStack?.[1]?.status).toBe('running')
+    expect(stored[0]?.executionStack?.[1]?.startedAt).toBeTruthy()
   })
 
   it('completes the whole chain and moves the entry to done after the last "completed"', async () => {

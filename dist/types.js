@@ -2,7 +2,7 @@
  * Shared types for openfox-automate.
  */
 export const DEFAULT_SETTINGS = {
-    'workflows.chain': 'Plan Issue v2\nBuild & Verify Auto v2\nDelivery v2',
+    'workflows.chain': 'plan-issue-v3\nbuild-verify-v3\npublish-pr-v1',
     'scan.refreshMinutes': 30,
     'scan.startupScan': true,
     'scan.ignoreLabels': 'wontfix,duplicate,needs-discussion',

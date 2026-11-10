@@ -35,9 +35,20 @@ export interface ChainOutcome {
     finished: boolean;
     blocked: boolean;
     waiting: boolean;
+    /** The host cancelled the execution: terminal, and NOT a retryable block. */
+    cancelled: boolean;
 }
+/**
+ * Status vocabulary of the chain engine.
+ *
+ * `done` and `cancelled` come from the host adapter
+ * (`src/host-events.ts`): the OpenFox host emits `completed` (normalised to
+ * `done`) and `cancelled` (kept distinct so it is terminal without
+ * triggering the retry-once path).
+ */
+export type ChainEventStatus = 'pending' | 'running' | 'done' | 'blocked' | 'waiting' | 'cancelled';
 export declare function applyExecutionEvent(stack: ExecutionStep[], currentIndex: number, event: {
-    status: 'pending' | 'running' | 'done' | 'blocked' | 'waiting';
+    status: ChainEventStatus;
 }): ChainOutcome;
 export declare function startChain(entry: QueueEntry, driver: LaunchDriver, options: {
     sessionId: string;
@@ -55,7 +66,7 @@ export interface WorkflowExecutionChange {
     sessionId?: string | undefined;
     workflowId?: string | undefined;
     executionId?: string | undefined;
-    status?: 'pending' | 'running' | 'done' | 'blocked' | undefined;
+    status?: ChainEventStatus | undefined;
 }
 export interface ProcessLaunch {
     sessionId: string;
