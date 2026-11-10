@@ -1,11 +1,18 @@
 /**
- * OpenFox internals resolver.
+ * OpenFox host-surface resolver.
  *
- * Prefers the host-exposed `context.host` (Plugin API v2.1+, exposes
- * `sessions.create / sessions.stop / workflows.launch`). Falls back to the
- * older `context.openFoxInternals` shape for backward compatibility, then to
- * a dynamic import of the host's dist/server for hosts that don't expose
- * either.
+ * Prefers the host-exposed `context.host` (which exposes
+ * `sessions.create / sessions.stop / workflows.launch`), then the older
+ * `context.openFoxInternals` shape for backward compatibility.
+ *
+ * There is NO dynamic import of the host's internals any more: the
+ * published package does not expose them (`openfox` only exports
+ * `createServer` / `createServerHandle`), so such an import could never
+ * work, and it coupled the plugin to the server's module layout.
+ *
+ * When neither surface is available the resolver returns null and the
+ * caller must use the supported HTTP client (`src/host-client.ts`).
+ * Failing closed is deliberate: the plugin must not invent an API.
  */
 import type { PluginContext } from 'openfox/plugin';
 /**
