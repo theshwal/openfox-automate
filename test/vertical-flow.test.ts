@@ -467,7 +467,7 @@ describe('AC10 — vertical simulation (no network, no host process)', () => {
     // Asking the legacy path to start the queued one is refused: the
     // control plane already holds the only slot.
     const queuedEntry = entries.find((e) => e.status === 'queued')!
-    const startIssue = sim.calls.rpc.find((r) => r.name === 'start_issue')!
+    const startIssue = sim.calls.rpc.find((r) => r.name === 'automate.startIssue')!
     await expect(startIssue.fn({ queueId: queuedEntry.id }, sim.registry.context)).rejects.toThrow(
       /already reserved by the control plane/,
     )

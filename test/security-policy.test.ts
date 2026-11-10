@@ -191,8 +191,8 @@ describe('AC15 — safe defaults', () => {
     register(sim.registry)
     await new Promise((r) => setTimeout(r, 0))
 
-    await sim.calls.rpc.find((r) => r.name === 'scan_now')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'control_plane_schedule')!.fn({}, sim.registry.context)
+    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
+    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
 
     expect(sim.created).toHaveLength(0)
     expect(sim.launched).toHaveLength(0)
@@ -297,15 +297,15 @@ describe('AC15 — an ambiguous session is blocked, never duplicated', () => {
 
     register(sim.registry)
     await new Promise((r) => setTimeout(r, 0))
-    await sim.calls.rpc.find((r) => r.name === 'scan_now')!.fn({}, sim.registry.context)
+    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
 
     // The control plane starts the issue.
-    await sim.calls.rpc.find((r) => r.name === 'control_plane_schedule')!.fn({}, sim.registry.context)
+    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
     expect(sim.created).toHaveLength(1)
 
     // The legacy path is asked to start the SAME issue again.
     const queue = JSON.parse(sim.backing.get('queue') as string) as Array<{ id: string; status: string }>
-    const startIssue = sim.calls.rpc.find((r) => r.name === 'start_issue')!
+    const startIssue = sim.calls.rpc.find((r) => r.name === 'automate.startIssue')!
     await expect(startIssue.fn({ queueId: queue[0]!.id }, sim.registry.context)).rejects.toThrow(
       /cannot start entry in status/,
     )
