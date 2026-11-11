@@ -174,8 +174,10 @@ export function orderQueue(
 export function findMissingDependencies(
   entries: QueueEntry[],
   satisfiedNumbers: Iterable<number> = [],
+  knownNumbers: Iterable<number> = [],
 ): { entry: QueueEntry; missing: number[] }[] {
   const known = new Set(entries.map((e) => e.issueNumber))
+  for (const n of knownNumbers) known.add(n)
   for (const n of satisfiedNumbers) known.add(n)
   return entries
     .map((entry) => ({

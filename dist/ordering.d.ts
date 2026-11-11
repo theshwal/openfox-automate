@@ -20,7 +20,7 @@ export declare function orderQueue(entries: QueueEntry[], strategy: OrderingStra
  * already completed lives in the HISTORY, and treating it as missing would
  * re-block its dependents forever.
  */
-export declare function findMissingDependencies(entries: QueueEntry[], satisfiedNumbers?: Iterable<number>): {
+export declare function findMissingDependencies(entries: QueueEntry[], satisfiedNumbers?: Iterable<number>, knownNumbers?: Iterable<number>): {
     entry: QueueEntry;
     missing: number[];
 }[];

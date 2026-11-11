@@ -162,8 +162,10 @@ export function orderQueue(entries, strategy, depPattern) {
  * already completed lives in the HISTORY, and treating it as missing would
  * re-block its dependents forever.
  */
-export function findMissingDependencies(entries, satisfiedNumbers = []) {
+export function findMissingDependencies(entries, satisfiedNumbers = [], knownNumbers = []) {
     const known = new Set(entries.map((e) => e.issueNumber));
+    for (const n of knownNumbers)
+        known.add(n);
     for (const n of satisfiedNumbers)
         known.add(n);
     return entries

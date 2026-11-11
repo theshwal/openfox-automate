@@ -241,14 +241,25 @@ async function orderAndStore(rt) {
     const settings = readSettingsFromContext(rt.context);
     const active = await rt.store.loadActive();
     const { ordered, cycleEntries } = orderQueue(active, settings['ordering.strategy'] ?? 'default', settings['ordering.dependencyPattern'] ?? '(#(\\d+))');
-    // A dependency that already COMPLETED lives in the history, not in the
-    // active queue: treating it as missing re-blocked its dependents on
-    // every scan, and the divergence never healed. The durable registry
-    // knows which issues are done.
-    const satisfiedDependencies = await rt.controlPlane.read((state) => Object.values(state.items)
-        .filter((i) => i.status === 'done')
-        .map((i) => i.issueNumber));
-    const blockedByMissing = findMissingDependencies(ordered, satisfiedDependencies).map((x) => x.entry);
+    // The dependency decision belongs to the CONTROL PLANE, which is the
+    // authority. The legacy view used to decide it on its own, from the
+    // ACTIVE queue only: a dependency that had left the active queue
+    // (completed, failed or cancelled — it now lives in the history) looked
+    // missing, so its dependent was blocked in the legacy queue while the
+    // control plane kept it 'queued'. The divergence never healed.
+    //
+    // The legacy view therefore only reports a dependency as missing when
+    // the durable registry also says so.
+    const dependencyView = await rt.controlPlane.read((state) => {
+        const known = new Set(Object.values(state.items)
+            .filter((i) => i.status !== 'done' && i.status !== 'failed' && i.status !== 'cancelled')
+            .map((i) => i.issueNumber));
+        const satisfied = new Set(Object.values(state.items)
+            .filter((i) => i.status === 'done' || i.status === 'failed' || i.status === 'cancelled')
+            .map((i) => i.issueNumber));
+        return { known, satisfied };
+    });
+    const blockedByMissing = findMissingDependencies(ordered, dependencyView.satisfied, dependencyView.known).map((x) => x.entry);
     const blockedIds = new Set([...cycleEntries.map((e) => e.id), ...blockedByMissing.map((e) => e.id)]);
     const final = ordered.map((e) => blockedIds.has(e.id) ? { ...e, status: 'blocked', error: 'missing or circular dependency' } : e);
     await rt.store.replace(final);
