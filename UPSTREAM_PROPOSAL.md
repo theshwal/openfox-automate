@@ -138,7 +138,8 @@ would remain for older hosts.
 |---|---|
 | Import the host's internals (`dist/server/session`, `dist/server/runner`) | Not part of the package's `exports`; the paths do not exist in the published build; couples the plugin to the server's module layout. This is exactly what the previous `tryDynamicImport` did — it was removed in this branch because it could never work. |
 | Use the host's task board (`/api/projects/:id/tasks`) | It has the slots, gates and links a control plane needs, but its service is internal to the server (`setTasksService`) and it is not on `PluginContext`. Reaching it over HTTP would require a project-scoped token and would race the user's own task board. |
-| Have the plugin drive the workflow through the message route only | Works, but requires the port/token and couples the plugin to the HTTP contract for every launch. |
+| Have the plugin drive the workflow through the session-message route | Does NOT work: `resolveSlashLaunch` is only called from the task path, so a `/<workflow-id>` prompt sent to `POST /api/sessions/:id/message` is delivered as a literal chat message and never starts a workflow. |
+| Have the plugin drive the workflow through the task board | This is what the plugin does: `POST /api/projects/:projectId/tasks` + the move to `in_progress`. It is the only HTTP-reachable launch path, and it brings the host's slot limit and task links. |
 | Keep the plugin's own control plane | Kept **for now**, because the host exposes no scheduling API to plugins. It is documented as a functional duplication of the host's task board, not a duplication of the runner. If the host later exposes its task board to plugins, the control plane should be replaced by it. |
 
 ## The second proposal — a scheduling surface

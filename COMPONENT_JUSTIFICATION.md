@@ -67,12 +67,23 @@ of its `exports` map, so the fallback could never work. It was **removed**
 in this branch.
 
 *What it does instead:* the host's documented local HTTP API
-(`POST /api/sessions`, `POST /api/sessions/:id/message`,
-`POST /api/sessions/:id/stop`, `GET /api/sessions/:id`,
-`GET /api/workflows`) and the host's own `/<workflow-id> <params>` launch
-syntax, which the host resolves and executes itself
-(`resolveSlashLaunch` → `findWorkflowById` → parameter validation →
-`launchWorkflowRun`).
+(`POST /api/sessions`, `POST /api/sessions/:id/stop`,
+`GET /api/sessions/:id`, `GET /api/workflows`) and the host's TASK BOARD
+(`POST /api/projects/:projectId/tasks`, then
+`POST /api/projects/:projectId/tasks/:taskId/move`).
+
+*Why the task board for the LAUNCH:* the host resolves a
+`/<workflow-id> <params>` prompt in exactly ONE place —
+`resolveSlashLaunch`, whose only call site is the task path
+(`seedSession`, chunk-Q54OOZ5U.js:1234). The route
+`POST /api/sessions/:id/message` only queues the raw text and the queue
+processor runs a plain chat turn, so a slash prompt sent there is
+delivered LITERALLY and never starts a workflow. There is no HTTP route
+that launches a workflow on a session: the two server-side launch points
+are the task path and the WebSocket `runner.launch` message.
+
+The task board is also the better target for a scheduler: it brings the
+host's own slot limit, queue pause and task links.
 
 *Properties:* fail-closed (typed results, never throws), no host internals
 imported, injectable `fetch`, loopback-only base URL, inert until
@@ -86,8 +97,15 @@ the host provides it, so the plugin-side change would be one line.
 
 *Gap:* the host has a task board with exactly the primitives a scheduler
 needs — `slotLimit`, `queuePaused`, task links (exclusive session
-binding) and gates (criteria) — but it is internal to the server and is
-not reachable from a plugin.
+binding) and gates (criteria) — but its SERVICE is internal to the server
+(`setTasksService`) and it is not on `PluginContext`.
+
+The board is reachable over HTTP, and the plugin now USES it to launch
+the workflows (see `src/host-client.ts`). What it does NOT expose is the
+board's STATE to the plugin: a plugin cannot read the slot limit, the
+queue pause or the task links, so it cannot make its scheduling decisions
+from the board's own state. The control plane therefore keeps its own
+registry for the decisions, and uses the board only for the LAUNCH.
 
 *What is duplicated:* the scheduling DECISIONS (admission, priority,
 dependency gating, exclusive reservation, leases, budgets, metrics).
@@ -99,9 +117,10 @@ workflow; it decides *what* runs, and the chain engine + host decide
 transformation over an in-memory registry, no I/O, no LLM call, no clock
 dependence (the time is injected). 22 unit tests plus 8 integration tests.
 
-*What would remove it:* exposing the host's task board to plugins, also
-proposed in `UPSTREAM_PROPOSAL.md`. Until then the duplication is
-assumed, documented, and bounded.
+*What would remove it:* exposing the host's task board's STATE to
+plugins, also proposed in `UPSTREAM_PROPOSAL.md`. Until then the
+duplication is assumed, documented, and bounded — and the board's own
+slot limit still caps the plugin, because the launch goes through it.
 
 ### `src/state-ownership.ts` — **removes a duplication instead of adding one**
 
