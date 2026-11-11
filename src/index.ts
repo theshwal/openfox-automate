@@ -227,7 +227,20 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
     return { added: 0, skipped: 0, errors }
   }
 
-  const { added, skipped } = await rt.store.addNew(candidates)
+  // An issue the control plane already FINISHED must never be re-added,
+  // whatever the history retention is: the history is PRUNED on every scan
+  // (pruneHistory), so the queue's dedup cannot be the authority here — the
+  // durable control-plane registry can.
+  const finished = await rt.controlPlane.read(
+    (state) =>
+      new Set(
+        Object.values(state.items)
+          .filter((i) => i.status === 'done' || i.status === 'cancelled')
+          .map((i) => `${i.repoKey}#${i.issueNumber}`),
+      ),
+  )
+  const reRunnable = candidates.filter((c) => !finished.has(`${c.repoKey}#${c.issueNumber}`))
+  const { added, skipped } = await rt.store.addNew(reRunnable)
   const ordered = await orderAndStore(rt)
   // Admit the same candidates into the durable control-plane registry, so
   // the scheduler owns an exclusive, crash-safe view of what may run.
@@ -597,7 +610,13 @@ async function pickAndSpawnNext(rt: Runtime): Promise<QueueEntry | null> {
     // with no session, and the queue could never be scheduled again.
     const key = `${entry.repoKey}#${entry.issueNumber}`
     const reserved = await reserveSingleIssue(rt, entry, options)
-    if (!reserved) continue
+    if (!reserved) {
+      // The reservation can have FAILED because the dependency gate
+      // blocked the item. That block must be mirrored to the legacy queue,
+      // or the two views disagree.
+      await mirrorControlPlaneBlocks(rt)
+      continue
+    }
 
     try {
       return await spawnEntry(rt, entry)
@@ -918,6 +937,14 @@ export function register(registry: PluginRegistry): void {
     // reservation here left the other issues 'reserved' with no session.
     const reserved = await reserveSingleIssue(rt, entry, options)
     if (!reserved) {
+      // The reservation can have failed because the dependency gate
+      // blocked the item, not because it was already reserved. The block
+      // is mirrored so the two views agree, and the message says which.
+      await mirrorControlPlaneBlocks(rt)
+      const item = await rt.controlPlane.read((state) => state.items[key])
+      if (item?.status === 'blocked') {
+        throw new Error(`issue ${key} is blocked: ${item.error ?? 'unknown reason'}`)
+      }
       throw new Error(`issue ${key} is already reserved by the control plane`)
     }
     // `spawnEntry` reports a failure in the returned entry rather than
