@@ -173,7 +173,7 @@ export declare class HostClient {
      * The task is created in "To Do" and then MOVED to "in_progress": the
      * move is what triggers the host's auto-launch.
      */
-    launchWorkflow(projectId: string, workflowId: string, params?: Record<string, string>, orderedParamIds?: string[]): Promise<HostClientResult<HostTask>>;
+    launchWorkflow(projectId: string, workflowId: string, params?: Record<string, string>, orderedParamIds?: string[], sessionId?: string): Promise<HostClientResult<HostTask>>;
     /** `POST /api/sessions/:id/stop` — stop a running session. */
     stopSession(sessionId: string): Promise<HostClientResult<unknown>>;
     /** `GET /api/workflows` — list the workflows the host can run. */

@@ -330,6 +330,7 @@ export class HostClient {
     workflowId: string,
     params: Record<string, string> = {},
     orderedParamIds?: string[],
+    sessionId?: string,
   ): Promise<HostClientResult<HostTask>> {
     if (!workflowId) return failure('bad-request', 'workflowId is required')
     if (!projectId) return failure('bad-request', 'projectId is required')
@@ -346,10 +347,18 @@ export class HostClient {
     }
 
     // Moving the task to "in_progress" is what makes the host launch it.
+    //
+    // The EXISTING session is passed so the host REUSES it: without it the
+    // host seeds a SECOND session for the same issue, and every host event
+    // of the real session is ignored by the plugin (which looks the entry
+    // up by session id), so the chain never advances.
     const moved = await this.request<{ task?: HostTask }>(
       'POST',
       `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(task.id)}/move`,
-      { to: 'in_progress' },
+      {
+        to: 'in_progress',
+        ...(sessionId ? { sessionId } : {}),
+      },
     )
     if (!moved.ok) return moved
     return { ok: true, value: moved.value?.task ?? task }

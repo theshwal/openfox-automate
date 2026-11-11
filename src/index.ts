@@ -231,17 +231,27 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
   // Admit the same candidates into the durable control-plane registry, so
   // the scheduler owns an exclusive, crash-safe view of what may run.
   await rt.controlPlane.mutate((state) => {
+    // The dependencies come from the ORDERED entries: `orderQueue` derives
+    // them from the issue text (the `#N` references), and the raw scan
+    // candidates carry an empty list. Admitting them with an empty list
+    // made the control plane disagree with the legacy view, which blocks
+    // the entries whose dependency is missing.
+    const orderedByKey = new Map(ordered.map((e) => [`${e.repoKey}#${e.issueNumber}`, e]))
     admit(
       state,
-      candidates.map((c) => ({
-        repoKey: c.repoKey,
-        projectId: c.projectId,
-        issueNumber: c.issueNumber,
-        title: c.title,
-        url: c.url,
-        labels: c.labels,
-        dependsOn: c.dependsOn,
-      })),
+      candidates.map((c) => {
+        const key = `${c.repoKey}#${c.issueNumber}`
+        const derived = orderedByKey.get(key)
+        return {
+          repoKey: c.repoKey,
+          projectId: c.projectId,
+          issueNumber: c.issueNumber,
+          title: c.title,
+          url: c.url,
+          labels: c.labels,
+          dependsOn: derived?.dependsOn ?? c.dependsOn,
+        }
+      }),
     )
   })
   rt.lastScanAt = new Date().toISOString()
@@ -943,6 +953,16 @@ export function register(registry: PluginRegistry): void {
 
   registry.registerRpc(`${RPC_NAMESPACE}removeIssue`, async (params: unknown) => {
     const { queueId } = (params ?? {}) as { queueId: string }
+    const entry = await rt.store.findById(queueId)
+    if (!entry) throw new Error(`queue entry not found: ${queueId}`)
+    // The CONTROL PLANE is the authority: the issue is removed THERE
+    // first, so it cannot be scheduled again while the legacy entry still
+    // exists.
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    await rt.controlPlane.mutate((state) => {
+      delete state.items[key]
+      state.updatedAt = new Date().toISOString()
+    })
     await rt.store.remove(queueId)
     return { ok: true }
   })
@@ -1251,8 +1271,8 @@ export function register(registry: PluginRegistry): void {
         return Number.isFinite(value) ? value : 0
       }
       const budget = controlPlaneOptionsFromSettings(readSettingsFromContext(context)).maxTokensPerIssue
-      await rt.controlPlane.mutate((state) => {
-        recordTokenUsage(
+      const blocked = await rt.controlPlane.mutate((state) => {
+        const item = recordTokenUsage(
           state,
           sessionId,
           {
@@ -1265,7 +1285,25 @@ export function register(registry: PluginRegistry): void {
           },
           { maxTokensPerIssue: budget },
         )
+        // The budget can block the item IN the control plane. The legacy
+        // entry must be mirrored, or the two views disagree.
+        return item?.status === 'blocked' ? item : null
       })
+      if (blocked) {
+        const active = await rt.store.loadActive()
+        const entry = active.find((e) => e.sessionId === sessionId)
+        if (entry && entry.status !== 'blocked') {
+          const patched = syncQueueStatus(entry, blocked)
+          try {
+            await rt.store.transitionTo(entry.id, patched.status, {
+              ...(patched.error ? { error: patched.error } : {}),
+            })
+          } catch {
+            // The store may refuse the transition; the drift detector
+            // reports it.
+          }
+        }
+      }
     }),
   )
 

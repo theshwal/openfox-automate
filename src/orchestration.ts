@@ -196,7 +196,15 @@ export function createHostOrchestration(
         })
         return
       }
-      const result = await client.launchWorkflow(params.projectId, params.workflowId, params.params ?? {})
+      const result = await client.launchWorkflow(
+        params.projectId,
+        params.workflowId,
+        params.params ?? {},
+        undefined,
+        // The EXISTING session: the host must reuse it, otherwise it seeds
+        // a second one and the plugin never sees the host's events.
+        params.sessionId,
+      )
       if (!result.ok) {
         context.logger.warn(`launchWorkflow failed (${result.reason}): ${result.message}`, {
           workflowId: params.workflowId,

@@ -251,7 +251,7 @@ export class HostClient {
      * The task is created in "To Do" and then MOVED to "in_progress": the
      * move is what triggers the host's auto-launch.
      */
-    async launchWorkflow(projectId, workflowId, params = {}, orderedParamIds) {
+    async launchWorkflow(projectId, workflowId, params = {}, orderedParamIds, sessionId) {
         if (!workflowId)
             return failure('bad-request', 'workflowId is required');
         if (!projectId)
@@ -264,7 +264,15 @@ export class HostClient {
             return failure('invalid-response', 'Host did not return a task id');
         }
         // Moving the task to "in_progress" is what makes the host launch it.
-        const moved = await this.request('POST', `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(task.id)}/move`, { to: 'in_progress' });
+        //
+        // The EXISTING session is passed so the host REUSES it: without it the
+        // host seeds a SECOND session for the same issue, and every host event
+        // of the real session is ignored by the plugin (which looks the entry
+        // up by session id), so the chain never advances.
+        const moved = await this.request('POST', `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(task.id)}/move`, {
+            to: 'in_progress',
+            ...(sessionId ? { sessionId } : {}),
+        });
         if (!moved.ok)
             return moved;
         return { ok: true, value: moved.value?.task ?? task };

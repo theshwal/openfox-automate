@@ -86,6 +86,26 @@ async function transitionThroughControlPlane(
     return
   }
   const key = `${entry.repoKey}#${entry.issueNumber}`
+
+  // The LEGACY transition decides whether it is allowed at all: the store
+  // rejects some transitions (e.g. blocked → done). The control plane must
+  // only be updated AFTER that transition succeeded — mutating it first
+  // left the two views diverging (control plane 'done', legacy 'blocked').
+  //
+  // A refused transition is NOT an error: it means the entry is already in
+  // a state the monitor must not override (a blocked entry stays blocked
+  // until an operator reprocesses it). It is reported as a skipped
+  // transition instead of throwing, so the scan timer never sees an
+  // unhandled rejection.
+  try {
+    await deps.store.transitionTo(entry.id, status, {
+      finishedAt: new Date().toISOString(),
+      ...(error ? { error } : {}),
+    })
+  } catch {
+    return
+  }
+
   await deps.controlPlane.mutate((state) => {
     if (!state.items[key]) {
       state.items[key] = {
@@ -111,15 +131,6 @@ async function transitionThroughControlPlane(
       }
     }
     completeItem(state, key, status, error ? { error } : {})
-  })
-
-  // The LEGACY transition decides whether it is allowed at all (the store
-  // rejects some transitions, e.g. blocked → done). The control plane must
-  // only be updated AFTER the legacy transition succeeded: mutating it
-  // first left the two views diverging when the store refused.
-  await deps.store.transitionTo(entry.id, status, {
-    finishedAt: new Date().toISOString(),
-    ...(error ? { error } : {}),
   })
 }
 
