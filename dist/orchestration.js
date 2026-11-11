@@ -89,7 +89,10 @@ export function createHostOrchestration(context, httpClientFactory = defaultHttp
                 return;
             const result = await client.stopSession(sessionId);
             if (!result.ok) {
-                context.logger.warn(`stopSession failed (${result.reason}): ${result.message}`);
+                // The caller must KNOW: a session that could not be stopped may
+                // still be running, and starting the issue again would create a
+                // second live session for it.
+                throw new Error(`stopSession failed (${result.reason}): ${result.message}`);
             }
         },
         async launchWorkflow(params) {

@@ -268,13 +268,14 @@ function nextScanAtIso(rt) {
  * in the registry, and the slot is released for the next candidate.
  */
 /**
- * Mirror the leases reclaimed in the control plane onto the legacy queue.
+ * Mirror the control plane's blocks onto the legacy queue.
  *
- * `reclaimExpiredLeases` blocks the items whose lease expired inside the
- * control plane. The legacy entry is written from that authority, so the
- * two views cannot drift.
+ * The control plane blocks an item for several reasons — an expired
+ * lease, a missing dependency, an exceeded token budget — and every one of
+ * them must be reflected in the legacy entry. The legacy entry is written
+ * FROM the authority, so the two views cannot drift.
  */
-async function mirrorReclaimedLeases(rt) {
+async function mirrorControlPlaneBlocks(rt) {
     const state = await rt.controlPlane.read((s) => s);
     const active = await rt.store.loadActive();
     for (const entry of active) {
@@ -282,11 +283,7 @@ async function mirrorReclaimedLeases(rt) {
         const item = state.items[key];
         if (!item)
             continue;
-        // Only the items the control plane blocked because their lease
-        // expired need a mirror; the others are handled by their own writer.
         if (item.status !== 'blocked')
-            continue;
-        if (!item.error?.startsWith('lease expired'))
             continue;
         if (entry.status === 'blocked')
             continue;
@@ -298,9 +295,8 @@ async function mirrorReclaimedLeases(rt) {
             });
         }
         catch {
-            // The store may refuse the transition (e.g. running → blocked is
-            // allowed, but a terminal entry is not); the drift detector reports
-            // it.
+            // The store may refuse the transition (e.g. a terminal entry); the
+            // drift detector reports it.
         }
     }
 }
@@ -391,11 +387,11 @@ async function scheduleControlPlane(rt) {
         return 0;
     }
     const reserved = await rt.controlPlane.mutate((state) => reserve(state, options).reserved);
-    // `reserve` RECLAIMS the expired leases inside the control plane (an
-    // item whose lease expired becomes 'blocked'). The legacy entry must be
-    // mirrored, otherwise the two views disagree: the control plane said
-    // 'blocked' while the entry still said 'running', forever.
-    await mirrorReclaimedLeases(rt);
+    // `reserve` may BLOCK items (a missing dependency, an exceeded token
+    // budget) and RECLAIM the expired leases. Every one of those changes
+    // must be mirrored to the legacy queue, otherwise the two views
+    // disagree.
+    await mirrorControlPlaneBlocks(rt);
     if (reserved.length === 0)
         return 0;
     let started = 0;
@@ -913,11 +909,16 @@ export function register(registry) {
         // Reprocessing while the previous session may still be alive created a
         // SECOND session for the same issue — two agents on the same code.
         if (entry.sessionId) {
+            // FAIL CLOSED: if the previous session cannot be stopped, the issue
+            // must NOT run again — a second live session for the same issue means
+            // two agents on the same code.
             try {
                 await rt.orchestration.stopSession(entry.sessionId);
             }
             catch (err) {
-                context.logger.warn(`automate.reprocess: stopSession failed: ${err instanceof Error ? err.message : String(err)}`);
+                const message = err instanceof Error ? err.message : String(err);
+                context.logger.warn(`automate.reprocess: stopSession failed: ${message}`);
+                throw new Error(`cannot reprocess: the previous session (${entry.sessionId}) could not be stopped (${message})`);
             }
         }
         const reset = settings['post.reprocessResetsRetryCount'];
@@ -948,15 +949,36 @@ export function register(registry) {
             delete item.error;
             item.updatedAt = new Date().toISOString();
             state.updatedAt = item.updatedAt;
+            // The DEPENDENCY GATE applies here too: reprocessing an issue whose
+            // prerequisite is missing must leave it 'blocked' in BOTH views, not
+            // 'queued' in the legacy queue and 'blocked' in the control plane.
+            // The gate is applied AFTER the reset, because the reset is what
+            // clears the previous block.
+            const deps = dependencyState(state, item);
+            if (!deps.satisfied) {
+                if (deps.missing.length > 0) {
+                    item.status = 'blocked';
+                    item.error = `missing dependency: ${deps.missing.join(', ')}`;
+                    item.updatedAt = new Date().toISOString();
+                    state.updatedAt = item.updatedAt;
+                }
+            }
         });
+        const item = await rt.controlPlane.read((state) => state.items[key]);
+        const status = item?.status === 'blocked' ? 'blocked' : 'queued';
         const updated = {
             ...entry,
-            status: 'queued',
+            status,
             ...(executionStack ? { executionStack } : {}),
         };
         delete updated.startedAt;
         delete updated.finishedAt;
-        delete updated.error;
+        if (status === 'blocked') {
+            updated.error = item?.error ?? 'missing dependency';
+        }
+        else {
+            delete updated.error;
+        }
         await rt.store.update(updated);
         await pickAndSpawnNext(rt);
         return updated;

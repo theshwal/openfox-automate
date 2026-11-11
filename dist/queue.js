@@ -55,7 +55,15 @@ export class QueueStore {
     }
     async addNew(candidates) {
         const active = await this.loadActive();
-        const existing = new Set(active.map((e) => dedupKey(e.repoKey, e.issueNumber)));
+        // The HISTORY counts too: a completed issue lives there, and the next
+        // scan re-added it — which made the legacy path run it a second time
+        // (a second session for the same issue) while the control plane still
+        // said 'done'.
+        const history = await this.loadHistory();
+        const existing = new Set([
+            ...active.map((e) => dedupKey(e.repoKey, e.issueNumber)),
+            ...history.map((e) => dedupKey(e.repoKey, e.issueNumber)),
+        ]);
         const fresh = candidates.filter((c) => !existing.has(dedupKey(c.repoKey, c.issueNumber)));
         if (fresh.length > 0) {
             const next = [...active, ...fresh];
