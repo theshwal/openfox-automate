@@ -154,8 +154,18 @@ export function orderQueue(entries, strategy, depPattern) {
         cycleEntries: [],
     };
 }
-export function findMissingDependencies(entries) {
+/**
+ * Find the entries whose dependency is missing.
+ *
+ * `satisfiedNumbers` carries the issue numbers that are known to be
+ * SATISFIED even when they are not in the active queue — a dependency that
+ * already completed lives in the HISTORY, and treating it as missing would
+ * re-block its dependents forever.
+ */
+export function findMissingDependencies(entries, satisfiedNumbers = []) {
     const known = new Set(entries.map((e) => e.issueNumber));
+    for (const n of satisfiedNumbers)
+        known.add(n);
     return entries
         .map((entry) => ({
         entry,

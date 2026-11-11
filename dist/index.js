@@ -186,7 +186,10 @@ async function scanAll(rt) {
     // (pruneHistory), so the queue's dedup cannot be the authority here — the
     // durable control-plane registry can.
     const finished = await rt.controlPlane.read((state) => new Set(Object.values(state.items)
-        .filter((i) => i.status === 'done' || i.status === 'cancelled')
+        // 'failed' counts too: a failed issue lives in the history,
+        // which is pruned on every scan, so the durable registry is the
+        // only place that still knows it.
+        .filter((i) => i.status === 'done' || i.status === 'cancelled' || i.status === 'failed')
         .map((i) => `${i.repoKey}#${i.issueNumber}`)));
     const reRunnable = candidates.filter((c) => !finished.has(`${c.repoKey}#${c.issueNumber}`));
     const { added, skipped } = await rt.store.addNew(reRunnable);
@@ -238,7 +241,14 @@ async function orderAndStore(rt) {
     const settings = readSettingsFromContext(rt.context);
     const active = await rt.store.loadActive();
     const { ordered, cycleEntries } = orderQueue(active, settings['ordering.strategy'] ?? 'default', settings['ordering.dependencyPattern'] ?? '(#(\\d+))');
-    const blockedByMissing = findMissingDependencies(ordered).map((x) => x.entry);
+    // A dependency that already COMPLETED lives in the history, not in the
+    // active queue: treating it as missing re-blocked its dependents on
+    // every scan, and the divergence never healed. The durable registry
+    // knows which issues are done.
+    const satisfiedDependencies = await rt.controlPlane.read((state) => Object.values(state.items)
+        .filter((i) => i.status === 'done')
+        .map((i) => i.issueNumber));
+    const blockedByMissing = findMissingDependencies(ordered, satisfiedDependencies).map((x) => x.entry);
     const blockedIds = new Set([...cycleEntries.map((e) => e.id), ...blockedByMissing.map((e) => e.id)]);
     const final = ordered.map((e) => blockedIds.has(e.id) ? { ...e, status: 'blocked', error: 'missing or circular dependency' } : e);
     await rt.store.replace(final);
@@ -1187,11 +1197,21 @@ export function register(registry) {
             });
             const item = await rt.controlPlane.read((state) => state.items[key]);
             const patched = syncQueueStatus(entry, item);
-            await rt.store.transitionTo(entry.id, patched.status, {
-                executionStack: entry.executionStack ?? [],
-                finishedAt: new Date().toISOString(),
-                ...(patched.error ? { error: patched.error } : {}),
-            });
+            // FAIL CLOSED, but never throw: a refused transition must not abort
+            // the hook before the freed worker slot is reused.
+            try {
+                await rt.store.transitionTo(entry.id, patched.status, {
+                    executionStack: entry.executionStack ?? [],
+                    finishedAt: new Date().toISOString(),
+                    ...(patched.error ? { error: patched.error } : {}),
+                });
+            }
+            catch (err) {
+                context.logger.warn(`workflow ${normalized.workflowId}: the legacy transition to "${patched.status}" was refused: ${err instanceof Error ? err.message : String(err)}`);
+                // The legacy entry is written directly so the two views agree even
+                // when the store refuses the transition.
+                await rt.store.update({ ...entry, ...patched });
+            }
             if (status === 'done') {
                 await maybePostProcess(rt, entry);
                 await pickAndSpawnNext(rt);
