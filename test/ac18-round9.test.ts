@@ -29,6 +29,7 @@ interface Hook {
 }
 
 function makeSim() {
+  const closedIssues: number[] = []
   const backing = new Map<string, unknown>()
   const calls: {
     hook: Hook[]
@@ -118,7 +119,9 @@ function makeSim() {
     const url = String(input)
     const method = init?.method ?? 'GET'
     if (method === 'GET' && url.includes('/issues?')) {
-      return new Response(JSON.stringify(issues), { status: 200 })
+      return new Response(JSON.stringify(issues.filter((i) => !closedIssues.includes(i.number))), {
+        status: 200,
+      })
     }
     if (method !== 'GET' && url.endsWith('/api/sessions')) {
       return new Response(JSON.stringify({ session: { id: 'sess-1' } }), { status: 201 })
@@ -130,7 +133,7 @@ function makeSim() {
   })
   vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
 
-  return { registry, calls, backing, context }
+  return { registry, calls, backing, context, closedIssues }
 }
 
 function readJson<T>(backing: Map<string, unknown>, key: string): T | undefined {
@@ -191,5 +194,38 @@ describe('AC18 L1 — the dependency decision belongs to the control plane', () 
     const after = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
     const dependent = after.find((e) => e.issueNumber === 2)
     expect(dependent?.status).not.toBe('blocked')
+  })
+})
+
+describe('AC18 L2 — a dependency removed from the queue blocks the dependent in BOTH views', () => {
+  it('records the scan-time block in the control plane and mirrors it', async () => {
+    const sim = makeSim()
+    register(sim.registry)
+    await new Promise((r) => setTimeout(r, 0))
+    const scan = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
+    await scan.fn({}, sim.registry.context)
+
+    // The dependency is removed from the queue AND from the registry.
+    const queue = readJson<QueueEntry[]>(sim.backing, 'queue')!
+    const dependency = queue.find((e) => e.issueNumber === 3)!
+    await sim.calls.rpc
+      .find((r) => r.name === 'automate.removeIssue')!
+      .fn({ queueId: dependency.id }, sim.registry.context)
+
+    // The dependency is gone from GitHub too, so the next scan does not
+    // bring it back — it is genuinely missing.
+    sim.closedIssues.push(3)
+
+    // The next scan must block the dependent in BOTH views.
+    await scan.fn({}, sim.registry.context)
+
+    const after = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
+    const dependent = after.find((e) => e.issueNumber === 2)
+    expect(dependent?.status).toBe('blocked')
+
+    const status = (await sim.calls.rpc
+      .find((r) => r.name === 'automate.controlPlaneStatus')!
+      .fn({}, sim.registry.context)) as { divergences: string[] }
+    expect(status.divergences).toEqual([])
   })
 })

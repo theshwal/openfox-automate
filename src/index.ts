@@ -333,6 +333,24 @@ async function orderAndStore(rt: Runtime): Promise<QueueEntry[]> {
   const final = ordered.map((e) =>
     blockedIds.has(e.id) ? { ...e, status: 'blocked' as const, error: 'missing or circular dependency' } : e,
   )
+  // The dependency decision belongs to the CONTROL PLANE: the scan-time
+  // block must be recorded THERE first, and the legacy entry written from
+  // it. Blocking only the legacy entry left the control plane saying
+  // 'queued' while the legacy queue said 'blocked' — a permanent
+  // divergence, and a dependent that could be clobbered mid-run.
+  if (blockedIds.size > 0) {
+    await rt.controlPlane.mutate((state) => {
+      for (const entry of blockedByMissing) {
+        const key = `${entry.repoKey}#${entry.issueNumber}`
+        const item = state.items[key]
+        if (!item) continue
+        item.status = 'blocked'
+        item.error = 'missing or circular dependency'
+        item.updatedAt = new Date().toISOString()
+        state.updatedAt = item.updatedAt
+      }
+    })
+  }
   await rt.store.replace(final)
   await rt.store.pruneHistory(settings['history.retentionCount'] ?? 100)
   return final
