@@ -16,7 +16,6 @@
  */
 import { getPullRequest } from './github.js';
 import { completeItem } from './control-plane.js';
-import { syncQueueStatus } from './state-ownership.js';
 import { RPC_NAMESPACE } from './constants.js';
 /**
  * Move an entry to a terminal status, through the control plane.
@@ -62,11 +61,13 @@ async function transitionThroughControlPlane(deps, entry, status, error) {
         }
         completeItem(state, key, status, error ? { error } : {});
     });
-    const item = await deps.controlPlane.mutate((state) => state.items[key]);
-    const patched = syncQueueStatus(entry, item);
-    await deps.store.transitionTo(entry.id, patched.status, {
+    // The LEGACY transition decides whether it is allowed at all (the store
+    // rejects some transitions, e.g. blocked → done). The control plane must
+    // only be updated AFTER the legacy transition succeeded: mutating it
+    // first left the two views diverging when the store refused.
+    await deps.store.transitionTo(entry.id, status, {
         finishedAt: new Date().toISOString(),
-        ...(patched.error ? { error: patched.error } : {}),
+        ...(error ? { error } : {}),
     });
 }
 export async function monitorPRs(deps) {

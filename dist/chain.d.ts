@@ -26,6 +26,8 @@ export interface LaunchParams {
     workflowId: string;
     content: string;
     params: Record<string, string>;
+    /** The host project the workflow belongs to (needed by the task-board launch). */
+    projectId?: string | undefined;
 }
 export declare function buildIssueContext(entry: QueueEntry): string;
 export declare function buildIssueParams(entry: QueueEntry): Record<string, string>;
@@ -73,6 +75,8 @@ export interface ProcessLaunch {
     workflowId: string;
     content: string;
     params: Record<string, string>;
+    /** The host project the workflow belongs to (needed by the task-board launch). */
+    projectId?: string | undefined;
 }
 /**
  * Pure orchestration outcome from processing a workflow.execution.changed

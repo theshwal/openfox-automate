@@ -48,11 +48,25 @@
  *     server.
  */
 /**
- * Build the launch message understood by the host's workflow resolver.
+ * Build the launch prompt understood by the host's workflow resolver.
  *
  * The host parses `/<id> <arg> <arg> …` and maps the positional arguments
  * onto the workflow's declared parameters (sorted by `position`). We
  * therefore pass the parameters in that declared order.
+ *
+ * IMPORTANT — where this prompt is valid:
+ *
+ *   The resolver (`resolveSlashLaunch`) has exactly ONE call site in the
+ *   host: the TASK path (`seedSession`, chunk-Q54OOZ5U.js:1234). The
+ *   session-message route (`POST /api/sessions/:id/message`) only queues
+ *   the raw text as a user message; the queue processor runs a plain chat
+ *   turn. A `/<workflow-id>` prompt sent there is delivered LITERALLY and
+ *   never starts a workflow.
+ *
+ *   So this prompt must be sent to the task board
+ *   (`POST /api/projects/:projectId/tasks`), which is the only
+ *   HTTP-reachable path that makes the host resolve and launch a
+ *   workflow.
  */
 export function buildWorkflowLaunchMessage(workflowId, params = {}, orderedParamIds) {
     const ids = orderedParamIds && orderedParamIds.length > 0 ? orderedParamIds : Object.keys(params);
@@ -215,16 +229,45 @@ export class HostClient {
         });
     }
     /**
-     * Launch a workflow on an existing session.
+     * Launch a workflow through the host's TASK BOARD.
      *
-     * The host owns the execution: it resolves the workflow id, validates the
-     * required parameters and runs the workflow. The plugin only queues the
-     * launch message.
+     * The host owns the execution: `resolveSlashLaunch` resolves the
+     * workflow id, validates the required parameters and runs the workflow.
+     * The plugin only submits the task.
+     *
+     * WHY THE TASK BOARD AND NOT THE SESSION MESSAGE ROUTE:
+     *
+     *   `resolveSlashLaunch` has exactly one call site in the host — the
+     *   task path (`seedSession`, chunk-Q54OOZ5U.js:1234). The route
+     *   `POST /api/sessions/:id/message` merely queues the raw text and the
+     *   queue processor runs a plain chat turn, so a `/<workflow-id>`
+     *   prompt sent there is delivered LITERALLY and never starts a
+     *   workflow.
+     *
+     *   The task board is the only HTTP-reachable path that makes the host
+     *   resolve and launch a workflow. It also brings the host's own slot
+     *   limit and task links, which is exactly what a scheduler wants.
+     *
+     * The task is created in "To Do" and then MOVED to "in_progress": the
+     * move is what triggers the host's auto-launch.
      */
-    async launchWorkflow(sessionId, workflowId, params = {}, orderedParamIds) {
+    async launchWorkflow(projectId, workflowId, params = {}, orderedParamIds) {
         if (!workflowId)
             return failure('bad-request', 'workflowId is required');
-        return await this.sendMessage(sessionId, buildWorkflowLaunchMessage(workflowId, params, orderedParamIds));
+        if (!projectId)
+            return failure('bad-request', 'projectId is required');
+        const created = await this.request('POST', `/api/projects/${encodeURIComponent(projectId)}/tasks`, { prompt: buildWorkflowLaunchMessage(workflowId, params, orderedParamIds) });
+        if (!created.ok)
+            return created;
+        const task = created.value?.task;
+        if (!task?.id) {
+            return failure('invalid-response', 'Host did not return a task id');
+        }
+        // Moving the task to "in_progress" is what makes the host launch it.
+        const moved = await this.request('POST', `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(task.id)}/move`, { to: 'in_progress' });
+        if (!moved.ok)
+            return moved;
+        return { ok: true, value: moved.value?.task ?? task };
     }
     /** `POST /api/sessions/:id/stop` — stop a running session. */
     async stopSession(sessionId) {

@@ -141,20 +141,31 @@ describe('HostClient — supported host API', () => {
     expect(JSON.parse(String(init.body))).toEqual({ projectId: 'p1', title: 'issue' })
   })
 
-  it('launches a workflow by queueing the host slash message', async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(200, { success: true })) as unknown as typeof fetch
+  it('launches a workflow through the host TASK BOARD', async () => {
+    // The host resolves `/<workflow-id> <args>` ONLY in the task path:
+    // `resolveSlashLaunch` has a single call site (`seedSession`). The
+    // session-message route queues the raw text as a chat message, so a
+    // slash prompt sent there never starts a workflow.
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/tasks')) return jsonResponse(201, { task: { id: 'task-1' } })
+      return jsonResponse(200, { task: { id: 'task-1' } })
+    }) as unknown as typeof fetch
 
-    const result = await client(fetchImpl).launchWorkflow('sess-1', 'plan-issue-v3', {
+    const result = await client(fetchImpl).launchWorkflow('proj-1', 'plan-issue-v3', {
       issue_ref: 'o/r#7',
     })
     expect(result.ok).toBe(true)
 
-    const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [
-      string,
-      RequestInit,
-    ]
-    expect(url).toBe('http://127.0.0.1:10369/api/sessions/sess-1/message')
-    expect(JSON.parse(String(init.body))).toEqual({ content: '/plan-issue-v3 o/r#7' })
+    const calls = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<
+      [string, RequestInit]
+    >
+    // The task is created with the slash prompt…
+    expect(calls[0]![0]).toBe('http://127.0.0.1:10369/api/projects/proj-1/tasks')
+    expect(JSON.parse(String(calls[0]![1].body))).toEqual({ prompt: '/plan-issue-v3 o/r#7' })
+    // …and moved to in_progress, which is what makes the host launch it.
+    expect(calls[1]![0]).toBe('http://127.0.0.1:10369/api/projects/proj-1/tasks/task-1/move')
+    expect(JSON.parse(String(calls[1]![1].body))).toEqual({ to: 'in_progress' })
   })
 
   it('sends the session token when configured', async () => {

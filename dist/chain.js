@@ -117,6 +117,8 @@ export function startChain(entry, driver, options) {
         workflowId: chain[0],
         content: buildIssueContext(entry),
         params: buildIssueParams(entry),
+        // The host project is needed by the task-board launch path.
+        projectId: entry.projectId,
     });
     return stack;
 }
@@ -201,6 +203,7 @@ export function processWorkflowEvent(entry, event, deps) {
                 workflowId: nextStep.workflowId,
                 content: deps.buildIssueContext(entry),
                 params: deps.buildIssueParams(entry),
+                projectId: entry.projectId,
             });
         }
     }
@@ -212,6 +215,7 @@ export function processWorkflowEvent(entry, event, deps) {
                 workflowId: currentStep.workflowId,
                 content: deps.buildIssueContext(entry),
                 params: deps.buildIssueParams(entry),
+                projectId: entry.projectId,
             });
         }
     }

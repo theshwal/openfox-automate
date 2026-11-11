@@ -18,6 +18,13 @@ export interface LaunchWorkflowParams {
     params?: Record<string, string>;
     content?: string;
     subGroup?: string;
+    /**
+     * The host project the workflow belongs to.
+     *
+     * The supported HTTP launch path goes through the host's TASK BOARD
+     * (`/api/projects/:projectId/tasks`), so the project is required there.
+     */
+    projectId?: string | undefined;
 }
 /**
  * Default implementation that bridges to whichever host surface is exposed.
@@ -35,6 +42,12 @@ export interface LaunchWorkflowParams {
  * create a session at all on a real host. The HTTP path is fail-closed:
  * it only runs when a base URL is configured, and every failure is
  * reported as a typed error.
+ *
+ * The HTTP LAUNCH goes through the host's TASK BOARD, because that is the
+ * only HTTP-reachable path where the host resolves a `/<workflow-id>`
+ * prompt into a workflow run: `resolveSlashLaunch` has exactly one call
+ * site in the host, the task path (`seedSession`). The session-message
+ * route only queues the raw text as a chat message.
  */
 export interface OpenFoxOrchestration {
     createSession(projectId: string, title: string): Promise<SessionLike>;

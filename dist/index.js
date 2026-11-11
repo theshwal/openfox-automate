@@ -251,6 +251,43 @@ function nextScanAtIso(rt) {
  * in the registry, and the slot is released for the next candidate.
  */
 /**
+ * Mirror the leases reclaimed in the control plane onto the legacy queue.
+ *
+ * `reclaimExpiredLeases` blocks the items whose lease expired inside the
+ * control plane. The legacy entry is written from that authority, so the
+ * two views cannot drift.
+ */
+async function mirrorReclaimedLeases(rt) {
+    const state = await rt.controlPlane.read((s) => s);
+    const active = await rt.store.loadActive();
+    for (const entry of active) {
+        const key = `${entry.repoKey}#${entry.issueNumber}`;
+        const item = state.items[key];
+        if (!item)
+            continue;
+        // Only the items the control plane blocked because their lease
+        // expired need a mirror; the others are handled by their own writer.
+        if (item.status !== 'blocked')
+            continue;
+        if (!item.error?.startsWith('lease expired'))
+            continue;
+        if (entry.status === 'blocked')
+            continue;
+        const patched = syncQueueStatus(entry, item);
+        try {
+            await rt.store.transitionTo(entry.id, patched.status, {
+                ...(patched.error ? { error: patched.error } : {}),
+                finishedAt: new Date().toISOString(),
+            });
+        }
+        catch {
+            // The store may refuse the transition (e.g. running → blocked is
+            // allowed, but a terminal entry is not); the drift detector reports
+            // it.
+        }
+    }
+}
+/**
  * Reserve ONE issue in the control plane.
  *
  * The reservation is exclusive and scoped to this issue: a bulk
@@ -323,6 +360,11 @@ async function scheduleControlPlane(rt) {
         return 0;
     }
     const reserved = await rt.controlPlane.mutate((state) => reserve(state, options).reserved);
+    // `reserve` RECLAIMS the expired leases inside the control plane (an
+    // item whose lease expired becomes 'blocked'). The legacy entry must be
+    // mirrored, otherwise the two views disagree: the control plane said
+    // 'blocked' while the entry still said 'running', forever.
+    await mirrorReclaimedLeases(rt);
     if (reserved.length === 0)
         return 0;
     let started = 0;
@@ -561,6 +603,7 @@ function createLaunchDriver(rt) {
                     workflowId: p.workflowId,
                     params: p.params,
                     content: p.content,
+                    projectId: p.projectId,
                 });
             }
             catch (err) {
@@ -1014,6 +1057,7 @@ export function register(registry) {
                 workflowId: launch.workflowId,
                 params: launch.params,
                 content: launch.content,
+                projectId: launch.projectId,
             });
         }
         if (outcome.transitionTo === 'done' || outcome.transitionTo === 'blocked') {

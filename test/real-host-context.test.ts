@@ -107,12 +107,18 @@ describe('AC18 — the plugin reaches the host with the REAL context shape', () 
     expect(calls[0]).toBe('POST http://127.0.0.1:10369/api/sessions')
   })
 
-  it('launches a workflow through the host slash syntax, not by executing it', async () => {
+  it('launches a workflow through the host TASK BOARD, not by executing it', async () => {
     const { context } = makeRealContext()
+    const urls: string[] = []
     const bodies: unknown[] = []
-    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      urls.push(url)
       if (init?.body) bodies.push(JSON.parse(String(init.body)))
-      return new Response(JSON.stringify({ success: true }), { status: 200 })
+      if (url.endsWith('/tasks')) {
+        return new Response(JSON.stringify({ task: { id: 'task-1' } }), { status: 201 })
+      }
+      return new Response(JSON.stringify({ task: { id: 'task-1' } }), { status: 200 })
     }) as unknown as typeof fetch
 
     const client = new HostClient({ baseUrl: 'http://127.0.0.1:10369' }, { fetchImpl })
@@ -122,10 +128,15 @@ describe('AC18 — the plugin reaches the host with the REAL context shape', () 
       sessionId: 'sess-1',
       workflowId: 'plan-issue-v3',
       params: { issue_ref: 'acme/widgets#7' },
+      projectId: 'proj-1',
     })
 
-    // The HOST resolves the id and runs the workflow.
-    expect(bodies[0]).toEqual({ content: '/plan-issue-v3 acme/widgets#7' })
+    // The HOST resolves the id and runs the workflow — through the task
+    // board, which is the only HTTP path where the host resolves a
+    // `/<workflow-id>` prompt.
+    expect(urls[0]).toBe('http://127.0.0.1:10369/api/projects/proj-1/tasks')
+    expect(bodies[0]).toEqual({ prompt: '/plan-issue-v3 acme/widgets#7' })
+    expect(urls[1]).toBe('http://127.0.0.1:10369/api/projects/proj-1/tasks/task-1/move')
   })
 
   it('fails closed when the host refuses, without pretending a session exists', async () => {

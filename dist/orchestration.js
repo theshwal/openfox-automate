@@ -114,7 +114,13 @@ export function createHostOrchestration(context, httpClientFactory = defaultHttp
                 context.logger.warn('OpenFox host orchestration is not available; cannot launch workflow', params);
                 return;
             }
-            const result = await client.launchWorkflow(params.sessionId, params.workflowId, params.params ?? {});
+            if (!params.projectId) {
+                context.logger.warn('cannot launch workflow: the host project is unknown', {
+                    workflowId: params.workflowId,
+                });
+                return;
+            }
+            const result = await client.launchWorkflow(params.projectId, params.workflowId, params.params ?? {});
             if (!result.ok) {
                 context.logger.warn(`launchWorkflow failed (${result.reason}): ${result.message}`, {
                     workflowId: params.workflowId,

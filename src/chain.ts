@@ -30,6 +30,8 @@ export interface LaunchParams {
   workflowId: string
   content: string
   params: Record<string, string>
+  /** The host project the workflow belongs to (needed by the task-board launch). */
+  projectId?: string | undefined
 }
 
 export function buildIssueContext(entry: QueueEntry): string {
@@ -169,6 +171,8 @@ export function startChain(
     workflowId: chain[0]!,
     content: buildIssueContext(entry),
     params: buildIssueParams(entry),
+    // The host project is needed by the task-board launch path.
+    projectId: entry.projectId,
   })
   return stack
 }
@@ -194,6 +198,8 @@ export interface ProcessLaunch {
   workflowId: string
   content: string
   params: Record<string, string>
+  /** The host project the workflow belongs to (needed by the task-board launch). */
+  projectId?: string | undefined
 }
 
 /**
@@ -318,6 +324,7 @@ export function processWorkflowEvent(
         workflowId: nextStep.workflowId,
         content: deps.buildIssueContext(entry),
         params: deps.buildIssueParams(entry),
+        projectId: entry.projectId,
       })
     }
   } else if (event.status === 'blocked' && stack[idx]!.retryCount > prevRetry) {
@@ -328,6 +335,7 @@ export function processWorkflowEvent(
         workflowId: currentStep.workflowId,
         content: deps.buildIssueContext(entry),
         params: deps.buildIssueParams(entry),
+        projectId: entry.projectId,
       })
     }
   }

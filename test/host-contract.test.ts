@@ -74,18 +74,24 @@ describe('AC14 — host route contracts (2.0.161)', () => {
     expect(calls[0]?.body).toEqual({ projectId: 'proj-1', title: '[issue #7] Boom' })
   })
 
-  it('POST /api/sessions/:id/message sends { content } and reads { success }', async () => {
+  it('the workflow launch goes through the task board (the only path the host resolves)', async () => {
+    // `resolveSlashLaunch` has exactly ONE call site in the host: the task
+    // path (`seedSession`). `POST /api/sessions/:id/message` only queues
+    // the raw text and the queue processor runs a plain chat turn, so a
+    // `/<workflow-id>` prompt sent there is delivered literally.
     const { fetchImpl, calls } = fakeHost({
-      'POST /api/sessions/sess-1/message': { status: 200, body: { success: true } },
+      'POST /api/projects/proj-1/tasks': { status: 201, body: { task: { id: 'task-1' } } },
+      'POST /api/projects/proj-1/tasks/task-1/move': { status: 200, body: { task: { id: 'task-1' } } },
     })
     const client = new HostClient({ baseUrl: BASE }, { fetchImpl })
 
-    const result = await client.launchWorkflow('sess-1', 'plan-issue-v3', { issue_ref: 'o/r#7' })
+    const result = await client.launchWorkflow('proj-1', 'plan-issue-v3', { issue_ref: 'o/r#7' })
     expect(result.ok).toBe(true)
 
-    expect(calls[0]?.url).toBe(`${BASE}/api/sessions/sess-1/message`)
-    // The host resolves `/<workflow-id> <args>` itself.
-    expect(calls[0]?.body).toEqual({ content: '/plan-issue-v3 o/r#7' })
+    expect(calls[0]?.url).toBe(`${BASE}/api/projects/proj-1/tasks`)
+    expect(calls[0]?.body).toEqual({ prompt: '/plan-issue-v3 o/r#7' })
+    expect(calls[1]?.url).toBe(`${BASE}/api/projects/proj-1/tasks/task-1/move`)
+    expect(calls[1]?.body).toEqual({ to: 'in_progress' })
   })
 
   it('POST /api/sessions/:id/stop reads { success, queuedMessages }', async () => {

@@ -21,7 +21,6 @@ import { getPullRequest, type RateLimitInfo } from './github.js'
 import type { QueueStore } from './queue.js'
 import type { ControlPlaneState } from './control-plane.js'
 import { completeItem } from './control-plane.js'
-import { syncQueueStatus } from './state-ownership.js'
 import { RPC_NAMESPACE } from './constants.js'
 
 export interface PRMonitorDeps {
@@ -113,11 +112,14 @@ async function transitionThroughControlPlane(
     }
     completeItem(state, key, status, error ? { error } : {})
   })
-  const item = await deps.controlPlane.mutate((state) => state.items[key])
-  const patched = syncQueueStatus(entry as never, item)
-  await deps.store.transitionTo(entry.id, patched.status, {
+
+  // The LEGACY transition decides whether it is allowed at all (the store
+  // rejects some transitions, e.g. blocked → done). The control plane must
+  // only be updated AFTER the legacy transition succeeded: mutating it
+  // first left the two views diverging when the store refused.
+  await deps.store.transitionTo(entry.id, status, {
     finishedAt: new Date().toISOString(),
-    ...(patched.error ? { error: patched.error } : {}),
+    ...(error ? { error } : {}),
   })
 }
 

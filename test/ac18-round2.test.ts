@@ -124,12 +124,15 @@ function makeSim(
         { status: 201 },
       )
     }
-    if (method === 'POST' && url.includes('/message')) {
+    if (method === 'POST' && url.endsWith('/tasks')) {
       if (init?.body) {
-        const body = JSON.parse(String(init.body)) as { content?: string }
-        workflowsLaunched.push(body.content ?? '')
+        const body = JSON.parse(String(init.body)) as { prompt?: string }
+        workflowsLaunched.push(body.prompt ?? '')
       }
-      return new Response(JSON.stringify({ success: true }), { status: 200 })
+      return new Response(JSON.stringify({ task: { id: 'task-1' } }), { status: 201 })
+    }
+    if (method === 'POST' && url.includes('/move')) {
+      return new Response(JSON.stringify({ task: { id: 'task-1' } }), { status: 200 })
     }
     if (method === 'GET' && url.includes('/issues?')) {
       return new Response(
@@ -194,8 +197,10 @@ describe('AC18 E1 — the session is created through the supported HTTP API', ()
     expect(result.started).toBe(1)
     expect(sim.sessionsCreated).toHaveLength(1)
     expect(sim.httpCalls.some((c) => c.startsWith('POST') && c.endsWith('/api/sessions'))).toBe(true)
-    // And the workflow was launched through the host's slash syntax.
+    // And the workflow was launched through the host's task board, which
+    // is the only HTTP path where the host resolves the workflow id.
     expect(sim.workflowsLaunched[0]).toContain('/plan-issue-v3')
+    expect(sim.httpCalls.some((c) => c.includes('/api/projects/') && c.endsWith('/tasks'))).toBe(true)
     expect(controlPlane(sim.backing).items['acme/widgets#1']?.status).toBe('running')
   })
 })
