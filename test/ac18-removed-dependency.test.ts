@@ -253,6 +253,72 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
     expect(status.divergences).toEqual([])
   })
 
+  it('never blocks a RUNNING item in the control plane either', async () => {
+    // The scan-time block must not touch an item whose workflow is in
+    // flight: aborting it would leave a live session behind.
+    const sim = makeSim()
+    register(sim.registry)
+    await new Promise((r) => setTimeout(r, 0))
+    const scan = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
+    await scan.fn({}, sim.registry.context)
+    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+
+    // #3 (the dependency) is running. Force the dependency check to fail
+    // for the running item by removing it from the registry while #3 runs,
+    // then rescan: neither view may be clobbered.
+    const cp = controlPlane(sim.backing)
+    const running = Object.values(cp.items).find((i) => i.status === 'running')
+    expect(running).toBeDefined()
+
+    // The DEPENDENCY of the running item vanishes: #3 completed (so #2 was
+    // schedulable and ran), and #3 is then removed from the registry. The
+    // dependency check now fails for #2 — which is RUNNING. It must not be
+    // clobbered: its workflow is in flight and its session is live.
+    const wfHook = sim.calls.hook.find((h) => h.h === 'workflow.execution.changed')!.fn
+    for (const step of CHAIN) {
+      await wfHook({
+        event: 'workflow.execution.changed',
+        timestamp: new Date().toISOString(),
+        sessionId: 'sess-1',
+        data: {
+          executionId: `exec-${step}`,
+          workflowId: step,
+          workflowName: step,
+          status: 'completed',
+        },
+      })
+    }
+    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+
+    // #2 is now the running one.
+    const cpBefore = controlPlane(sim.backing)
+    expect(Object.values(cpBefore.items).find((i) => i.status === 'running')?.key).toBe('acme/widgets#2')
+
+    // Its dependency (#3) leaves the registry ENTIRELY: it is neither
+    // known nor satisfied any more, so the dependency check fails for #2.
+    // #2 is RUNNING: it must not be blocked in either view.
+    //
+    // This is the case that requires BOTH guards: without the control
+    // plane's "never clobber a running item" and the legacy view's
+    // symmetric rule, the control plane says 'blocked' while the legacy
+    // entry says 'running' — the divergence AC18-13 describes.
+    const cpStore = readJson<Record<string, unknown>>(sim.backing, 'control_plane')!
+    delete cpStore['acme/widgets#3']
+    sim.backing.set('control_plane', JSON.stringify(cpStore))
+
+    await scan.fn({}, sim.registry.context)
+
+    const after = controlPlane(sim.backing)
+    const stillRunning = Object.values(after.items).filter((i) => i.status === 'running')
+    expect(stillRunning).toHaveLength(1)
+    expect(stillRunning[0]?.status).toBe('running')
+
+    const status = (await sim.calls.rpc
+      .find((r) => r.name === 'automate.controlPlaneStatus')!
+      .fn({}, sim.registry.context)) as { divergences: string[] }
+    expect(status.divergences).toEqual([])
+  })
+
   it('the fix is idempotent: repeated scans do not drift', async () => {
     const sim = makeSim()
     register(sim.registry)

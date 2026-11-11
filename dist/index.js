@@ -261,7 +261,15 @@ async function orderAndStore(rt) {
     });
     const blockedByMissing = findMissingDependencies(ordered, dependencyView.satisfied, dependencyView.known).map((x) => x.entry);
     const blockedIds = new Set([...cycleEntries.map((e) => e.id), ...blockedByMissing.map((e) => e.id)]);
-    const final = ordered.map((e) => blockedIds.has(e.id) ? { ...e, status: 'blocked', error: 'missing or circular dependency' } : e);
+    // A RUNNING or RESERVED issue is never blocked: its workflow is in
+    // flight and its session is live. The SAME rule applies to the legacy
+    // view and to the control plane, so the two cannot diverge on it.
+    const runningKeys = new Set(await rt.controlPlane.read((state) => Object.values(state.items)
+        .filter((i) => i.status === 'running' || i.status === 'reserved')
+        .map((i) => `${i.repoKey}#${i.issueNumber}`)));
+    const final = ordered.map((e) => blockedIds.has(e.id) && !runningKeys.has(`${e.repoKey}#${e.issueNumber}`)
+        ? { ...e, status: 'blocked', error: 'missing or circular dependency' }
+        : e);
     // The dependency decision belongs to the CONTROL PLANE: the scan-time
     // block must be recorded THERE first, and the legacy entry written from
     // it. Blocking only the legacy entry left the control plane saying
@@ -273,6 +281,12 @@ async function orderAndStore(rt) {
                 const key = `${entry.repoKey}#${entry.issueNumber}`;
                 const item = state.items[key];
                 if (!item)
+                    continue;
+                // NEVER clobber a RUNNING issue: its workflow is in flight and its
+                // session is live. Blocking it here would abort a legitimate run and
+                // leave the session behind. The dependency that vanished will be
+                // reported when the run finishes.
+                if (item.status === 'running' || item.status === 'reserved')
                     continue;
                 item.status = 'blocked';
                 item.error = 'missing or circular dependency';
