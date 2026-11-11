@@ -16,7 +16,7 @@ import { getHostInternal } from './resolve-openfox.js';
 import { extractToolOutputText, normalizeWorkflowExecutionPayload, readSessionId } from './host-events.js';
 import { ControlPlaneStore, controlPlaneOptionsFromSettings } from './control-plane-store.js';
 import { findDivergence, syncQueueStatus } from './state-ownership.js';
-import { admit, completeItem, computeControlPlaneMetrics, markRunning, recordTokenUsage, reserve, } from './control-plane.js';
+import { admit, completeItem, computeControlPlaneMetrics, dependencyState, markRunning, recordTokenUsage, reserve, } from './control-plane.js';
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js';
 import { computeMetrics } from './metrics.js';
 import { DEFAULT_SETTINGS } from './types.js';
@@ -192,6 +192,11 @@ async function scanAll(rt) {
         // made the control plane disagree with the legacy view, which blocks
         // the entries whose dependency is missing.
         const orderedByKey = new Map(ordered.map((e) => [`${e.repoKey}#${e.issueNumber}`, e]));
+        // The DERIVED status is mirrored too: `orderAndStore` blocked the
+        // entries whose dependency is missing, and admitting them as 'queued'
+        // made the two views disagree (and the scheduler started an issue
+        // whose prerequisite was absent).
+        const blockedIds = new Set(ordered.filter((e) => e.status === 'blocked').map((e) => `${e.repoKey}#${e.issueNumber}`));
         admit(state, candidates.map((c) => {
             const key = `${c.repoKey}#${c.issueNumber}`;
             const derived = orderedByKey.get(key);
@@ -203,6 +208,8 @@ async function scanAll(rt) {
                 url: c.url,
                 labels: c.labels,
                 dependsOn: derived?.dependsOn ?? c.dependsOn,
+                blocked: blockedIds.has(key),
+                blockedReason: derived?.error,
             };
         }));
     });
@@ -333,6 +340,20 @@ async function reserveSingleIssue(rt, entry, options) {
         const item = state.items[key];
         if (!item)
             return false;
+        // The DEPENDENCY GATE: an issue may only run when every dependency is
+        // done. Without it the legacy path could start an issue whose
+        // prerequisite was missing (the control plane's own `reserve` applies
+        // the gate, but this path reserved the item directly).
+        const deps = dependencyState(state, item);
+        if (!deps.satisfied) {
+            if (deps.missing.length > 0) {
+                item.status = 'blocked';
+                item.error = `missing dependency: ${deps.missing.join(', ')}`;
+                item.updatedAt = new Date().toISOString();
+                state.updatedAt = item.updatedAt;
+            }
+            return false;
+        }
         const active = Object.values(state.items).filter((i) => i.status === 'running' || i.status === 'reserved');
         if (active.length >= options.maxWorkers)
             return false;
@@ -887,6 +908,17 @@ export function register(registry) {
             throw new Error(`queue entry not found: ${queueId}`);
         if (!isTerminated(entry.status) && entry.status !== 'blocked') {
             throw new Error(`cannot reprocess entry in status ${entry.status}`);
+        }
+        // The previous session must be STOPPED before the issue runs again.
+        // Reprocessing while the previous session may still be alive created a
+        // SECOND session for the same issue — two agents on the same code.
+        if (entry.sessionId) {
+            try {
+                await rt.orchestration.stopSession(entry.sessionId);
+            }
+            catch (err) {
+                context.logger.warn(`automate.reprocess: stopSession failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
         }
         const reset = settings['post.reprocessResetsRetryCount'];
         const executionStack = entry.executionStack?.map((s) => reset ? { ...s, retryCount: 0, status: 'pending' } : s);

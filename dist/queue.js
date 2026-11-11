@@ -8,7 +8,11 @@
  * The plugin only reads/writes via the storage passed at construction.
  */
 const VALID_TRANSITIONS = {
-    queued: ['running', 'cancelled', 'removed'],
+    // 'blocked' is reachable from 'queued': a scan can discover that an
+    // issue depends on a missing issue, and an expired lease can block a
+    // queued entry. Without it the store refuses the transition and the
+    // refusal is swallowed, leaving the two views disagreeing.
+    queued: ['running', 'blocked', 'cancelled', 'removed'],
     running: ['blocked', 'done', 'failed', 'cancelled'],
     blocked: ['running', 'failed', 'cancelled', 'queued'],
     done: ['queued'],

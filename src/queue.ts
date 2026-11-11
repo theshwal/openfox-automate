@@ -11,7 +11,11 @@
 import type { QueueEntry, QueueStatus } from './types.js'
 
 const VALID_TRANSITIONS: Record<QueueStatus, QueueStatus[]> = {
-  queued: ['running', 'cancelled', 'removed' as QueueStatus],
+  // 'blocked' is reachable from 'queued': a scan can discover that an
+  // issue depends on a missing issue, and an expired lease can block a
+  // queued entry. Without it the store refuses the transition and the
+  // refusal is swallowed, leaving the two views disagreeing.
+  queued: ['running', 'blocked', 'cancelled', 'removed' as QueueStatus],
   running: ['blocked', 'done', 'failed', 'cancelled'],
   blocked: ['running', 'failed', 'cancelled', 'queued'],
   done: ['queued'],

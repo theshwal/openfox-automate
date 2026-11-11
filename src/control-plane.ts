@@ -117,6 +117,16 @@ export interface AdmissionCandidate {
   url: string
   dependsOn?: number[]
   labels?: string[]
+  /**
+   * The candidate is already blocked (e.g. its dependency is missing).
+   *
+   * The legacy view derives this from the issue text; the admission must
+   * mirror it, otherwise the two views disagree and the scheduler starts an
+   * issue whose prerequisite is absent.
+   */
+  blocked?: boolean | undefined
+  /** Why the candidate is blocked. */
+  blockedReason?: string | undefined
 }
 
 export interface AdmissionResult {
@@ -196,6 +206,10 @@ export function admit(
       attempt: 0,
       tokens: { ...EMPTY_TOKEN_USAGE },
       updatedAt: new Date(now).toISOString(),
+    }
+    if (candidate.blocked) {
+      item.status = 'blocked'
+      item.error = candidate.blockedReason ?? 'blocked at admission'
     }
     state.items[key] = item
     admitted.push(item)

@@ -116,6 +116,10 @@ export function admit(state, candidates, options = {}) {
             tokens: { ...EMPTY_TOKEN_USAGE },
             updatedAt: new Date(now).toISOString(),
         };
+        if (candidate.blocked) {
+            item.status = 'blocked';
+            item.error = candidate.blockedReason ?? 'blocked at admission';
+        }
         state.items[key] = item;
         admitted.push(item);
     }
