@@ -101,6 +101,7 @@ describe('AC18 D1 — the legacy path must not starve the control plane', () => 
 
     // First pass: 5 start (the ceiling).
     await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
     expect(sim.sessions).toHaveLength(5)
 
     // The 5 running issues complete: the next 5 must be able to start.
@@ -110,12 +111,22 @@ describe('AC18 D1 — the legacy path must not starve the control plane', () => 
 
     // The chain has three steps: each step must complete before the next
     // one starts, and the issue is done only after the LAST one.
+    //
+    // The chain advance is ASYNCHRONOUS: the hook awaits the host's
+    // answer to learn WHICH session the next step runs in (the host seeds
+    // a new session for every step, because it can only reuse a session
+    // that has no messages). The entry follows that session, so the next
+    // event must be sent on the entry's CURRENT session — which is read
+    // back from the queue instead of being cached.
     for (const item of running) {
       for (const step of CHAIN) {
+        const current = (readJson<QueueEntry[]>(sim.backing, 'queue') ?? []).find(
+          (e) => `${e.repoKey}#${e.issueNumber}` === item.key,
+        )
         await wfHook({
           event: 'workflow.execution.changed',
           timestamp: new Date().toISOString(),
-          sessionId: item.sessionId,
+          sessionId: current?.sessionId ?? item.sessionId,
           data: {
             executionId: `exec-${item.key}-${step}`,
             workflowId: step,
@@ -123,8 +134,10 @@ describe('AC18 D1 — the legacy path must not starve the control plane', () => 
             status: 'completed',
           },
         })
+        await settle()
       }
     }
+    await settle()
 
     // The next issues started as soon as the running ones completed (the
     // chain engine schedules the next one on completion), so the queue

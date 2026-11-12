@@ -399,8 +399,24 @@ async function reserveSingleIssue(rt, entry, options) {
     const key = `${entry.repoKey}#${entry.issueNumber}`;
     return await rt.controlPlane.mutate((state) => {
         const existing = state.items[key];
+        // A RESERVED or RUNNING item is already held by the control plane.
         if (existing?.status === 'reserved' || existing?.status === 'running')
             return false;
+        // A FINISHED item (failed / cancelled / blocked / done) is NEVER
+        // revived by the manual path: the durable registry exists precisely
+        // so that a finished issue is not re-admitted automatically, and the
+        // legacy entry is only the mirror. `automate.startIssue` would
+        // otherwise start a NEW session for an issue that already failed,
+        // keeping its stale error while the item runs again.
+        // The explicit way to run it again is `automate.reprocess`, which
+        // resets the item on purpose.
+        if (existing &&
+            (existing.status === 'failed' ||
+                existing.status === 'cancelled' ||
+                existing.status === 'blocked' ||
+                existing.status === 'done')) {
+            return false;
+        }
         // The issue may not be in the registry yet (it was added manually):
         // admit it first so the reservation has something to attach to.
         if (!existing) {
@@ -588,12 +604,46 @@ async function nextManualIssueNumber(rt, repoKey) {
     return candidate;
 }
 /**
- * Close the HOST TASK the launch created.
+ * Launch a workflow and report what the host actually did.
  *
- * The host only frees a worker slot when its task leaves the
- * "in_progress" state. A task left there consumes the slot forever: the
- * next issue's task is queued on the host's side and its workflow never
- * starts, while the plugin believes it is running.
+ * THE SINGLE LAUNCH PATH. Both the first step of a chain (`startChain`)
+ * and the chain advance (the `workflow.execution.changed` hook) go through
+ * this function, because they face the SAME host contract:
+ *
+ *   - the host's `reusableTarget` only reuses a session that has NO
+ *     MESSAGES, so from the SECOND step on the host necessarily seeds a
+ *     NEW session. The plugin must follow the REPORTED id, or the host's
+ *     events for that step are dropped by the hook (which looks the entry
+ *     up by session id) and the chain stalls after step 1;
+ *   - the host creates a TASK per launch and only frees its worker slot
+ *     when the task leaves "in_progress". Every task must therefore be
+ *     closed — the intermediate ones included, or the host's slots
+ *     saturate and the next issue never starts.
+ *
+ * The launch is asynchronous, so the caller awaits it and persists what
+ * the host reported.
+ */
+async function launchAndBind(rt, launch) {
+    const outcome = await rt.orchestration.launchWorkflow({
+        sessionId: launch.sessionId,
+        workflowId: launch.workflowId,
+        params: launch.params,
+        content: launch.content,
+        projectId: launch.projectId,
+    });
+    const sessionId = outcome.sessionId ?? launch.sessionId;
+    if (!outcome.launched) {
+        rt.context.logger.warn(`the host queued the launch of "${launch.workflowId}": its task slot limit was reached`);
+    }
+    return { sessionId, taskId: outcome.taskId, launched: outcome.launched };
+}
+/**
+ * Close a host task by id.
+ *
+ * The host only frees a worker slot when its task leaves the "in_progress"
+ * state. A task left there consumes the slot forever: the next issue's
+ * task is queued on the host's side and its workflow never starts, while
+ * the plugin believes it is running.
  *
  * A failure to close is reported but never fatal: the chain itself is
  * over, and the issue must still be completed.
@@ -728,6 +778,16 @@ async function spawnEntry(rt, entry) {
             // the session the host reports.
             const onSessionBound = (sessionId, _workflowId) => {
                 updated.sessionId = sessionId;
+                // The session is part of the SCHEDULING state: the control plane
+                // (the authority) must know it too, or the two views disagree on
+                // the session and the drift detector reports it.
+                void rt.controlPlane
+                    .mutate((state) => {
+                    markRunning(state, `${entry.repoKey}#${entry.issueNumber}`, sessionId);
+                })
+                    .catch((err) => {
+                    rt.context.logger.error(`could not record the host session in the control plane: ${err instanceof Error ? err.message : String(err)}`);
+                });
                 void rt.store.update({ ...updated }).catch((err) => {
                     rt.context.logger.error(`could not record the host session: ${err instanceof Error ? err.message : String(err)}`);
                 });
@@ -791,26 +851,17 @@ function createLaunchDriver(rt, onSessionBound, onTaskBound) {
             // to the run, and the plugin must follow it.
             void (async () => {
                 try {
-                    const outcome = await rt.orchestration.launchWorkflow({
-                        sessionId: p.sessionId,
-                        workflowId: p.workflowId,
-                        params: p.params,
-                        content: p.content,
-                        projectId: p.projectId,
-                    });
-                    if (outcome.sessionId && outcome.sessionId !== p.sessionId) {
+                    const bound = await launchAndBind(rt, p);
+                    if (bound.sessionId !== p.sessionId) {
                         // The host seeded a NEW session (it can only reuse a session
                         // that has no messages yet): the entry must follow it.
-                        onSessionBound(outcome.sessionId, p.workflowId);
+                        onSessionBound(bound.sessionId, p.workflowId);
                     }
-                    if (outcome.taskId) {
+                    if (bound.taskId) {
                         // The host task must be CLOSED when the chain ends, otherwise
                         // it keeps its worker slot forever and the next issue never
                         // starts.
-                        onTaskBound(outcome.taskId, p.workflowId);
-                    }
-                    if (!outcome.launched) {
-                        rt.context.logger.warn(`the host queued the launch of "${p.workflowId}": its task slot limit was reached`);
+                        onTaskBound(bound.taskId, p.workflowId);
                     }
                 }
                 catch (err) {
@@ -1043,6 +1094,11 @@ export function register(registry) {
             const item = await rt.controlPlane.read((state) => state.items[key]);
             if (item?.status === 'blocked') {
                 throw new Error(`issue ${key} is blocked: ${item.error ?? 'unknown reason'}`);
+            }
+            // A FINISHED issue is never revived by this path: the operator must
+            // use `automate.reprocess`, which resets it on purpose.
+            if (item && (item.status === 'failed' || item.status === 'cancelled' || item.status === 'done')) {
+                throw new Error(`issue ${key} is ${item.status}: use automate.reprocess to run it again`);
             }
             throw new Error(`issue ${key} is already reserved by the control plane`);
         }
@@ -1344,13 +1400,62 @@ export function register(registry) {
         });
         if (outcome.deduplicated)
             return;
+        // The CHAIN ADVANCE launches the next step. It must go through the
+        // same path as the first step: the host seeds a NEW session for
+        // every step (it can only reuse a session that has no messages), so
+        // the entry has to follow the session the host REPORTS — otherwise
+        // the host's event for that step is dropped by this very hook (which
+        // looks the entry up by session id) and the chain stalls after step
+        // 1. The host TASK of the PREVIOUS step is closed here as well: it
+        // only frees the host's worker slot when it leaves "in_progress",
+        // so the intermediate tasks would otherwise consume the host's slots
+        // forever.
         for (const launch of outcome.launches) {
-            rt.orchestration.launchWorkflow({
-                sessionId: launch.sessionId,
-                workflowId: launch.workflowId,
-                params: launch.params,
-                content: launch.content,
-                projectId: launch.projectId,
+            // The task of the step that just finished is released BEFORE the
+            // next one is created: the host counts the running tasks, so
+            // closing it first keeps the slot count honest.
+            if (outcome.launches.length > 0 && entry.hostTaskId) {
+                await closeHostTask(rt, entry, 'done');
+                entry.hostTaskId = undefined;
+            }
+            let bound;
+            try {
+                bound = await launchAndBind(rt, launch);
+            }
+            catch (err) {
+                context.logger.error(`could not launch the next step "${launch.workflowId}": ${err instanceof Error ? err.message : String(err)}`);
+                continue;
+            }
+            if (bound.sessionId !== entry.sessionId) {
+                // The host seeded a NEW session: the entry follows it.
+                //
+                // The session is part of the SCHEDULING state, so the CONTROL
+                // PLANE (the authority) must know it too — otherwise the two
+                // views disagree on the session and the drift detector reports
+                // it. The STATUS is left untouched: the item is already
+                // 'running' (a step is in flight), and `markRunning` would
+                // revive a finished item.
+                const sessionChanged = bound.sessionId;
+                entry.sessionId = sessionChanged;
+                await rt.controlPlane.mutate((state) => {
+                    const item = state.items[`${entry.repoKey}#${entry.issueNumber}`];
+                    if (!item)
+                        return;
+                    item.sessionId = sessionChanged;
+                    item.updatedAt = new Date().toISOString();
+                    state.updatedAt = item.updatedAt;
+                });
+            }
+            if (bound.taskId) {
+                entry.hostTaskId = bound.taskId;
+                entry.hostProjectId = launch.projectId ?? entry.projectId;
+            }
+            // The session and the task id are persisted BEFORE the next
+            // event arrives: the hook looks the entry up by session id, so a
+            // session that is not persisted makes the next event invisible.
+            await rt.store.update({
+                ...entry,
+                ...(entry.executionStack ? { executionStack: entry.executionStack } : {}),
             });
         }
         if (outcome.transitionTo === 'done' || outcome.transitionTo === 'blocked') {

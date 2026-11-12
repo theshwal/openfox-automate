@@ -30,8 +30,20 @@ export interface LaunchDriver {
    * messages, so the plugin cannot assume its own session is reused: it
    * must follow the reported id, or the host's events are ignored and the
    * chain stalls after its first step.
+   *
+   * The SAME rule applies to EVERY step of the chain, not only the first
+   * one: by the second step the session already has messages, so the host
+   * necessarily seeds a new one.
    */
   onSessionBound?(sessionId: string, workflowId: string): void
+  /**
+   * Called when the host reports the TASK it created for the run.
+   *
+   * The host only frees a worker slot when its task leaves "in_progress",
+   * so every task the plugin creates must be closed — including the ones
+   * created for the INTERMEDIATE steps of a chain.
+   */
+  onTaskBound?(taskId: string, workflowId: string): void
 }
 
 export interface LaunchParams {

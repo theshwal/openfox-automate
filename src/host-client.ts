@@ -407,9 +407,15 @@ export class HostClient {
 
     // Moving the task to "in_progress" is what makes the host launch it.
     //
-    // The EXISTING session is passed so the host can reuse it when it is
-    // still pristine (the first step of a chain). When it is not, the host
-    // seeds a new session and REPORTS it — the caller must follow that id.
+    // THE EXISTING session is passed so the host can reuse it when it is
+    // still pristine (the FIRST step of a chain). From the second step
+    // on, the session already has messages and the host's `reusableTarget`
+    // cannot reuse it: the host seeds a NEW session and REPORTS it — the
+    // caller must follow that id.
+    //
+    // EVERY launch creates a host task, and the host only frees its worker
+    // slot when the task leaves "in_progress". The caller must therefore
+    // close EVERY task it creates — including the intermediate ones.
     const moved = await this.request<{ task?: HostTask; sessionId?: string }>(
       'POST',
       `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(task.id)}/move`,
