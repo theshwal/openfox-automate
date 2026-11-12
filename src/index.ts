@@ -20,7 +20,14 @@ import { orderQueue, findMissingDependencies } from './ordering.js'
 import { fetchAllOpenIssues, getIssue, listIssueComments, validateToken, isPullRequest } from './github.js'
 import { spawnSessionFor } from './spawner.js'
 import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent } from './chain.js'
-import { createOrchestration, type OpenFoxOrchestration } from './orchestration.js'
+import {
+  createOrchestration,
+  defaultHttpClientFactory,
+  readHostBaseUrl,
+  readHostToken,
+  type OpenFoxOrchestration,
+} from './orchestration.js'
+import { HostClient } from './host-client.js'
 import { getHostInternal } from './resolve-openfox.js'
 import { extractToolOutputText, normalizeWorkflowExecutionPayload, readSessionId } from './host-events.js'
 import { ControlPlaneStore, controlPlaneOptionsFromSettings } from './control-plane-store.js'
@@ -55,6 +62,13 @@ interface Runtime {
   appliedExecutionEvents: Set<string>
   /** Durable control-plane registry (admission, reservation, budgets). */
   controlPlane: ControlPlaneStore
+  /**
+   * The supported host HTTP client, when the host is configured.
+   *
+   * It is needed to close the HOST TASK at the end of a chain: the host
+   * only frees its worker slot when the task leaves "in_progress".
+   */
+  hostClient?: (() => HostClient | null) | undefined
 }
 
 let currentRt: Runtime | null = null
@@ -244,7 +258,7 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
   )
   const reRunnable = candidates.filter((c) => !finished.has(`${c.repoKey}#${c.issueNumber}`))
   const { added, skipped } = await rt.store.addNew(reRunnable)
-  const ordered = await orderAndStore(rt)
+  const { ordered, cycleEntries } = await orderAndStore(rt)
   // Admit the same candidates into the durable control-plane registry, so
   // the scheduler owns an exclusive, crash-safe view of what may run.
   await rt.controlPlane.mutate((state) => {
@@ -258,9 +272,14 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
     // entries whose dependency is missing, and admitting them as 'queued'
     // made the two views disagree (and the scheduler started an issue
     // whose prerequisite was absent).
-    const blockedIds = new Set(
-      ordered.filter((e) => e.status === 'blocked').map((e) => `${e.repoKey}#${e.issueNumber}`),
-    )
+    const blockedIds = new Set([
+      ...ordered.filter((e) => e.status === 'blocked').map((e) => `${e.repoKey}#${e.issueNumber}`),
+      // The cycle entries are not in `ordered` (the topological sort
+      // cannot place them), so they are blocked explicitly: admitting them
+      // as 'queued' would let the scheduler start an issue whose
+      // dependency is a cycle.
+      ...cycleEntries.map((e) => `${e.repoKey}#${e.issueNumber}`),
+    ])
     admit(
       state,
       candidates.map((c) => {
@@ -294,7 +313,13 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
   return { added: added.length, skipped, errors }
 }
 
-async function orderAndStore(rt: Runtime): Promise<QueueEntry[]> {
+interface OrderedResult {
+  ordered: QueueEntry[]
+  /** Entries the topological sort could not place (a dependency cycle). */
+  cycleEntries: QueueEntry[]
+}
+
+async function orderAndStore(rt: Runtime): Promise<OrderedResult> {
   const settings = readSettingsFromContext(rt.context)
   const active = await rt.store.loadActive()
   const { ordered, cycleEntries } = orderQueue(
@@ -340,11 +365,25 @@ async function orderAndStore(rt: Runtime): Promise<QueueEntry[]> {
         .map((i) => `${i.repoKey}#${i.issueNumber}`),
     ),
   )
-  const final = ordered.map((e) =>
-    blockedIds.has(e.id) && !runningKeys.has(`${e.repoKey}#${e.issueNumber}`)
-      ? { ...e, status: 'blocked' as const, error: 'missing or circular dependency' }
-      : e,
-  )
+  // The CYCLE entries are NOT part of `ordered` (the topological sort
+  // cannot place them), so building the legacy view from `ordered` alone
+  // DROPPED them from the queue — while the control plane still held them,
+  // and the scheduler then failed with 'Queue entry not found'. They are
+  // kept here and blocked, in BOTH views.
+  const orderedIds = new Set(ordered.map((e) => e.id))
+  const keptCycles = cycleEntries.filter((e) => !orderedIds.has(e.id))
+  const final = [
+    ...ordered.map((e) =>
+      blockedIds.has(e.id) && !runningKeys.has(`${e.repoKey}#${e.issueNumber}`)
+        ? { ...e, status: 'blocked' as const, error: 'missing or circular dependency' }
+        : e,
+    ),
+    ...keptCycles.map((e) => ({
+      ...e,
+      status: 'blocked' as const,
+      error: 'missing or circular dependency',
+    })),
+  ]
   // The dependency decision belongs to the CONTROL PLANE: the scan-time
   // block must be recorded THERE first, and the legacy entry written from
   // it. Blocking only the legacy entry left the control plane saying
@@ -352,7 +391,7 @@ async function orderAndStore(rt: Runtime): Promise<QueueEntry[]> {
   // divergence, and a dependent that could be clobbered mid-run.
   if (blockedIds.size > 0) {
     await rt.controlPlane.mutate((state) => {
-      for (const entry of blockedByMissing) {
+      for (const entry of [...blockedByMissing, ...keptCycles]) {
         const key = `${entry.repoKey}#${entry.issueNumber}`
         const item = state.items[key]
         if (!item) continue
@@ -370,7 +409,7 @@ async function orderAndStore(rt: Runtime): Promise<QueueEntry[]> {
   }
   await rt.store.replace(final)
   await rt.store.pruneHistory(settings['history.retentionCount'] ?? 100)
-  return final
+  return { ordered: final, cycleEntries: keptCycles }
 }
 
 function publishQueue(rt: Runtime, active: QueueEntry[]): void {
@@ -494,6 +533,16 @@ async function reserveSingleIssue(
       }
       return false
     }
+    // The TOKEN BUDGET applies on this path too, exactly as in the bulk
+    // `reserve()`: an issue that already exceeded its budget must not be
+    // started by the manual path either.
+    if (options.maxTokensPerIssue > 0 && item.tokens.totalTokens >= options.maxTokensPerIssue) {
+      item.status = 'blocked'
+      item.error = `token budget exceeded (${item.tokens.totalTokens}/${options.maxTokensPerIssue})`
+      item.updatedAt = new Date().toISOString()
+      state.updatedAt = item.updatedAt
+      return false
+    }
     const active = Object.values(state.items).filter((i) => i.status === 'running' || i.status === 'reserved')
     if (active.length >= options.maxWorkers) return false
     if (active.filter((i) => i.repoKey === item.repoKey).length >= options.maxWorkersPerRepo) return false
@@ -543,6 +592,24 @@ async function scheduleControlPlane(rt: Runtime): Promise<number> {
 
   if (reserved.length === 0) return 0
 
+  // The HOST's task board defaults to ONE concurrent task per project, so
+  // the host's own scheduler would serialise the plugin's workers: the
+  // second issue's task would sit queued on the host's side and its
+  // workflow would never start, while the plugin believes it is running.
+  // The plugin asks for the capacity it needs — the host clamps it to
+  // 1..10.
+  const hostClient = rt.hostClient?.()
+  if (hostClient) {
+    for (const projectId of new Set(reserved.map((i) => i.projectId))) {
+      const slotResult = await hostClient.setTaskSlotLimit(projectId, options.maxWorkers)
+      if (!slotResult.ok) {
+        rt.context.logger.warn(
+          `could not raise the host task slot limit for ${projectId} (${slotResult.reason}): ${slotResult.message}`,
+        )
+      }
+    }
+  }
+
   let started = 0
   for (const item of reserved) {
     try {
@@ -573,7 +640,11 @@ async function scheduleControlPlane(rt: Runtime): Promise<number> {
         addedAt: new Date().toISOString(),
       }
       if (!existing) {
-        await rt.store.update(queueEntry)
+        // The entry does not exist yet: `update` THROWS on a missing id, so
+        // it must be ADDED. Otherwise the control plane holds an item the
+        // legacy queue does not, and the scheduler fails with a cryptic
+        // 'Queue entry not found'.
+        await rt.store.addNew([queueEntry])
       }
       const spawned = await spawnEntry(rt, { ...queueEntry, status: 'queued' })
       if (spawned.status === 'running') {
@@ -622,6 +693,39 @@ async function nextManualIssueNumber(rt: Runtime, repoKey: string): Promise<numb
     candidate += 1
   }
   return candidate
+}
+
+/**
+ * Close the HOST TASK the launch created.
+ *
+ * The host only frees a worker slot when its task leaves the
+ * "in_progress" state. A task left there consumes the slot forever: the
+ * next issue's task is queued on the host's side and its workflow never
+ * starts, while the plugin believes it is running.
+ *
+ * A failure to close is reported but never fatal: the chain itself is
+ * over, and the issue must still be completed.
+ */
+async function closeHostTask(
+  rt: Runtime,
+  entry: QueueEntry,
+  finalState: 'done' | 'cancelled',
+): Promise<void> {
+  const taskId = entry.hostTaskId
+  const projectId = entry.hostProjectId ?? entry.projectId
+  if (!taskId || !projectId) return
+  const client = rt.hostClient?.()
+  if (!client) return
+  const result =
+    finalState === 'done'
+      ? await client.completeTask(projectId, taskId)
+      : await client.deleteTask(projectId, taskId)
+  if (!result.ok) {
+    rt.context.logger.warn(
+      `could not close the host task ${taskId} (${result.reason}): ${result.message} — ` +
+        'the host keeps its worker slot, the next issue may not start',
+    )
+  }
 }
 
 /**
@@ -731,7 +835,28 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
       // assign it back so subsequent reads (RPC, hooks, store) see the
       // running status immediately, before the workflow fires its first
       // workflow.execution.changed event.
-      updated.executionStack = startChain(updated, createLaunchDriver(rt), {
+      //
+      // The host may bind the run to a DIFFERENT session (it can only
+      // reuse a session that has no messages yet), so the entry follows
+      // the session the host reports.
+      const onSessionBound = (sessionId: string, _workflowId: string): void => {
+        updated.sessionId = sessionId
+        void rt.store.update({ ...updated }).catch((err: unknown) => {
+          rt.context.logger.error(
+            `could not record the host session: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        })
+      }
+      const onTaskBound = (taskId: string, _workflowId: string): void => {
+        updated.hostTaskId = taskId
+        updated.hostProjectId = entry.projectId
+        void rt.store.update({ ...updated }).catch((err: unknown) => {
+          rt.context.logger.error(
+            `could not record the host task: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        })
+      }
+      updated.executionStack = startChain(updated, createLaunchDriver(rt, onSessionBound, onTaskBound), {
         sessionId: updated.sessionId ?? '',
       })
     }
@@ -742,6 +867,8 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
     // too. Writing only the legacy entry left the control plane saying
     // 'reserved' while the entry said 'failed' — a drift, and an orphan
     // reservation that blocked the queue.
+    // A failed spawn must release the host's worker slot too.
+    await closeHostTask(rt, updated, 'cancelled')
     const key = `${entry.repoKey}#${entry.issueNumber}`
     await rt.controlPlane.mutate((state) => {
       if (!state.items[key]) {
@@ -774,7 +901,11 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
   return updated
 }
 
-function createLaunchDriver(rt: Runtime): {
+function createLaunchDriver(
+  rt: Runtime,
+  onSessionBound: (sessionId: string, workflowId: string) => void,
+  onTaskBound: (taskId: string, workflowId: string) => void,
+): {
   launch(params: {
     sessionId: string
     workflowId: string
@@ -782,21 +913,47 @@ function createLaunchDriver(rt: Runtime): {
     params: Record<string, string>
     projectId?: string | undefined
   }): void
+  onSessionBound: (sessionId: string, workflowId: string) => void
+  onTaskBound: (taskId: string, workflowId: string) => void
 } {
   return {
     launch: (p) => {
-      try {
-        rt.orchestration.launchWorkflow({
-          sessionId: p.sessionId,
-          workflowId: p.workflowId,
-          params: p.params,
-          content: p.content,
-          projectId: p.projectId,
-        })
-      } catch (err) {
-        rt.context.logger.error(`launchWorkflow failed: ${err instanceof Error ? err.message : String(err)}`)
-      }
+      // The launch is asynchronous: the host reports the session it bound
+      // to the run, and the plugin must follow it.
+      void (async () => {
+        try {
+          const outcome = await rt.orchestration.launchWorkflow({
+            sessionId: p.sessionId,
+            workflowId: p.workflowId,
+            params: p.params,
+            content: p.content,
+            projectId: p.projectId,
+          })
+          if (outcome.sessionId && outcome.sessionId !== p.sessionId) {
+            // The host seeded a NEW session (it can only reuse a session
+            // that has no messages yet): the entry must follow it.
+            onSessionBound(outcome.sessionId, p.workflowId)
+          }
+          if (outcome.taskId) {
+            // The host task must be CLOSED when the chain ends, otherwise
+            // it keeps its worker slot forever and the next issue never
+            // starts.
+            onTaskBound(outcome.taskId, p.workflowId)
+          }
+          if (!outcome.launched) {
+            rt.context.logger.warn(
+              `the host queued the launch of "${p.workflowId}": its task slot limit was reached`,
+            )
+          }
+        } catch (err) {
+          rt.context.logger.error(
+            `launchWorkflow failed: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        }
+      })()
     },
+    onSessionBound,
+    onTaskBound,
   }
 }
 
@@ -840,12 +997,36 @@ async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthR
   const internal = await getHostInternal(context)
   const hasFacade = internal?.kind === 'facade'
   const hasLegacy = internal?.kind === 'legacy'
+  // The HTTP path is the ONLY one a plugin can use on the current host:
+  // `PluginContext` exposes no `host` and no `openFoxInternals`. Reporting
+  // only the in-process surfaces made the health check say 'missing' even
+  // when the plugin could reach the host.
+  const hostSettings = (context.settings ? context.settings() : {}) as Record<string, unknown>
+  const hostBaseUrl = readHostBaseUrl(context) ?? ''
+  const hostTokenConfigured = Boolean(readHostToken(context))
+  // The base URL falls back to the host's own default port when the
+  // operator did not set one, so the report says explicitly whether the
+  // URL was CONFIGURED or merely defaulted.
+  const configuredBaseUrl = hostSettings['host.baseUrl']
+  const hostBaseUrlConfigured = typeof configuredBaseUrl === 'string' && configuredBaseUrl.trim().length > 0
   return {
     github: { tokenValid: tokenRes.valid, rateLimitRemaining: tokenRes.rateLimit.remaining, reposAccessible },
     openFoxInternals: {
       sessionManager: internal ? 'ok' : 'missing',
       launchWorkflowRun: hasLegacy ? 'ok' : hasFacade ? 'ok' : 'missing',
       host: hasFacade ? 'ok' : 'missing',
+    },
+    host: {
+      /** The base URL the plugin uses to reach the host. */
+      baseUrl: hostBaseUrl,
+      /** True when the base URL comes from the operator's settings. */
+      baseUrlConfigured: hostBaseUrlConfigured,
+      /** True when a session token is configured (network auth). */
+      tokenConfigured: hostTokenConfigured,
+      /** 'http' when the plugin can drive the host, 'missing' otherwise. */
+      transport: hostBaseUrl ? 'http' : 'missing',
+      /** The in-process surfaces, when the host provides them. */
+      inProcess: hasFacade ? 'facade' : hasLegacy ? 'legacy' : 'none',
     },
     workflows,
     projects,
@@ -897,6 +1078,7 @@ export function register(registry: PluginRegistry): void {
     rateLimitedUntil: null,
     executions: new Map(),
     orchestration: createOrchestration(context),
+    hostClient: defaultHttpClientFactory(context),
     appliedExecutionEvents: new Set(),
     controlPlane,
   }
@@ -1036,6 +1218,8 @@ export function register(registry: PluginRegistry): void {
         )
       }
     }
+    // The cancelled issue must release the host's worker slot too.
+    await closeHostTask(rt, entry, 'cancelled')
     // The CONTROL PLANE is the authority for the scheduling state: the
     // legacy entry is updated from it, never the other way round.
     const key = `${entry.repoKey}#${entry.issueNumber}`
@@ -1329,6 +1513,12 @@ export function register(registry: PluginRegistry): void {
       }
 
       if (outcome.transitionTo === 'done' || outcome.transitionTo === 'blocked') {
+        // The chain is over: the HOST TASK must be closed, otherwise it
+        // keeps the host's worker slot forever and the next issue is
+        // queued on the host's side and never starts (the host's default
+        // slot limit is one).
+        await closeHostTask(rt, entry, outcome.transitionTo === 'done' ? 'done' : 'cancelled')
+
         // The CONTROL PLANE is the single authority for the scheduling
         // state. The legacy queue entry is updated afterwards from that
         // authority, so the two views cannot drift: there is one writer

@@ -10,7 +10,8 @@
  *     session for it;
  *   - no GitHub write and no session happens while the dry run is on.
  *
- * Everything is offline: a fake GitHub and a fake host.
+ * Everything is offline: the shared harness (`test/helpers/sim.ts`) fakes
+ * both GitHub and the host.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -28,136 +29,9 @@ import {
 import { controlPlaneOptionsFromSettings } from '../src/control-plane-store.js'
 import { DEFAULT_SETTINGS } from '../src/types.js'
 import { settingsSchema } from '../src/settings.js'
-import type { PluginContext, PluginRegistry } from 'openfox/plugin'
+import { makeSim, rpc, settle } from './helpers/sim.js'
 
 const T0 = 1_700_000_000_000
-
-function makeSim(settings: Record<string, unknown> = {}) {
-  const backing = new Map<string, unknown>()
-  const calls: {
-    hook: Array<{ h: string; fn: (p: unknown) => Promise<void> }>
-    rpc: Array<{ name: string; fn: (p: unknown, c: unknown) => Promise<unknown> }>
-  } = { hook: [], rpc: [] }
-  const created: string[] = []
-  const launched: string[] = []
-  const githubWrites: string[] = []
-
-  const base = {
-    'github.token': 'tok',
-    'repos.mapping': 'acme/widgets=proj-1',
-    'workflows.chain': 'plan-issue-v3\nbuild-verify-v3',
-    'scan.startupScan': false,
-    'scan.ignoreLabels': '',
-    'batch.maxConcurrency': 5,
-    'batch.maxConcurrencyPerRepo': 5,
-    'ordering.dependencyPattern': '',
-    dryRun: false,
-    'history.retentionCount': 100,
-    'post.closeOnSuccess': false,
-    'post.assignOnSuccess': false,
-    'post.commentTemplate': '',
-    'pr.monitorEnabled': false,
-    'budget.maxTokensPerIssue': 0,
-    'control.leaseMinutes': 10,
-    ...settings,
-  }
-
-  const context = {
-    id: 'openfox-automate',
-    version: '0.1.0',
-    runtime: { mode: 'development' as const, configDirectory: '/tmp/openfox-sec' },
-    logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    storage: {
-      get: vi.fn(async (k: string) => {
-        const raw = backing.get(k)
-        return raw === undefined ? undefined : (JSON.parse(raw as string) as unknown)
-      }),
-      set: vi.fn(async (k: string, v: unknown) => {
-        backing.set(k, JSON.stringify(v))
-      }),
-    },
-    settings: vi.fn(() => base),
-    notify: vi.fn(),
-    publish: vi.fn(),
-  } as unknown as PluginContext
-
-  const registry = {
-    context,
-    registerTool: vi.fn(),
-    registerCommand: vi.fn(),
-    registerSkillSource: vi.fn(),
-    registerSettings: vi.fn(),
-    registerUiAction: vi.fn(),
-    registerUiBadge: vi.fn(),
-    registerUiPanel: vi.fn(),
-    registerHook: (h: string, fn: (p: unknown) => Promise<void>) => calls.hook.push({ h, fn }),
-    registerTransitionHandler: vi.fn(),
-    registerRpc: (name: string, fn: (p: unknown, c: unknown) => Promise<unknown>) =>
-      calls.rpc.push({ name, fn }),
-    registerAsset: vi.fn(),
-    registerAuth: vi.fn(),
-    registerTransport: vi.fn(),
-    registerPreset: vi.fn(),
-    registerModelMetadataProvider: vi.fn(),
-  } as unknown as PluginRegistry
-
-  ;(context as unknown as { host?: unknown }).host = {
-    sessions: {
-      create: async () => {
-        created.push('c')
-        return { sessionId: `sess-${created.length}` }
-      },
-      stop: vi.fn(),
-    },
-    workflows: {
-      launch: (p: { workflowId: string }) => {
-        launched.push(p.workflowId)
-      },
-    },
-  }
-
-  const fetchStub = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input)
-    const method = init?.method ?? 'GET'
-    if (method !== 'GET') {
-      githubWrites.push(`${method} ${url}`)
-      return new Response('{}', { status: 200 })
-    }
-    if (url.includes('/issues?')) {
-      return new Response(
-        JSON.stringify([
-          {
-            number: 1,
-            title: 'A',
-            body: '',
-            html_url: 'https://github.com/acme/widgets/issues/1',
-            state: 'open',
-            labels: [],
-            created_at: '2026-01-01T00:00:00Z',
-            updated_at: '2026-01-01T00:00:00Z',
-            user: { login: 'r' },
-          },
-          {
-            number: 2,
-            title: 'B',
-            body: '',
-            html_url: 'https://github.com/acme/widgets/issues/2',
-            state: 'open',
-            labels: [],
-            created_at: '2026-01-01T00:00:00Z',
-            updated_at: '2026-01-01T00:00:00Z',
-            user: { login: 'r' },
-          },
-        ]),
-        { status: 200 },
-      )
-    }
-    return new Response('{}', { status: 200 })
-  })
-  vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
-
-  return { registry, calls, backing, created, launched, githubWrites, context }
-}
 
 afterEach(() => {
   _resetLifecycleForTesting()
@@ -187,15 +61,15 @@ describe('AC15 — safe defaults', () => {
   })
 
   it('creates NO session and NO workflow while the dry run is on', async () => {
-    const sim = makeSim({ dryRun: true })
+    const sim = makeSim({ issues: [{ number: 1, title: 'A' }], settings: { dryRun: true } })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
+    await settle()
 
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
 
-    expect(sim.created).toHaveLength(0)
-    expect(sim.launched).toHaveLength(0)
+    expect(sim.sessions).toHaveLength(0)
+    expect(sim.launchedPrompts).toHaveLength(0)
     expect(sim.githubWrites).toHaveLength(0)
   })
 })
@@ -270,46 +144,22 @@ describe('AC15 — an ambiguous session is blocked, never duplicated', () => {
 
   it('a second scheduler cannot start a second session for the same issue', async () => {
     // ONE issue only, so any second session would be a duplicate.
-    const sim = makeSim({ 'scan.ignoreLabels': '' })
-    const single = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input)
-      if ((init?.method ?? 'GET') === 'GET' && url.includes('/issues?')) {
-        return new Response(
-          JSON.stringify([
-            {
-              number: 1,
-              title: 'A',
-              body: '',
-              html_url: 'https://github.com/acme/widgets/issues/1',
-              state: 'open',
-              labels: [],
-              created_at: '2026-01-01T00:00:00Z',
-              updated_at: '2026-01-01T00:00:00Z',
-              user: { login: 'r' },
-            },
-          ]),
-          { status: 200 },
-        )
-      }
-      return new Response('{}', { status: 200 })
-    })
-    vi.stubGlobal('fetch', single as unknown as typeof fetch)
-
+    const sim = makeSim({ issues: [{ number: 1, title: 'A' }] })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
 
     // The control plane starts the issue.
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
-    expect(sim.created).toHaveLength(1)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
+    expect(sim.sessions).toHaveLength(1)
 
     // The legacy path is asked to start the SAME issue again.
     const queue = JSON.parse(sim.backing.get('queue') as string) as Array<{ id: string; status: string }>
-    const startIssue = sim.calls.rpc.find((r) => r.name === 'automate.startIssue')!
-    await expect(startIssue.fn({ queueId: queue[0]!.id }, sim.registry.context)).rejects.toThrow(
-      /cannot start entry in status/,
-    )
+    await expect(
+      rpc(sim, 'automate.startIssue')({ queueId: queue[0]!.id }, sim.registry.context),
+    ).rejects.toThrow(/cannot start entry in status/)
 
-    expect(sim.created).toHaveLength(1)
+    expect(sim.sessions).toHaveLength(1)
   })
 })

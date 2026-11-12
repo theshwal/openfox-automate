@@ -95,7 +95,7 @@ describe('HostClient — fail closed', () => {
 
   it('maps 409 to conflict', async () => {
     const fetchImpl = vi.fn(async () => new Response('', { status: 409 })) as unknown as typeof fetch
-    const result = await client(fetchImpl).sendMessage('s1', 'hello')
+    const result = await client(fetchImpl).launchWorkflow('proj-1', 'plan-issue-v3', { issue_ref: 'o/r#7' })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toBe('conflict')
   })
@@ -201,8 +201,10 @@ describe('HostClient — supported host API', () => {
     const results: HostClientResult<unknown>[] = [
       await c.createSession('p1'),
       await c.getSession('s1'),
-      await c.sendMessage('s1', 'x'),
-      await c.launchWorkflow('s1', 'wf'),
+      await c.launchWorkflow('proj-1', 'wf'),
+      await c.completeTask('proj-1', 'task-1'),
+      await c.deleteTask('proj-1', 'task-1'),
+      await c.setTaskSlotLimit('proj-1', 5),
       await c.stopSession('s1'),
       await c.listWorkflows(),
     ]

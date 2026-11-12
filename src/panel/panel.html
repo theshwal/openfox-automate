@@ -62,6 +62,24 @@
         background: var(--danger);
         color: #450a0a;
       }
+      .hostbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 16px;
+        border-bottom: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .hostbar .host-url {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--text);
+      }
+      .hostbar .host-label {
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
       .tabs {
         display: flex;
         gap: 4px;
@@ -211,7 +229,14 @@
     <header>
       <h1>Issue Queue</h1>
       <span id="dryRunBadge" class="badge">DRY RUN</span>
+      <span id="divergenceBadge" class="badge danger">DIVERGENCE</span>
     </header>
+    <div class="hostbar">
+      <span class="host-label">Host</span>
+      <span id="hostUrl" class="host-url">—</span>
+      <span id="hostTransport" class="host-label"></span>
+      <span id="hostToken" class="host-label"></span>
+    </div>
     <nav class="tabs">
       <div class="tab active" data-tab="active">Active</div>
       <div class="tab" data-tab="history">History</div>
@@ -374,6 +399,32 @@
           else badge.classList.remove('show')
         }
 
+        // The HOST section: on the current OpenFox the HTTP path is the
+        // ONLY one a plugin can use, so the operator must see WHICH host
+        // the plugin talks to and whether a token is configured.
+        function applyHost(health) {
+          const host = (health && health.host) || {}
+          const url = document.getElementById('hostUrl')
+          const transport = document.getElementById('hostTransport')
+          const token = document.getElementById('hostToken')
+          url.textContent = host.baseUrl || 'not configured'
+          transport.textContent = host.transport ? 'via ' + host.transport : ''
+          token.textContent = host.tokenConfigured ? 'token configured' : 'no token'
+        }
+
+        // A divergence between the control plane (the authority) and the
+        // legacy queue means a writer bypassed the authority: it is shown
+        // as a badge, never silently tolerated.
+        function applyDivergences(count) {
+          const badge = document.getElementById('divergenceBadge')
+          if (count > 0) {
+            badge.textContent = count + ' DIVERGENCE' + (count > 1 ? 'S' : '')
+            badge.classList.add('show')
+          } else {
+            badge.classList.remove('show')
+          }
+        }
+
         function activate(tab) {
           document
             .querySelectorAll('.tab')
@@ -400,6 +451,9 @@
             const lines = [
               'github.tokenValid: ' + h.github.tokenValid,
               'github.rateLimitRemaining: ' + h.github.rateLimitRemaining,
+              'host.baseUrl: ' + (h.host ? h.host.baseUrl || '(not configured)' : '(unknown)'),
+              'host.transport: ' + (h.host ? h.host.transport : '(unknown)'),
+              'host.tokenConfigured: ' + (h.host ? h.host.tokenConfigured : '(unknown)'),
               'openFoxInternals.sessionManager: ' + h.openFoxInternals.sessionManager,
               'openFoxInternals.launchWorkflowRun: ' + h.openFoxInternals.launchWorkflowRun,
               'workflows: ' + Object.keys(h.workflows).length,
@@ -425,14 +479,18 @@
 
         async function refresh() {
           try {
-            const [q, h, m] = await Promise.all([
+            const [q, h, m, health, cp] = await Promise.all([
               rpc(`${RPC_NAMESPACE}getQueue`),
               rpc(`${RPC_NAMESPACE}getHistory`, { limit: 50, offset: 0 }),
               rpc(`${RPC_NAMESPACE}getMetrics`),
+              rpc(`${RPC_NAMESPACE}health`).catch(() => null),
+              rpc(`${RPC_NAMESPACE}controlPlaneStatus`).catch(() => null),
             ])
             queue = Array.isArray(q) ? q : []
             history = Array.isArray(h) ? h : []
             metrics = m || null
+            applyHost(health)
+            applyDivergences((cp && cp.divergences ? cp.divergences : []).length)
           } catch (e) {
             console.error('refresh failed', e)
           }

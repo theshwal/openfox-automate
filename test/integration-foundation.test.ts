@@ -16,6 +16,8 @@
  *
  * Each native capability is reused when it is genuinely reachable, and
  * each duplication documents the PROVEN gap that justifies it.
+ *
+ * Everything is offline: the shared harness (`test/helpers/sim.ts`).
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -32,105 +34,11 @@ import {
   recordTokenUsage,
   reserve,
 } from '../src/control-plane.js'
-import type { PluginContext, PluginRegistry } from 'openfox/plugin'
+import { makeSim, readJson, rpc, settle } from './helpers/sim.js'
 import type { QueueEntry } from '../src/types.js'
 
 const T0 = 1_700_000_000_000
 const CHAIN = ['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1']
-
-function makeSim(): {
-  registry: PluginRegistry
-  calls: {
-    hook: Array<{ h: string; fn: (p: unknown) => Promise<void> }>
-    rpc: Array<{ name: string; fn: (p: unknown, c: unknown) => Promise<unknown> }>
-  }
-  backing: Map<string, unknown>
-  launched: Array<{ sessionId: string; workflowId: string }>
-  created: string[]
-} {
-  const calls: {
-    hook: Array<{ h: string; fn: (p: unknown) => Promise<void> }>
-    rpc: Array<{ name: string; fn: (p: unknown, c: unknown) => Promise<unknown> }>
-  } = { hook: [], rpc: [] }
-  const backing = new Map<string, unknown>()
-  const launched: Array<{ sessionId: string; workflowId: string }> = []
-  const created: string[] = []
-
-  const context = {
-    id: 'openfox-automate',
-    version: '0.1.0',
-    runtime: { mode: 'development' as const, configDirectory: '/tmp/openfox-ac17' },
-    logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    storage: {
-      get: vi.fn(async (k: string) => {
-        const raw = backing.get(k)
-        return raw === undefined ? undefined : (JSON.parse(raw as string) as unknown)
-      }),
-      set: vi.fn(async (k: string, v: unknown) => {
-        backing.set(k, JSON.stringify(v))
-      }),
-    },
-    settings: vi.fn(() => ({
-      'github.token': 'tok',
-      'repos.mapping': 'acme/widgets=proj-1',
-      'workflows.chain': CHAIN.join('\n'),
-      'scan.startupScan': false,
-      'scan.ignoreLabels': '',
-      'batch.maxConcurrency': 5,
-      'batch.maxConcurrencyPerRepo': 5,
-      'ordering.dependencyPattern': '',
-      dryRun: false,
-      'history.retentionCount': 100,
-      'pr.monitorEnabled': false,
-      'budget.maxTokensPerIssue': 0,
-      'control.leaseMinutes': 10,
-    })),
-    notify: vi.fn(),
-    publish: vi.fn(),
-  } as unknown as PluginContext
-
-  const registry = {
-    context,
-    registerTool: vi.fn(),
-    registerCommand: vi.fn(),
-    registerSkillSource: vi.fn(),
-    registerSettings: vi.fn(),
-    registerUiAction: vi.fn(),
-    registerUiBadge: vi.fn(),
-    registerUiPanel: vi.fn(),
-    registerHook: (h: string, fn: (p: unknown) => Promise<void>) => calls.hook.push({ h, fn }),
-    registerTransitionHandler: vi.fn(),
-    registerRpc: (name: string, fn: (p: unknown, c: unknown) => Promise<unknown>) =>
-      calls.rpc.push({ name, fn }),
-    registerAsset: vi.fn(),
-    registerAuth: vi.fn(),
-    registerTransport: vi.fn(),
-    registerPreset: vi.fn(),
-    registerModelMetadataProvider: vi.fn(),
-  } as unknown as PluginRegistry
-
-  ;(context as unknown as { host?: unknown }).host = {
-    sessions: {
-      create: async () => {
-        created.push('c')
-        return { sessionId: `sess-${created.length}` }
-      },
-      stop: vi.fn(),
-    },
-    workflows: {
-      launch: (p: { sessionId: string; workflowId: string }) => {
-        launched.push({ sessionId: p.sessionId, workflowId: p.workflowId })
-      },
-    },
-  }
-
-  return { registry, calls, backing, launched, created }
-}
-
-function readJson<T>(backing: Map<string, unknown>, key: string): T | undefined {
-  const raw = backing.get(key)
-  return raw === undefined ? undefined : (JSON.parse(raw as string) as T)
-}
 
 function queueEntry(partial: Partial<QueueEntry> = {}): QueueEntry {
   return {
@@ -226,36 +134,17 @@ describe('AC17 — one source of truth for the scheduling state', () => {
   })
 
   it('the plugin writes the scheduling state through the control plane only', async () => {
-    const sim = makeSim()
-    register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-
-    const fetchStub = vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes('/issues?')) {
-        return new Response(
-          JSON.stringify([
-            {
-              number: 7,
-              title: 'Issue 7',
-              body: '',
-              html_url: 'https://github.com/acme/widgets/issues/7',
-              state: 'open',
-              labels: [],
-              created_at: '2026-01-01T00:00:00Z',
-              updated_at: '2026-01-01T00:00:00Z',
-              user: { login: 'r' },
-            },
-          ]),
-          { status: 200 },
-        )
-      }
-      return new Response('{}', { status: 200 })
+    const sim = makeSim({
+      issues: [{ number: 7, title: 'Issue 7' }],
+      chain: CHAIN,
+      inProcessFacade: true,
     })
-    vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
+    register(sim.registry)
+    await settle()
 
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
 
     // The control plane knows the issue.
     const registry = readJson<{ items: Record<string, { status: string; sessionId?: string }> }>(
@@ -275,50 +164,31 @@ describe('AC17 — one source of truth for the scheduling state', () => {
 
 describe('AC17 — no parallel execution engine', () => {
   it('the plugin never executes a workflow itself: it delegates to the host', async () => {
-    const sim = makeSim()
-    register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-
-    const fetchStub = vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes('/issues?')) {
-        return new Response(
-          JSON.stringify([
-            {
-              number: 7,
-              title: 'Issue 7',
-              body: '',
-              html_url: 'https://github.com/acme/widgets/issues/7',
-              state: 'open',
-              labels: [],
-              created_at: '2026-01-01T00:00:00Z',
-              updated_at: '2026-01-01T00:00:00Z',
-              user: { login: 'r' },
-            },
-          ]),
-          { status: 200 },
-        )
-      }
-      return new Response('{}', { status: 200 })
+    const sim = makeSim({
+      issues: [{ number: 7, title: 'Issue 7' }],
+      chain: CHAIN,
+      inProcessFacade: true,
     })
-    vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
+    register(sim.registry)
+    await settle()
 
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
 
     // Exactly ONE launch, for the FIRST step of the chain: the host runs
     // the workflow, the plugin only asks for it.
-    expect(sim.launched).toHaveLength(1)
-    expect(sim.launched[0]?.workflowId).toBe('plan-issue-v3')
+    expect(sim.inProcessLaunches).toHaveLength(1)
+    expect(sim.inProcessLaunches[0]?.workflowId).toBe('plan-issue-v3')
 
     // The plugin does not launch the NEXT step by itself: only the host's
     // event advances the chain.
-    const before = sim.launched.length
+    const before = sim.inProcessLaunches.length
     const wfHook = sim.calls.hook.find((h) => h.h === 'workflow.execution.changed')!.fn
     await wfHook({
       event: 'workflow.execution.changed',
       timestamp: new Date().toISOString(),
-      sessionId: sim.launched[0]!.sessionId,
+      sessionId: sim.inProcessLaunches[0]!.sessionId,
       data: {
         executionId: 'exec-1',
         workflowId: 'plan-issue-v3',
@@ -326,52 +196,34 @@ describe('AC17 — no parallel execution engine', () => {
         status: 'completed',
       },
     })
+    await settle()
     // Exactly one more launch: the second chain step, triggered BY THE HOST EVENT.
-    expect(sim.launched.length).toBe(before + 1)
-    expect(sim.launched[before]?.workflowId).toBe('build-verify-v3')
+    expect(sim.inProcessLaunches.length).toBe(before + 1)
+    expect(sim.inProcessLaunches[before]?.workflowId).toBe('build-verify-v3')
   })
 })
 
 describe('AC17 — crash, reconciliation and idempotence', () => {
   it('rebuilds the scheduling state from the durable registry after a restart', async () => {
-    const sim = makeSim()
-    register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-
-    const fetchStub = vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes('/issues?')) {
-        return new Response(
-          JSON.stringify([
-            {
-              number: 7,
-              title: 'Issue 7',
-              body: '',
-              html_url: 'https://github.com/acme/widgets/issues/7',
-              state: 'open',
-              labels: [],
-              created_at: '2026-01-01T00:00:00Z',
-              updated_at: '2026-01-01T00:00:00Z',
-              user: { login: 'r' },
-            },
-          ]),
-          { status: 200 },
-        )
-      }
-      return new Response('{}', { status: 200 })
+    const sim = makeSim({
+      issues: [{ number: 7, title: 'Issue 7' }],
+      chain: CHAIN,
+      inProcessFacade: true,
     })
-    vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
+    register(sim.registry)
+    await settle()
 
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
 
     // Simulate a crash: the plugin is torn down, the storage survives.
     _resetLifecycleForTesting()
 
     // A fresh instance reads the same durable registry.
-    const status = (await sim.calls.rpc
-      .find((r) => r.name === 'automate.controlPlaneStatus')!
-      .fn({}, sim.registry.context)) as { items: Array<{ key: string; status: string }> }
+    const status = (await rpc(sim, 'automate.controlPlaneStatus')({}, sim.registry.context)) as {
+      items: Array<{ key: string; status: string }>
+    }
     const item = status.items.find((i) => i.key === 'acme/widgets#7')
     expect(item).toBeDefined()
     expect(item?.status).toBe('running')
@@ -394,42 +246,23 @@ describe('AC17 — crash, reconciliation and idempotence', () => {
   })
 
   it('replays an event without changing the state twice', async () => {
-    const sim = makeSim()
-    register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-
-    const fetchStub = vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes('/issues?')) {
-        return new Response(
-          JSON.stringify([
-            {
-              number: 7,
-              title: 'Issue 7',
-              body: '',
-              html_url: 'https://github.com/acme/widgets/issues/7',
-              state: 'open',
-              labels: [],
-              created_at: '2026-01-01T00:00:00Z',
-              updated_at: '2026-01-01T00:00:00Z',
-              user: { login: 'r' },
-            },
-          ]),
-          { status: 200 },
-        )
-      }
-      return new Response('{}', { status: 200 })
+    const sim = makeSim({
+      issues: [{ number: 7, title: 'Issue 7' }],
+      chain: CHAIN,
+      inProcessFacade: true,
     })
-    vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
+    register(sim.registry)
+    await settle()
 
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
 
     const wfHook = sim.calls.hook.find((h) => h.h === 'workflow.execution.changed')!.fn
     const event = {
       event: 'workflow.execution.changed',
       timestamp: new Date().toISOString(),
-      sessionId: sim.launched[0]!.sessionId,
+      sessionId: sim.inProcessLaunches[0]!.sessionId,
       data: {
         executionId: 'exec-1',
         workflowId: 'plan-issue-v3',
@@ -439,14 +272,16 @@ describe('AC17 — crash, reconciliation and idempotence', () => {
     }
 
     await wfHook(event)
+    await settle()
     const afterFirst = readJson<QueueEntry[]>(sim.backing, 'queue')!
-    const launchesAfterFirst = sim.launched.length
+    const launchesAfterFirst = sim.inProcessLaunches.length
 
     await wfHook(event)
+    await settle()
     const afterReplay = readJson<QueueEntry[]>(sim.backing, 'queue')!
 
     // No second launch, and the state is identical.
-    expect(sim.launched.length).toBe(launchesAfterFirst)
+    expect(sim.inProcessLaunches.length).toBe(launchesAfterFirst)
     expect(afterReplay[0]?.executionStack).toEqual(afterFirst[0]?.executionStack)
   })
 

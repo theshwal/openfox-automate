@@ -35,15 +35,4 @@ export async function spawnSessionFor(entry, deps = {}) {
         'The orchestration port must be provided (it resolves context.host, ' +
         'context.openFoxInternals, or the supported HTTP API).');
 }
-export async function stopSession(sessionId, deps = {}) {
-    if (deps.stopSession) {
-        await deps.stopSession(sessionId);
-        return;
-    }
-    if (deps.orchestration) {
-        await deps.orchestration.stopSession(sessionId);
-        return;
-    }
-    throw new Error('OpenFox host orchestration is not available; cannot stop the session.');
-}
 //# sourceMappingURL=spawner.js.map

@@ -29,9 +29,4 @@ export interface SpawnerDeps {
 }
 export declare function buildSessionTitle(entry: QueueEntry): string;
 export declare function spawnSessionFor(entry: QueueEntry, deps?: SpawnerDeps): Promise<SessionLike>;
-export declare function stopSession(sessionId: string, deps?: {
-    stopSession?: (id: string) => Promise<void> | void;
-    context?: unknown;
-    orchestration?: OpenFoxOrchestration;
-}): Promise<void>;
 //# sourceMappingURL=spawner.d.ts.map

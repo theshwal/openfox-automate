@@ -12,143 +12,29 @@
  * The fix: the scan-time dependency decision belongs to the control
  * plane. It is recorded THERE first, and the legacy entry is written from
  * it.
+ *
+ * AC18-24 — the token budget applies to the single-issue path too.
+ *
+ * Everything is offline: the shared harness (`test/helpers/sim.ts`).
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { _resetLifecycleForTesting, register } from '../src/index.js'
-import type { PluginContext, PluginRegistry } from 'openfox/plugin'
+import { makeSim, readJson, rpc, settle } from './helpers/sim.js'
 import type { QueueEntry } from '../src/types.js'
 
 const CHAIN = ['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1']
 
-interface Hook {
-  h: string
-  fn: (p: unknown) => Promise<void>
-}
+const ISSUES = [
+  { number: 2, title: 'B', body: 'Depends on #3' },
+  { number: 3, title: 'C' },
+]
 
-interface Sim {
-  registry: PluginRegistry
-  calls: { hook: Hook[]; rpc: Array<{ name: string; fn: (p: unknown, c: unknown) => Promise<unknown> }> }
-  backing: Map<string, unknown>
-  sessions: string[]
-  /** Issue numbers the fake GitHub no longer returns (closed). */
-  closed: number[]
-}
-
-function makeSim(): Sim {
-  const backing = new Map<string, unknown>()
-  const calls: {
-    hook: Hook[]
-    rpc: Array<{ name: string; fn: (p: unknown, c: unknown) => Promise<unknown> }>
-  } = { hook: [], rpc: [] }
-  const sessions: string[] = []
-  const closed: number[] = []
-
-  const context = {
-    id: 'openfox-automate',
-    version: '0.1.0',
-    runtime: { mode: 'development' as const, configDirectory: '/tmp/openfox-m1' },
-    logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    storage: {
-      get: vi.fn(async (k: string) => {
-        const raw = backing.get(k)
-        return raw === undefined ? undefined : (JSON.parse(raw as string) as unknown)
-      }),
-      set: vi.fn(async (k: string, v: unknown) => {
-        backing.set(k, JSON.stringify(v))
-      }),
-    },
-    settings: vi.fn(() => ({
-      'github.token': 'tok',
-      'repos.mapping': 'acme/widgets=proj-1',
-      'workflows.chain': CHAIN.join('\n'),
-      'scan.startupScan': false,
-      'scan.ignoreLabels': '',
-      'batch.maxConcurrency': 5,
-      'batch.maxConcurrencyPerRepo': 5,
-      'ordering.dependencyPattern': '(#(\\d+))',
-      dryRun: false,
-      'history.retentionCount': 100,
-      'pr.monitorEnabled': false,
-      'budget.maxTokensPerIssue': 0,
-      'control.leaseMinutes': 10,
-      'host.baseUrl': 'http://127.0.0.1:10369',
-    })),
-    notify: vi.fn(),
-    publish: vi.fn(),
-  } as unknown as PluginContext
-
-  const registry = {
-    context,
-    registerTool: vi.fn(),
-    registerCommand: vi.fn(),
-    registerSkillSource: vi.fn(),
-    registerSettings: vi.fn(),
-    registerUiAction: vi.fn(),
-    registerUiBadge: vi.fn(),
-    registerUiPanel: vi.fn(),
-    registerHook: (h: string, fn: (p: unknown) => Promise<void>) => calls.hook.push({ h, fn }),
-    registerTransitionHandler: vi.fn(),
-    registerRpc: (name: string, fn: (p: unknown, c: unknown) => Promise<unknown>) =>
-      calls.rpc.push({ name, fn }),
-    registerAsset: vi.fn(),
-    registerAuth: vi.fn(),
-    registerTransport: vi.fn(),
-    registerPreset: vi.fn(),
-    registerModelMetadataProvider: vi.fn(),
-  } as unknown as PluginRegistry
-
-  const issues = [
-    {
-      number: 2,
-      title: 'B',
-      body: 'Depends on #3',
-      html_url: 'https://github.com/acme/widgets/issues/2',
-      state: 'open',
-      labels: [],
-      created_at: '2026-01-01T00:00:00Z',
-      updated_at: '2026-01-01T00:00:00Z',
-      user: { login: 'r' },
-    },
-    {
-      number: 3,
-      title: 'C',
-      body: '',
-      html_url: 'https://github.com/acme/widgets/issues/3',
-      state: 'open',
-      labels: [],
-      created_at: '2026-01-01T00:00:00Z',
-      updated_at: '2026-01-01T00:00:00Z',
-      user: { login: 'r' },
-    },
-  ]
-
-  const fetchStub = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input)
-    const method = init?.method ?? 'GET'
-    if (method === 'GET' && url.includes('/issues?')) {
-      return new Response(JSON.stringify(issues.filter((i) => !closed.includes(i.number))), { status: 200 })
-    }
-    if (method !== 'GET' && url.endsWith('/api/sessions')) {
-      sessions.push(`sess-${sessions.length + 1}`)
-      return new Response(JSON.stringify({ session: { id: `sess-${sessions.length}` } }), {
-        status: 201,
-      })
-    }
-    if (method === 'POST' && url.endsWith('/tasks')) {
-      return new Response(JSON.stringify({ task: { id: 'task-1' } }), { status: 201 })
-    }
-    return new Response(JSON.stringify({ success: true }), { status: 200 })
-  })
-  vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
-
-  return { registry, calls, backing, sessions, closed }
-}
-
-function readJson<T>(backing: Map<string, unknown>, key: string): T | undefined {
-  const raw = backing.get(key)
-  return raw === undefined ? undefined : (JSON.parse(raw as string) as T)
+/** The session the running control-plane item is bound to. */
+function runningSessionOf(cp: { items: Record<string, { status: string; sessionId?: string }> }): string {
+  const running = Object.values(cp.items).find((i) => i.status === 'running')
+  return running?.sessionId ?? 'sess-1'
 }
 
 function controlPlane(backing: Map<string, unknown>): {
@@ -168,21 +54,22 @@ afterEach(() => {
 
 describe('AC18-13 — a removed dependency never diverges the views', () => {
   it('blocks the dependent in BOTH views after removeIssue + scan', async () => {
-    const sim = makeSim()
+    const sim = makeSim({
+      issues: ISSUES,
+      chain: CHAIN,
+      settings: { 'ordering.dependencyPattern': '(#(\\d+))' },
+    })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    const scan = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
-    await scan.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
 
     // #3 is closed on GitHub but still lingers in the queue.
     const queue = readJson<QueueEntry[]>(sim.backing, 'queue')!
     const dependency = queue.find((e) => e.issueNumber === 3)!
-    sim.closed.push(3)
-    await sim.calls.rpc
-      .find((r) => r.name === 'automate.removeIssue')!
-      .fn({ queueId: dependency.id }, sim.registry.context)
+    sim.closedIssues.push(3)
+    await rpc(sim, 'automate.removeIssue')({ queueId: dependency.id }, sim.registry.context)
 
-    await scan.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
 
     // The two views agree.
     const cp = controlPlane(sim.backing)
@@ -192,19 +79,25 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
     expect(dependentCp?.status).toBe(dependentLegacy?.status)
     expect(dependentLegacy?.status).toBe('blocked')
 
-    const status = (await sim.calls.rpc
-      .find((r) => r.name === 'automate.controlPlaneStatus')!
-      .fn({}, sim.registry.context)) as { divergences: string[] }
+    const status = (await rpc(sim, 'automate.controlPlaneStatus')({}, sim.registry.context)) as {
+      divergences: string[]
+    }
     expect(status.divergences).toEqual([])
   })
 
   it('NEVER clobbers a RUNNING dependent', async () => {
-    const sim = makeSim()
+    const sim = makeSim({
+      issues: ISSUES,
+      chain: CHAIN,
+      settings: { 'ordering.dependencyPattern': '(#(\\d+))' },
+    })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    const scan = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
-    await scan.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    // The launch is asynchronous: the session is recorded after the host
+    // round-trip.
+    await settle()
 
     // #3 (the dependency) runs first. It completes, so #2 becomes
     // schedulable and runs too.
@@ -213,7 +106,8 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
       await wfHook({
         event: 'workflow.execution.changed',
         timestamp: new Date().toISOString(),
-        sessionId: 'sess-1',
+        // The session the RUNNING issue actually uses.
+        sessionId: runningSessionOf(controlPlane(sim.backing)),
         data: {
           executionId: `exec-${step}`,
           workflowId: step,
@@ -222,10 +116,14 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
         },
       })
     }
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    // The dependency is done, so the DEPENDENT becomes schedulable.
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    // The launch is asynchronous: give the host round-trips a chance.
+    await settle()
 
     // Now the DEPENDENT (#2) is the running one.
     const cp = controlPlane(sim.backing)
+
     const running = Object.values(cp.items).find((i) => i.status === 'running')
     expect(running?.key).toBe('acme/widgets#2')
 
@@ -233,13 +131,11 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
     const queue = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
     const dependency = queue.find((e) => e.issueNumber === 3)
     if (dependency) {
-      sim.closed.push(3)
-      await sim.calls.rpc
-        .find((r) => r.name === 'automate.removeIssue')!
-        .fn({ queueId: dependency.id }, sim.registry.context)
+      sim.closedIssues.push(3)
+      await rpc(sim, 'automate.removeIssue')({ queueId: dependency.id }, sim.registry.context)
     }
 
-    await scan.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
 
     // The RUNNING dependent was NOT clobbered: it keeps running, and the
     // two views still agree.
@@ -247,21 +143,27 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
     const dependent = after.find((e) => e.issueNumber === 2)
     expect(dependent?.status).toBe('running')
 
-    const status = (await sim.calls.rpc
-      .find((r) => r.name === 'automate.controlPlaneStatus')!
-      .fn({}, sim.registry.context)) as { divergences: string[] }
+    const status = (await rpc(sim, 'automate.controlPlaneStatus')({}, sim.registry.context)) as {
+      divergences: string[]
+    }
     expect(status.divergences).toEqual([])
   })
 
   it('never blocks a RUNNING item in the control plane either', async () => {
     // The scan-time block must not touch an item whose workflow is in
     // flight: aborting it would leave a live session behind.
-    const sim = makeSim()
+    const sim = makeSim({
+      issues: ISSUES,
+      chain: CHAIN,
+      settings: { 'ordering.dependencyPattern': '(#(\\d+))' },
+    })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    const scan = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
-    await scan.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    // The launch is asynchronous: the session is recorded after the host
+    // round-trip.
+    await settle()
 
     // #3 (the dependency) is running. Force the dependency check to fail
     // for the running item by removing it from the registry while #3 runs,
@@ -279,7 +181,8 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
       await wfHook({
         event: 'workflow.execution.changed',
         timestamp: new Date().toISOString(),
-        sessionId: 'sess-1',
+        // The session the RUNNING issue actually uses.
+        sessionId: runningSessionOf(controlPlane(sim.backing)),
         data: {
           executionId: `exec-${step}`,
           workflowId: step,
@@ -288,7 +191,8 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
         },
       })
     }
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
 
     // #2 is now the running one.
     const cpBefore = controlPlane(sim.backing)
@@ -302,43 +206,85 @@ describe('AC18-13 — a removed dependency never diverges the views', () => {
     // plane's "never clobber a running item" and the legacy view's
     // symmetric rule, the control plane says 'blocked' while the legacy
     // entry says 'running' — the divergence AC18-13 describes.
-    const cpStore = readJson<Record<string, unknown>>(sim.backing, 'control_plane')!
-    delete cpStore['acme/widgets#3']
+    // The registry is stored as {version, items, sequence, updatedAt}: the
+    // item lives under `items`, so THAT is the key to delete.
+    const cpStore = readJson<{ items: Record<string, unknown> }>(sim.backing, 'control_plane')!
+    expect(cpStore.items['acme/widgets#3']).toBeDefined()
+    delete cpStore.items['acme/widgets#3']
     sim.backing.set('control_plane', JSON.stringify(cpStore))
 
-    await scan.fn({}, sim.registry.context)
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
 
     const after = controlPlane(sim.backing)
     const stillRunning = Object.values(after.items).filter((i) => i.status === 'running')
     expect(stillRunning).toHaveLength(1)
     expect(stillRunning[0]?.status).toBe('running')
 
-    const status = (await sim.calls.rpc
-      .find((r) => r.name === 'automate.controlPlaneStatus')!
-      .fn({}, sim.registry.context)) as { divergences: string[] }
+    const status = (await rpc(sim, 'automate.controlPlaneStatus')({}, sim.registry.context)) as {
+      divergences: string[]
+    }
     expect(status.divergences).toEqual([])
   })
 
   it('the fix is idempotent: repeated scans do not drift', async () => {
-    const sim = makeSim()
+    const sim = makeSim({
+      issues: ISSUES,
+      chain: CHAIN,
+      settings: { 'ordering.dependencyPattern': '(#(\\d+))' },
+    })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    const scan = sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!
-    await scan.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
 
     const queue = readJson<QueueEntry[]>(sim.backing, 'queue')!
     const dependency = queue.find((e) => e.issueNumber === 3)!
-    sim.closed.push(3)
-    await sim.calls.rpc
-      .find((r) => r.name === 'automate.removeIssue')!
-      .fn({ queueId: dependency.id }, sim.registry.context)
+    sim.closedIssues.push(3)
+    await rpc(sim, 'automate.removeIssue')({ queueId: dependency.id }, sim.registry.context)
 
     for (let i = 0; i < 5; i += 1) {
-      await scan.fn({}, sim.registry.context)
-      const status = (await sim.calls.rpc
-        .find((r) => r.name === 'automate.controlPlaneStatus')!
-        .fn({}, sim.registry.context)) as { divergences: string[] }
+      await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+      const status = (await rpc(sim, 'automate.controlPlaneStatus')({}, sim.registry.context)) as {
+        divergences: string[]
+      }
       expect(status.divergences).toEqual([])
     }
+  })
+})
+
+describe('AC18-24 — the token budget applies to the single-issue path too', () => {
+  it('refuses to start an issue that already exceeded its budget', async () => {
+    const sim = makeSim({
+      issues: ISSUES,
+      chain: CHAIN,
+      settings: { 'budget.maxTokensPerIssue': 100, 'ordering.dependencyPattern': '(#(\\d+))' },
+    })
+    register(sim.registry)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+
+    // The issue already consumed more than its budget. Issue #3 is the one
+    // with no dependency, so it is the one the budget applies to.
+    const cpStore = readJson<{ items: Record<string, { tokens: { totalTokens: number } }> }>(
+      sim.backing,
+      'control_plane',
+    )!
+    cpStore.items['acme/widgets#3']!.tokens.totalTokens = 500
+    sim.backing.set('control_plane', JSON.stringify(cpStore))
+
+    const queue = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
+    const target = queue.find((e) => e.issueNumber === 3)!
+    await expect(
+      rpc(sim, 'automate.startIssue')({ queueId: target.id }, sim.registry.context),
+    ).rejects.toThrow(/token budget exceeded/)
+
+    // No session was created, and the two views agree on the block.
+    expect(sim.sessions).toHaveLength(0)
+    const after = controlPlane(sim.backing)
+    expect(after.items['acme/widgets#3']?.status).toBe('blocked')
+
+    const status = (await rpc(sim, 'automate.controlPlaneStatus')({}, sim.registry.context)) as {
+      divergences: string[]
+    }
+    expect(status.divergences).toEqual([])
   })
 })

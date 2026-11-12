@@ -23,6 +23,15 @@ export interface ChainContext {
 
 export interface LaunchDriver {
   launch(params: LaunchParams): void
+  /**
+   * Called when the host reports the session it actually bound to the run.
+   *
+   * The host seeds a NEW session when the one it was given already has
+   * messages, so the plugin cannot assume its own session is reused: it
+   * must follow the reported id, or the host's events are ignored and the
+   * chain stalls after its first step.
+   */
+  onSessionBound?(sessionId: string, workflowId: string): void
 }
 
 export interface LaunchParams {

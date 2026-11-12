@@ -41,7 +41,8 @@ function fakeHost(routes: Record<string, { status: number; body: unknown }>): {
     // The routes are keyed by the exact path. A single-route fake is
     // matched by method when no exact path is registered, which keeps the
     // fixtures short.
-    const key = `${method} ${url.split('?')[0]!}`
+    const path = url.slice(url.indexOf('/', url.indexOf('://') + 3))
+    const key = `${method} ${path.split('?')[0]!}`
     const exact = routes[key]
     const byMethod = Object.entries(routes).find(([k]) => k.startsWith(`${method} `))
     const route = exact ?? byMethod?.[1]
@@ -163,23 +164,27 @@ describe('AC14 — auth and error handling', () => {
 
   it('maps 400 to bad-request (the host refused the payload)', async () => {
     const { fetchImpl } = fakeHost({
-      'POST /api/sessions/sess-1/message': {
+      'POST /api/projects/proj-1/tasks': {
         status: 400,
-        body: { error: 'content or attachments is required' },
+        body: { error: 'prompt is required' },
       },
     })
     const client = new HostClient({ baseUrl: BASE }, { fetchImpl })
-    const result = await client.sendMessage('sess-1', '')
+    const result = await client.launchWorkflow('proj-1', 'plan-issue-v3', { issue_ref: 'o/r#7' })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toBe('bad-request')
   })
 
-  it('maps 409 to conflict (the session is already running)', async () => {
+  it('maps 409 to conflict (the task is already running)', async () => {
     const { fetchImpl } = fakeHost({
-      'POST /api/sessions/sess-1/message': { status: 409, body: { error: 'Session is already running' } },
+      'POST /api/projects/proj-1/tasks': { status: 201, body: { task: { id: 'task-1' } } },
+      'POST /api/projects/proj-1/tasks/task-1/move': {
+        status: 409,
+        body: { error: 'Task is already running' },
+      },
     })
     const client = new HostClient({ baseUrl: BASE }, { fetchImpl })
-    const result = await client.sendMessage('sess-1', '/plan-issue-v3')
+    const result = await client.launchWorkflow('proj-1', 'plan-issue-v3', { issue_ref: 'o/r#7' })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toBe('conflict')
   })

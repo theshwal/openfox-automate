@@ -29,7 +29,7 @@ export function defaultHttpClientFactory(context) {
  * When it is absent, the host's own default is used — which is correct
  * for a local installation.
  */
-function readHostBaseUrl(context) {
+export function readHostBaseUrl(context) {
     const settings = (context.settings ? context.settings() : {});
     const configured = settings['host.baseUrl'];
     if (typeof configured === 'string' && configured.trim().length > 0)
@@ -37,7 +37,7 @@ function readHostBaseUrl(context) {
     return defaultHostBaseUrl(context.runtime.mode);
 }
 /** The session token, when the host requires network authentication. */
-function readHostToken(context) {
+export function readHostToken(context) {
     const settings = (context.settings ? context.settings() : {});
     const token = settings['host.sessionToken'];
     return typeof token === 'string' && token.length > 0 ? token : null;
@@ -99,7 +99,7 @@ export function createHostOrchestration(context, httpClientFactory = defaultHttp
             const internal = await getHostInternal(context);
             if (internal?.kind === 'facade') {
                 internal.facade.workflows.launch(params);
-                return;
+                return { sessionId: params.sessionId, launched: true };
             }
             if (internal?.kind === 'legacy') {
                 internal.legacy.runWorkflow(params.sessionId, {
@@ -108,30 +108,50 @@ export function createHostOrchestration(context, httpClientFactory = defaultHttp
                     ...(params.content !== undefined ? { content: params.content } : {}),
                     ...(params.subGroup ? { subGroup: params.subGroup } : {}),
                 });
-                return;
+                return { sessionId: params.sessionId, launched: true };
             }
             // The supported HTTP API: the HOST resolves the workflow id and runs
             // it. The plugin never executes a workflow itself.
             const client = httpClientFactory();
             if (!client) {
                 context.logger.warn('OpenFox host orchestration is not available; cannot launch workflow', params);
-                return;
+                return { launched: false };
             }
             if (!params.projectId) {
                 context.logger.warn('cannot launch workflow: the host project is unknown', {
                     workflowId: params.workflowId,
                 });
-                return;
+                return { launched: false };
             }
-            const result = await client.launchWorkflow(params.projectId, params.workflowId, params.params ?? {}, undefined, 
-            // The EXISTING session: the host must reuse it, otherwise it seeds
-            // a second one and the plugin never sees the host's events.
-            params.sessionId);
+            // The host maps the positional arguments onto the workflow's
+            // DECLARED parameters, by position, and refuses the launch when a
+            // required one is missing — the prompt is then queued as a plain chat
+            // message and the workflow never starts. The declared order is
+            // therefore read from the host before the prompt is built.
+            const declared = await client.getWorkflowParameters(params.workflowId);
+            const orderedParamIds = declared.ok ? declared.value.map((p) => p.id) : undefined;
+            if (!declared.ok) {
+                context.logger.warn(`cannot map the parameters of "${params.workflowId}": ${declared.message}`);
+            }
+            const result = await client.launchWorkflow(params.projectId, params.workflowId, params.params ?? {}, orderedParamIds, 
+            // The EXISTING session: the host reuses it when it is still
+            // pristine. When it is not, the host seeds a new one and reports
+            // it — the caller follows the reported id.
+            params.sessionId, 
+            // The issue context: the host only sees `task.prompt`, so it would
+            // otherwise be LOST.
+            params.content);
             if (!result.ok) {
                 context.logger.warn(`launchWorkflow failed (${result.reason}): ${result.message}`, {
                     workflowId: params.workflowId,
                 });
+                return { launched: false };
             }
+            return {
+                sessionId: result.value.sessionId,
+                launched: result.value.launched,
+                taskId: result.value.task.id,
+            };
         },
     };
 }
@@ -150,12 +170,11 @@ export function createOrchestration(context, deps = {}) {
             }
             await host.stopSession(sessionId);
         },
-        launchWorkflow(params) {
+        async launchWorkflow(params) {
             if (deps.launchWorkflow) {
-                deps.launchWorkflow(params);
-                return;
+                return await deps.launchWorkflow(params);
             }
-            void host.launchWorkflow(params);
+            return await host.launchWorkflow(params);
         },
     };
 }

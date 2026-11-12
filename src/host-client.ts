@@ -22,16 +22,24 @@
  * workflow:
  *
  *   POST /api/sessions                      { projectId, title }  -> { session }
- *   POST /api/sessions/:id/message          { content }           -> queued message
  *   GET  /api/sessions/:id                  -> session state
  *   POST /api/sessions/:id/stop             -> stop the session
  *   GET  /api/workflows                     -> available workflows
+ *   POST /api/projects/:id/tasks            { prompt }            -> task board
+ *   POST /api/projects/:id/tasks/:task/move { to }               -> task board
  *
- * A queued message whose content starts with `/<workflow-id>` is resolved
- * by the host itself: `resolveSlashLaunch` looks the id up in the user +
- * project workflow directories and launches it with the remaining tokens as
- * parameters. That is the host's own supported workflow-launch syntax, so
- * the plugin does not re-implement the runner.
+ * A workflow is launched by submitting a TASK whose prompt starts with
+ * `/<workflow-id>` and then moving that task to "in_progress": the host's
+ * `resolveSlashLaunch` looks the id up in the user + project workflow
+ * directories and launches it with the remaining tokens as parameters.
+ * That is the host's own supported workflow-launch syntax, so the plugin
+ * does not re-implement the runner.
+ *
+ * NOT the session-message route: `POST /api/sessions/:id/message` only
+ * queues the raw text as a chat message — the queue processor then runs a
+ * plain chat turn, so a `/<workflow-id>` prompt sent there is delivered
+ * LITERALLY and never starts a workflow. `resolveSlashLaunch` has exactly
+ * one call site in the host: the task path.
  *
  * DESIGN RULES
  *
@@ -93,6 +101,16 @@ export interface HostWorkflowInfo {
   id: string
   name?: string
   description?: string
+  /**
+   * The workflow's declared parameters.
+   *
+   * The host maps the positional arguments of a `/<workflow-id> <args…>`
+   * prompt onto these by their `position` (host `workflowParamsFromArgs`),
+   * and REFUSES the launch when a REQUIRED parameter is missing — the
+   * prompt is then queued as a plain chat message and the workflow never
+   * starts. The plugin therefore needs the declared order.
+   */
+  parameters?: Array<{ id: string; label?: string; position?: number; required?: boolean }>
 }
 
 /** A task of the host's project task board. */
@@ -101,7 +119,24 @@ export interface HostTask {
   status?: string
   runState?: string
   prompt?: string
+  /** The session the host bound to this task (returned by the move). */
   sessionId?: string
+}
+
+/** The outcome of a launch through the host's task board. */
+export interface HostLaunch {
+  task: HostTask
+  /**
+   * The session the host bound to the task. The host seeds a NEW session
+   * when the one it was given already has messages, so the caller must
+   * follow this id.
+   */
+  sessionId?: string | undefined
+  /**
+   * False when the host QUEUED the task because its slot limit was
+   * reached: the workflow has not started.
+   */
+  launched: boolean
 }
 
 export interface HostClientDeps {
@@ -134,10 +169,16 @@ export function buildWorkflowLaunchMessage(
   workflowId: string,
   params: Record<string, string> = {},
   orderedParamIds?: string[],
+  content?: string,
 ): string {
   const ids = orderedParamIds && orderedParamIds.length > 0 ? orderedParamIds : Object.keys(params)
   const values = ids.map((id) => params[id]).filter((v): v is string => typeof v === 'string' && v.length > 0)
-  return [`/${workflowId}`, ...values].join(' ')
+  const head = [`/${workflowId}`, ...values].join(' ')
+  // The host only ever sees `task.prompt`, so the issue CONTEXT is carried
+  // after the positional arguments: the arguments come first because the
+  // host maps them onto the declared parameters by position.
+  if (!content || content.trim().length === 0) return head
+  return `${head}\n\n${content}`
 }
 
 function failure(reason: HostClientFailureReason, message: string, status?: number): HostClientFailure {
@@ -200,7 +241,7 @@ export class HostClient {
   }
 
   private async request<T>(
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
     path: string,
     body?: unknown,
   ): Promise<HostClientResult<T>> {
@@ -289,17 +330,26 @@ export class HostClient {
   }
 
   /**
-   * `POST /api/sessions/:id/message` — queue a message.
+   * Read the declared parameters of a workflow, ordered by position.
    *
-   * A message starting with `/<workflow-id>` is resolved and launched by
-   * the host as a workflow run.
+   * The host maps the positional arguments of a `/<workflow-id> <args…>`
+   * prompt onto the workflow's `parameters` BY POSITION, and refuses the
+   * launch when a required parameter is missing. The plugin therefore has
+   * to send the arguments in the DECLARED order — not in `Object.keys()`
+   * order — or the workflow silently never starts.
    */
-  async sendMessage(sessionId: string, content: string): Promise<HostClientResult<unknown>> {
-    if (!sessionId) return failure('bad-request', 'sessionId is required')
-    if (!content) return failure('bad-request', 'content is required')
-    return await this.request<unknown>('POST', `/api/sessions/${encodeURIComponent(sessionId)}/message`, {
-      content,
-    })
+  async getWorkflowParameters(
+    workflowId: string,
+  ): Promise<HostClientResult<Array<{ id: string; position?: number; required?: boolean }>>> {
+    if (!workflowId) return failure('bad-request', 'workflowId is required')
+    const res = await this.listWorkflows()
+    if (!res.ok) return res
+    const workflow = res.value.find((w) => w.id === workflowId)
+    if (!workflow) {
+      return failure('not-found', `the host does not know the workflow "${workflowId}"`)
+    }
+    const parameters = [...(workflow.parameters ?? [])].sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+    return { ok: true, value: parameters }
   }
 
   /**
@@ -312,15 +362,18 @@ export class HostClient {
    * WHY THE TASK BOARD AND NOT THE SESSION MESSAGE ROUTE:
    *
    *   `resolveSlashLaunch` has exactly one call site in the host — the
-   *   task path (`seedSession`, chunk-Q54OOZ5U.js:1234). The route
+   *   task path (`seedSession`). The route
    *   `POST /api/sessions/:id/message` merely queues the raw text and the
    *   queue processor runs a plain chat turn, so a `/<workflow-id>`
    *   prompt sent there is delivered LITERALLY and never starts a
    *   workflow.
    *
-   *   The task board is the only HTTP-reachable path that makes the host
-   *   resolve and launch a workflow. It also brings the host's own slot
-   *   limit and task links, which is exactly what a scheduler wants.
+   * THE SESSION: the host's `reusableTarget` only reuses a session that
+   * has NO MESSAGES yet, so the host CANNOT continue a session that
+   * already ran a workflow — it seeds a new one. The plugin therefore
+   * follows the session the host REPORTS (the move response carries it)
+   * instead of assuming its own session is reused. That is the only way
+   * the chain can advance past its first step.
    *
    * The task is created in "To Do" and then MOVED to "in_progress": the
    * move is what triggers the host's auto-launch.
@@ -331,14 +384,20 @@ export class HostClient {
     params: Record<string, string> = {},
     orderedParamIds?: string[],
     sessionId?: string,
-  ): Promise<HostClientResult<HostTask>> {
+    content?: string,
+  ): Promise<HostClientResult<HostLaunch>> {
     if (!workflowId) return failure('bad-request', 'workflowId is required')
     if (!projectId) return failure('bad-request', 'projectId is required')
+
+    // The issue CONTEXT must not be lost: the host only ever sees
+    // `task.prompt`, so it is appended after the launch arguments. The
+    // arguments stay first, because the host maps them positionally.
+    const prompt = buildWorkflowLaunchMessage(workflowId, params, orderedParamIds, content)
 
     const created = await this.request<{ task?: HostTask }>(
       'POST',
       `/api/projects/${encodeURIComponent(projectId)}/tasks`,
-      { prompt: buildWorkflowLaunchMessage(workflowId, params, orderedParamIds) },
+      { prompt },
     )
     if (!created.ok) return created
     const task = created.value?.task
@@ -348,11 +407,10 @@ export class HostClient {
 
     // Moving the task to "in_progress" is what makes the host launch it.
     //
-    // The EXISTING session is passed so the host REUSES it: without it the
-    // host seeds a SECOND session for the same issue, and every host event
-    // of the real session is ignored by the plugin (which looks the entry
-    // up by session id), so the chain never advances.
-    const moved = await this.request<{ task?: HostTask }>(
+    // The EXISTING session is passed so the host can reuse it when it is
+    // still pristine (the first step of a chain). When it is not, the host
+    // seeds a new session and REPORTS it — the caller must follow that id.
+    const moved = await this.request<{ task?: HostTask; sessionId?: string }>(
       'POST',
       `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(task.id)}/move`,
       {
@@ -361,7 +419,57 @@ export class HostClient {
       },
     )
     if (!moved.ok) return moved
-    return { ok: true, value: moved.value?.task ?? task }
+    return {
+      ok: true,
+      value: {
+        task: moved.value?.task ?? task,
+        // The session the host actually bound to the task.
+        sessionId: moved.value?.sessionId ?? sessionId,
+        // The host queues the task when its slot limit is reached: the
+        // workflow has NOT started.
+        launched: moved.value?.task?.runState !== 'queued',
+      },
+    }
+  }
+
+  /**
+   * Close a task: the host only frees its worker slot when the task
+   * leaves the "in_progress" state. A task left there consumes the slot
+   * forever, so the next issue would never be launched.
+   */
+  async completeTask(projectId: string, taskId: string): Promise<HostClientResult<unknown>> {
+    if (!taskId) return failure('bad-request', 'taskId is required')
+    return await this.request<unknown>(
+      'POST',
+      `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(taskId)}/move`,
+      { to: 'done' },
+    )
+  }
+
+  /** Delete a task (used when the issue fails or is cancelled). */
+  async deleteTask(projectId: string, taskId: string): Promise<HostClientResult<unknown>> {
+    if (!taskId) return failure('bad-request', 'taskId is required')
+    return await this.request<unknown>(
+      'DELETE',
+      `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(taskId)}`,
+    )
+  }
+
+  /**
+   * Raise the host's task slot limit.
+   *
+   * The host's default is ONE concurrent task per project, so the host's
+   * own scheduler would serialise the plugin's five workers. The plugin
+   * asks for the capacity it needs — the host clamps it to 1..10.
+   */
+  async setTaskSlotLimit(projectId: string, slotLimit: number): Promise<HostClientResult<unknown>> {
+    if (!projectId) return failure('bad-request', 'projectId is required')
+    const limit = Math.max(1, Math.min(10, Math.floor(slotLimit)))
+    return await this.request<unknown>(
+      'PUT',
+      `/api/projects/${encodeURIComponent(projectId)}/tasks/settings`,
+      { slotLimit: limit },
+    )
   }
 
   /** `POST /api/sessions/:id/stop` — stop a running session. */

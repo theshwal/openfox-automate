@@ -57,13 +57,34 @@ export interface LaunchWorkflowParams {
 export interface OpenFoxOrchestration {
   createSession(projectId: string, title: string): Promise<SessionLike>
   stopSession(sessionId: string): Promise<void> | void
-  launchWorkflow(params: LaunchWorkflowParams): void
+  /**
+   * Ask the host to launch a workflow.
+   *
+   * It returns the session the host actually bound to the run: the host
+   * seeds a NEW session when the one it was given already has messages,
+   * so the caller MUST follow the reported id — otherwise the host's
+   * events are ignored and the chain stalls.
+   */
+  launchWorkflow(params: LaunchWorkflowParams): Promise<LaunchOutcome>
+}
+
+export interface LaunchOutcome {
+  /** The session the host bound to the run, when it reports one. */
+  sessionId?: string | undefined
+  /** False when the host queued the run (its slot limit was reached). */
+  launched: boolean
+  /**
+   * The id of the host TASK the launch created. The host only frees its
+   * worker slot when the task leaves "in_progress", so it must be closed
+   * when the chain ends.
+   */
+  taskId?: string | undefined
 }
 
 export interface OrchestrationDeps {
   createSession?: (projectId: string, title: string) => Promise<SessionLike>
   stopSession?: (sessionId: string) => Promise<void> | void
-  launchWorkflow?: (params: LaunchWorkflowParams) => void
+  launchWorkflow?: (params: LaunchWorkflowParams) => Promise<LaunchOutcome>
 }
 
 /**
@@ -97,7 +118,7 @@ export function defaultHttpClientFactory(context: PluginContext): HttpClientFact
  * When it is absent, the host's own default is used — which is correct
  * for a local installation.
  */
-function readHostBaseUrl(context: PluginContext): string | null {
+export function readHostBaseUrl(context: PluginContext): string | null {
   const settings = (context.settings ? context.settings() : {}) as Record<string, unknown>
   const configured = settings['host.baseUrl']
   if (typeof configured === 'string' && configured.trim().length > 0) return configured.trim()
@@ -105,7 +126,7 @@ function readHostBaseUrl(context: PluginContext): string | null {
 }
 
 /** The session token, when the host requires network authentication. */
-function readHostToken(context: PluginContext): string | null {
+export function readHostToken(context: PluginContext): string | null {
   const settings = (context.settings ? context.settings() : {}) as Record<string, unknown>
   const token = settings['host.sessionToken']
   return typeof token === 'string' && token.length > 0 ? token : null
@@ -168,11 +189,11 @@ export function createHostOrchestration(
         throw new Error(`stopSession failed (${result.reason}): ${result.message}`)
       }
     },
-    async launchWorkflow(params: LaunchWorkflowParams) {
+    async launchWorkflow(params: LaunchWorkflowParams): Promise<LaunchOutcome> {
       const internal = await getHostInternal(context)
       if (internal?.kind === 'facade') {
         internal.facade.workflows.launch(params)
-        return
+        return { sessionId: params.sessionId, launched: true }
       }
       if (internal?.kind === 'legacy') {
         internal.legacy.runWorkflow(params.sessionId, {
@@ -181,7 +202,7 @@ export function createHostOrchestration(
           ...(params.content !== undefined ? { content: params.content } : {}),
           ...(params.subGroup ? { subGroup: params.subGroup } : {}),
         })
-        return
+        return { sessionId: params.sessionId, launched: true }
       }
       // The supported HTTP API: the HOST resolves the workflow id and runs
       // it. The plugin never executes a workflow itself.
@@ -191,27 +212,47 @@ export function createHostOrchestration(
           'OpenFox host orchestration is not available; cannot launch workflow',
           params as unknown as Record<string, unknown>,
         )
-        return
+        return { launched: false }
       }
       if (!params.projectId) {
         context.logger.warn('cannot launch workflow: the host project is unknown', {
           workflowId: params.workflowId,
         })
-        return
+        return { launched: false }
+      }
+      // The host maps the positional arguments onto the workflow's
+      // DECLARED parameters, by position, and refuses the launch when a
+      // required one is missing — the prompt is then queued as a plain chat
+      // message and the workflow never starts. The declared order is
+      // therefore read from the host before the prompt is built.
+      const declared = await client.getWorkflowParameters(params.workflowId)
+      const orderedParamIds = declared.ok ? declared.value.map((p) => p.id) : undefined
+      if (!declared.ok) {
+        context.logger.warn(`cannot map the parameters of "${params.workflowId}": ${declared.message}`)
       }
       const result = await client.launchWorkflow(
         params.projectId,
         params.workflowId,
         params.params ?? {},
-        undefined,
-        // The EXISTING session: the host must reuse it, otherwise it seeds
-        // a second one and the plugin never sees the host's events.
+        orderedParamIds,
+        // The EXISTING session: the host reuses it when it is still
+        // pristine. When it is not, the host seeds a new one and reports
+        // it — the caller follows the reported id.
         params.sessionId,
+        // The issue context: the host only sees `task.prompt`, so it would
+        // otherwise be LOST.
+        params.content,
       )
       if (!result.ok) {
         context.logger.warn(`launchWorkflow failed (${result.reason}): ${result.message}`, {
           workflowId: params.workflowId,
         })
+        return { launched: false }
+      }
+      return {
+        sessionId: result.value.sessionId,
+        launched: result.value.launched,
+        taskId: result.value.task.id,
       }
     },
   }
@@ -234,12 +275,11 @@ export function createOrchestration(
       }
       await host.stopSession(sessionId)
     },
-    launchWorkflow(params) {
+    async launchWorkflow(params) {
       if (deps.launchWorkflow) {
-        deps.launchWorkflow(params)
-        return
+        return await deps.launchWorkflow(params)
       }
-      void host.launchWorkflow(params)
+      return await host.launchWorkflow(params)
     },
   }
 }

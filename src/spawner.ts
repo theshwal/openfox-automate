@@ -54,22 +54,3 @@ export async function spawnSessionFor(entry: QueueEntry, deps: SpawnerDeps = {})
       'context.openFoxInternals, or the supported HTTP API).',
   )
 }
-
-export async function stopSession(
-  sessionId: string,
-  deps: {
-    stopSession?: (id: string) => Promise<void> | void
-    context?: unknown
-    orchestration?: OpenFoxOrchestration
-  } = {},
-): Promise<void> {
-  if (deps.stopSession) {
-    await deps.stopSession(sessionId)
-    return
-  }
-  if (deps.orchestration) {
-    await deps.orchestration.stopSession(sessionId)
-    return
-  }
-  throw new Error('OpenFox host orchestration is not available; cannot stop the session.')
-}

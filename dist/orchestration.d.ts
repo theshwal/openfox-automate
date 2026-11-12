@@ -52,12 +52,32 @@ export interface LaunchWorkflowParams {
 export interface OpenFoxOrchestration {
     createSession(projectId: string, title: string): Promise<SessionLike>;
     stopSession(sessionId: string): Promise<void> | void;
-    launchWorkflow(params: LaunchWorkflowParams): void;
+    /**
+     * Ask the host to launch a workflow.
+     *
+     * It returns the session the host actually bound to the run: the host
+     * seeds a NEW session when the one it was given already has messages,
+     * so the caller MUST follow the reported id — otherwise the host's
+     * events are ignored and the chain stalls.
+     */
+    launchWorkflow(params: LaunchWorkflowParams): Promise<LaunchOutcome>;
+}
+export interface LaunchOutcome {
+    /** The session the host bound to the run, when it reports one. */
+    sessionId?: string | undefined;
+    /** False when the host queued the run (its slot limit was reached). */
+    launched: boolean;
+    /**
+     * The id of the host TASK the launch created. The host only frees its
+     * worker slot when the task leaves "in_progress", so it must be closed
+     * when the chain ends.
+     */
+    taskId?: string | undefined;
 }
 export interface OrchestrationDeps {
     createSession?: (projectId: string, title: string) => Promise<SessionLike>;
     stopSession?: (sessionId: string) => Promise<void> | void;
-    launchWorkflow?: (params: LaunchWorkflowParams) => void;
+    launchWorkflow?: (params: LaunchWorkflowParams) => Promise<LaunchOutcome>;
 }
 /**
  * The HTTP client used when no in-process surface is available.
@@ -69,6 +89,17 @@ export interface HttpClientFactory {
     (): HostClient | null;
 }
 export declare function defaultHttpClientFactory(context: PluginContext): HttpClientFactory;
+/**
+ * Read the host base URL from the plugin settings.
+ *
+ * The host does not expose its port to a plugin (`PluginRuntime` carries
+ * only `mode` and `configDirectory`), so the URL is operator-supplied.
+ * When it is absent, the host's own default is used — which is correct
+ * for a local installation.
+ */
+export declare function readHostBaseUrl(context: PluginContext): string | null;
+/** The session token, when the host requires network authentication. */
+export declare function readHostToken(context: PluginContext): string | null;
 export declare function createHostOrchestration(context: PluginContext, httpClientFactory?: HttpClientFactory): OpenFoxOrchestration;
 export declare function createOrchestration(context: PluginContext, deps?: OrchestrationDeps): OpenFoxOrchestration;
 //# sourceMappingURL=orchestration.d.ts.map

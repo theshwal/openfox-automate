@@ -115,6 +115,25 @@ describe('AC18 — the plugin reaches the host with the REAL context shape', () 
       const url = String(input)
       urls.push(url)
       if (init?.body) bodies.push(JSON.parse(String(init.body)))
+      if (url.endsWith('/api/workflows')) {
+        // The declared parameters, in the order the host expects them.
+        return new Response(
+          JSON.stringify({
+            defaults: [],
+            userItems: [
+              {
+                id: 'plan-issue-v3',
+                parameters: [
+                  { id: 'issue_ref', position: 0, required: true },
+                  { id: 'repo', position: 1, required: false },
+                ],
+              },
+            ],
+            projectItems: [],
+          }),
+          { status: 200 },
+        )
+      }
       if (url.endsWith('/tasks')) {
         return new Response(JSON.stringify({ task: { id: 'task-1' } }), { status: 201 })
       }
@@ -127,16 +146,24 @@ describe('AC18 — the plugin reaches the host with the REAL context shape', () 
     await orchestration.launchWorkflow({
       sessionId: 'sess-1',
       workflowId: 'plan-issue-v3',
-      params: { issue_ref: 'acme/widgets#7' },
+      params: { issue_ref: 'acme/widgets#7', repo: 'acme/widgets' },
       projectId: 'proj-1',
     })
+
+    // The declared parameters are read FIRST: the host maps the positional
+    // arguments by DECLARED position, and refuses the launch when a
+    // required one is missing.
+    expect(urls[0]).toBe('http://127.0.0.1:10369/api/workflows')
 
     // The HOST resolves the id and runs the workflow — through the task
     // board, which is the only HTTP path where the host resolves a
     // `/<workflow-id>` prompt.
-    expect(urls[0]).toBe('http://127.0.0.1:10369/api/projects/proj-1/tasks')
-    expect(bodies[0]).toEqual({ prompt: '/plan-issue-v3 acme/widgets#7' })
-    expect(urls[1]).toBe('http://127.0.0.1:10369/api/projects/proj-1/tasks/task-1/move')
+    expect(urls[1]).toBe('http://127.0.0.1:10369/api/projects/proj-1/tasks')
+    // bodies[0] is the task creation (the parameter read is a GET).
+    expect(bodies[0]).toEqual({ prompt: '/plan-issue-v3 acme/widgets#7 acme/widgets' })
+    // The move carries the session AND is what triggers the host's launch.
+    expect(bodies[1]).toEqual({ to: 'in_progress', sessionId: 'sess-1' })
+    expect(urls[2]).toBe('http://127.0.0.1:10369/api/projects/proj-1/tasks/task-1/move')
   })
 
   it('fails closed when the host refuses, without pretending a session exists', async () => {

@@ -20,133 +20,20 @@
  *
  *   D3 — `findDivergence` was never called from the runtime, so a drift
  *        was invisible in production.
+ *
+ * Everything is offline: the shared harness (`test/helpers/sim.ts`).
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { _resetLifecycleForTesting, register } from '../src/index.js'
 import { monitorPRs } from '../src/pr-monitor.js'
-import { ControlPlaneStore } from '../src/control-plane-store.js'
-import { CONTROL_PLANE_STORAGE_KEY } from '../src/control-plane-store.js'
+import { ControlPlaneStore, CONTROL_PLANE_STORAGE_KEY } from '../src/control-plane-store.js'
 import { findDivergence } from '../src/state-ownership.js'
-import type { PluginContext, PluginRegistry } from 'openfox/plugin'
+import { makeSim, readJson, rpc, settle } from './helpers/sim.js'
 import type { QueueEntry } from '../src/types.js'
 
 const CHAIN = ['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1']
-
-interface Hook {
-  h: string
-  fn: (p: unknown) => Promise<void>
-}
-
-function makeSim(issues: Array<{ number: number; title: string }>) {
-  const backing = new Map<string, unknown>()
-  const calls: {
-    hook: Hook[]
-    rpc: Array<{ name: string; fn: (p: unknown, c: unknown) => Promise<unknown> }>
-  } = { hook: [], rpc: [] }
-  const created: string[] = []
-  const launched: Array<{ sessionId: string; workflowId: string }> = []
-
-  const context = {
-    id: 'openfox-automate',
-    version: '0.1.0',
-    runtime: { mode: 'development' as const, configDirectory: '/tmp/openfox-ac18' },
-    logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    storage: {
-      get: vi.fn(async (k: string) => {
-        const raw = backing.get(k)
-        return raw === undefined ? undefined : (JSON.parse(raw as string) as unknown)
-      }),
-      set: vi.fn(async (k: string, v: unknown) => {
-        backing.set(k, JSON.stringify(v))
-      }),
-    },
-    settings: vi.fn(() => ({
-      'github.token': 'tok',
-      'repos.mapping': 'acme/widgets=proj-1',
-      'workflows.chain': CHAIN.join('\n'),
-      'scan.startupScan': false,
-      'scan.ignoreLabels': '',
-      'batch.maxConcurrency': 5,
-      'batch.maxConcurrencyPerRepo': 5,
-      'ordering.dependencyPattern': '',
-      dryRun: false,
-      'history.retentionCount': 100,
-      'pr.monitorEnabled': true,
-      'budget.maxTokensPerIssue': 0,
-      'control.leaseMinutes': 10,
-    })),
-    notify: vi.fn(),
-    publish: vi.fn(),
-  } as unknown as PluginContext
-
-  const registry = {
-    context,
-    registerTool: vi.fn(),
-    registerCommand: vi.fn(),
-    registerSkillSource: vi.fn(),
-    registerSettings: vi.fn(),
-    registerUiAction: vi.fn(),
-    registerUiBadge: vi.fn(),
-    registerUiPanel: vi.fn(),
-    registerHook: (h: string, fn: (p: unknown) => Promise<void>) => calls.hook.push({ h, fn }),
-    registerTransitionHandler: vi.fn(),
-    registerRpc: (name: string, fn: (p: unknown, c: unknown) => Promise<unknown>) =>
-      calls.rpc.push({ name, fn }),
-    registerAsset: vi.fn(),
-    registerAuth: vi.fn(),
-    registerTransport: vi.fn(),
-    registerPreset: vi.fn(),
-    registerModelMetadataProvider: vi.fn(),
-  } as unknown as PluginRegistry
-
-  ;(context as unknown as { host?: unknown }).host = {
-    sessions: {
-      create: async () => {
-        created.push('c')
-        return { sessionId: `sess-${created.length}` }
-      },
-      stop: vi.fn(),
-    },
-    workflows: {
-      launch: (p: { sessionId: string; workflowId: string }) => {
-        launched.push({ sessionId: p.sessionId, workflowId: p.workflowId })
-      },
-    },
-  }
-
-  const fetchStub = vi.fn(async (input: RequestInfo | URL) => {
-    const url = String(input)
-    if (url.includes('/issues?')) {
-      return new Response(
-        JSON.stringify(
-          issues.map((i) => ({
-            number: i.number,
-            title: i.title,
-            body: '',
-            html_url: `https://github.com/acme/widgets/issues/${i.number}`,
-            state: 'open',
-            labels: [],
-            created_at: '2026-01-01T00:00:00Z',
-            updated_at: '2026-01-01T00:00:00Z',
-            user: { login: 'r' },
-          })),
-        ),
-        { status: 200 },
-      )
-    }
-    return new Response('{}', { status: 200 })
-  })
-  vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
-
-  return { registry, calls, backing, created, launched, context }
-}
-
-function readJson<T>(backing: Map<string, unknown>, key: string): T | undefined {
-  const raw = backing.get(key)
-  return raw === undefined ? undefined : (JSON.parse(raw as string) as T)
-}
 
 function controlPlane(backing: Map<string, unknown>): {
   items: Record<string, { key: string; status: string; sessionId?: string; error?: string }>
@@ -165,17 +52,19 @@ afterEach(() => {
 
 describe('AC18 D1 — the legacy path must not starve the control plane', () => {
   it('does not leave orphan reservations that block every later scheduling pass', async () => {
-    const sim = makeSim(Array.from({ length: 10 }, (_, i) => ({ number: i + 1, title: `I${i + 1}` })))
+    const sim = makeSim({
+      issues: Array.from({ length: 10 }, (_, i) => ({ number: i + 1, title: `I${i + 1}` })),
+    })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-
-    const schedule = sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
 
     // Several scheduling passes, as the host would do.
     let totalStarted = 0
     for (let i = 0; i < 5; i += 1) {
-      const res = (await schedule.fn({}, sim.registry.context)) as { started: number }
+      const res = (await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)) as {
+        started: number
+      }
       totalStarted += res.started
     }
 
@@ -193,24 +82,26 @@ describe('AC18 D1 — the legacy path must not starve the control plane', () => 
     // Every started item has a session, and the sessions match.
     const started = Object.values(cp.items).filter((i) => i.status === 'running')
     expect(started).toHaveLength(5)
-    expect(sim.created).toHaveLength(5)
+    expect(sim.sessions).toHaveLength(5)
     for (const item of started) {
       expect(item.sessionId).toBeTruthy()
     }
   })
 
   it('drains the queue as the running issues complete', async () => {
-    const sim = makeSim(Array.from({ length: 10 }, (_, i) => ({ number: i + 1, title: `I${i + 1}` })))
+    const sim = makeSim({
+      issues: Array.from({ length: 10 }, (_, i) => ({ number: i + 1, title: `I${i + 1}` })),
+      chain: CHAIN,
+    })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
 
-    const schedule = sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!
     const wfHook = sim.calls.hook.find((h) => h.h === 'workflow.execution.changed')!.fn
 
     // First pass: 5 start (the ceiling).
-    await schedule.fn({}, sim.registry.context)
-    expect(sim.created).toHaveLength(5)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    expect(sim.sessions).toHaveLength(5)
 
     // The 5 running issues complete: the next 5 must be able to start.
     const cp = controlPlane(sim.backing)
@@ -238,7 +129,7 @@ describe('AC18 D1 — the legacy path must not starve the control plane', () => 
     // The next issues started as soon as the running ones completed (the
     // chain engine schedules the next one on completion), so the queue
     // drained WITHOUT another scheduling pass.
-    expect(sim.created).toHaveLength(10)
+    expect(sim.sessions).toHaveLength(10)
 
     const after = controlPlane(sim.backing)
     expect(Object.values(after.items).filter((i) => i.status === 'running')).toHaveLength(5)
@@ -250,11 +141,12 @@ describe('AC18 D1 — the legacy path must not starve the control plane', () => 
 
 describe('AC18 D2 — every writer goes through the control plane', () => {
   it('the PR monitor updates the control plane, not only the legacy entry', async () => {
-    const sim = makeSim([{ number: 1, title: 'I1' }])
+    const sim = makeSim({ issues: [{ number: 1, title: 'I1' }] })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
 
     // The PR URL is captured so the monitor has something to reconcile.
     const toolHook = sim.calls.hook.find((h) => h.h === 'tool.completed')!.fn
@@ -326,27 +218,25 @@ describe('AC18 D2 — every writer goes through the control plane', () => {
   })
 
   it('cancelIssue moves the control-plane item to cancelled', async () => {
-    const sim = makeSim([{ number: 1, title: 'I1' }])
+    const sim = makeSim({ issues: [{ number: 1, title: 'I1' }] })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
 
     const queue = readJson<QueueEntry[]>(sim.backing, 'queue')!
-    await sim.calls.rpc
-      .find((r) => r.name === 'automate.cancelIssue')!
-      .fn({ queueId: queue[0]!.id }, sim.registry.context)
+    await rpc(sim, 'automate.cancelIssue')({ queueId: queue[0]!.id }, sim.registry.context)
 
     const cp = controlPlane(sim.backing)
     expect(cp.items['acme/widgets#1']?.status).toBe('cancelled')
   })
 
   it('reprocess re-queues the control-plane item, so it can run again', async () => {
-    const sim = makeSim([{ number: 1, title: 'I1' }])
+    const sim = makeSim({ issues: [{ number: 1, title: 'I1' }] })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
 
     const queue = readJson<QueueEntry[]>(sim.backing, 'queue')!
     const id = queue[0]!.id
@@ -368,9 +258,7 @@ describe('AC18 D2 — every writer goes through the control plane', () => {
       })
     expect(controlPlane(sim.backing).items['acme/widgets#1']?.status).toBe('blocked')
 
-    await sim.calls.rpc
-      .find((r) => r.name === 'automate.reprocess')!
-      .fn({ queueId: id }, sim.registry.context)
+    await rpc(sim, 'automate.reprocess')({ queueId: id }, sim.registry.context)
 
     const cp = controlPlane(sim.backing)
     // The issue is schedulable again: the control plane agrees with the
@@ -389,15 +277,13 @@ describe('AC18 D2 — every writer goes through the control plane', () => {
 
 describe('AC18 D3 — the drift detector is actually used', () => {
   it('the runtime reports a divergence instead of leaving it invisible', async () => {
-    const sim = makeSim([{ number: 1, title: 'I1' }])
+    const sim = makeSim({ issues: [{ number: 1, title: 'I1' }] })
     register(sim.registry)
-    await new Promise((r) => setTimeout(r, 0))
-    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
-    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await settle()
+    await rpc(sim, 'automate.scanNow')({}, sim.registry.context)
+    await rpc(sim, 'automate.controlPlaneSchedule')({}, sim.registry.context)
 
-    const status = (await sim.calls.rpc
-      .find((r) => r.name === 'automate.controlPlaneStatus')!
-      .fn({}, sim.registry.context)) as {
+    const status = (await rpc(sim, 'automate.controlPlaneStatus')({}, sim.registry.context)) as {
       items: Array<{ key: string; status: string }>
       divergences: string[]
     }
