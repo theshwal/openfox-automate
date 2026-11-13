@@ -402,11 +402,21 @@
         // The HOST section: on the current OpenFox the HTTP path is the
         // ONLY one a plugin can use, so the operator must see WHICH host
         // the plugin talks to and whether a token is configured.
+        //
+        // `health` is null when the call FAILED: showing "not configured"
+        // then would be a lie — it would make a working plugin look
+        // misconfigured. The unreachable state is shown as such.
         function applyHost(health) {
-          const host = (health && health.host) || {}
           const url = document.getElementById('hostUrl')
           const transport = document.getElementById('hostTransport')
           const token = document.getElementById('hostToken')
+          if (!health) {
+            url.textContent = 'unreachable'
+            transport.textContent = ''
+            token.textContent = ''
+            return
+          }
+          const host = health.host || {}
           url.textContent = host.baseUrl || 'not configured'
           transport.textContent = host.transport ? 'via ' + host.transport : ''
           token.textContent = host.tokenConfigured ? 'token configured' : 'no token'
