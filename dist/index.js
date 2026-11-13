@@ -1414,7 +1414,11 @@ export function register(registry) {
             // The task of the step that just finished is released BEFORE the
             // next one is created: the host counts the running tasks, so
             // closing it first keeps the slot count honest.
-            if (outcome.launches.length > 0 && entry.hostTaskId) {
+            //
+            // `outcome.launches` never holds more than one element (the
+            // chain advance and the retry are mutually exclusive), so the
+            // release happens once per advance.
+            if (entry.hostTaskId) {
                 await closeHostTask(rt, entry, 'done');
                 entry.hostTaskId = undefined;
             }
