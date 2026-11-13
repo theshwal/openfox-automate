@@ -147,11 +147,30 @@ export interface HostClientDeps {
  *   never starts a workflow.
  *
  *   So this prompt must be sent to the task board
- *   (`POST /api/projects/:projectId/tasks`), which is the only
+ *   (`/api/projects/:projectId/tasks`), which is the only
  *   HTTP-reachable path that makes the host resolve and launch a
  *   workflow.
+ *
+ * THE PROMPT CARRIES THE ARGUMENTS AND NOTHING ELSE.
+ *
+ * The host splits the prompt on EVERY whitespace (newlines included) and
+ * maps the resulting tokens onto the declared parameters BY POSITION
+ * (`parseSlashInvocation` + `workflowParamsFromArgs`, host
+ * chunk-Q54OOZ5U.js:309-330). Any free text appended here would
+ * therefore be SPLIT INTO TOKENS and would land in the NEXT positional
+ * parameter — the `repo` parameter of plan-issue-v3 received the first
+ * token of the issue context, which made the planner fail with
+ * "TARGET REJECTED".
+ *
+ * The host also DROPS the prompt when it launches a workflow: it passes
+ * `{ workflowId, params, scope, attachments }` to the runner
+ * (chunk-Q54OOZ5U.js:1240-1245). So the prompt is a transport for the
+ * POSITIONAL ARGUMENTS, not a channel for content.
+ *
+ * `orderedValues` are the values already sorted in the workflow's
+ * DECLARED order, so they line up with what the host will read.
  */
-export declare function buildWorkflowLaunchMessage(workflowId: string, params?: Record<string, string>, orderedParamIds?: string[], content?: string): string;
+export declare function buildWorkflowLaunchMessage(workflowId: string, params?: Record<string, string>, orderedValues?: string[]): string;
 /**
  * Validate the operator-supplied host base URL.
  *
@@ -222,7 +241,7 @@ export declare class HostClient {
      * The task is created in "To Do" and then MOVED to "in_progress": the
      * move is what triggers the host's auto-launch.
      */
-    launchWorkflow(projectId: string, workflowId: string, params?: Record<string, string>, orderedParamIds?: string[], sessionId?: string, content?: string): Promise<HostClientResult<HostLaunch>>;
+    launchWorkflow(projectId: string, workflowId: string, params?: Record<string, string>, orderedValues?: string[], sessionId?: string): Promise<HostClientResult<HostLaunch>>;
     /**
      * Close a task: the host only frees its worker slot when the task
      * leaves the "in_progress" state. A task left there consumes the slot

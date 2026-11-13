@@ -403,23 +403,30 @@
         // ONLY one a plugin can use, so the operator must see WHICH host
         // the plugin talks to and whether a token is configured.
         //
-        // `health` is null when the call FAILED: showing "not configured"
+        // The status comes from `automate.hostStatus`, which is PURELY
+        // LOCAL. The panel refreshes every 10 seconds, and the full
+        // `automate.health` queries the GitHub API (one `GET /user` plus
+        // one `GET /issues/1` per mapped repository): polling it here
+        // spent ~1,440 GitHub requests per hour on the operator's quota
+        // for the display alone. The full check stays available for the
+        // operator's explicit click on "Health check".
+        //
+        // `status` is null when the call FAILED: showing "not configured"
         // then would be a lie — it would make a working plugin look
         // misconfigured. The unreachable state is shown as such.
-        function applyHost(health) {
+        function applyHost(status) {
           const url = document.getElementById('hostUrl')
           const transport = document.getElementById('hostTransport')
           const token = document.getElementById('hostToken')
-          if (!health) {
+          if (!status) {
             url.textContent = 'unreachable'
             transport.textContent = ''
             token.textContent = ''
             return
           }
-          const host = health.host || {}
-          url.textContent = host.baseUrl || 'not configured'
-          transport.textContent = host.transport ? 'via ' + host.transport : ''
-          token.textContent = host.tokenConfigured ? 'token configured' : 'no token'
+          url.textContent = status.baseUrl || 'not configured'
+          transport.textContent = status.transport ? 'via ' + status.transport : ''
+          token.textContent = status.tokenConfigured ? 'token configured' : 'no token'
         }
 
         // A divergence between the control plane (the authority) and the
@@ -489,17 +496,21 @@
 
         async function refresh() {
           try {
-            const [q, h, m, health, cp] = await Promise.all([
+            // `hostStatus` is LOCAL: it never touches the GitHub API. The
+            // panel refreshes every 10 seconds, so the full `health`
+            // check (which queries GitHub) would spend the operator's
+            // quota for the display alone.
+            const [q, h, m, host, cp] = await Promise.all([
               rpc(`${RPC_NAMESPACE}getQueue`),
               rpc(`${RPC_NAMESPACE}getHistory`, { limit: 50, offset: 0 }),
               rpc(`${RPC_NAMESPACE}getMetrics`),
-              rpc(`${RPC_NAMESPACE}health`).catch(() => null),
+              rpc(`${RPC_NAMESPACE}hostStatus`).catch(() => null),
               rpc(`${RPC_NAMESPACE}controlPlaneStatus`).catch(() => null),
             ])
             queue = Array.isArray(q) ? q : []
             history = Array.isArray(h) ? h : []
             metrics = m || null
-            applyHost(health)
+            applyHost(host)
             applyDivergences((cp && cp.divergences ? cp.divergences : []).length)
           } catch (e) {
             console.error('refresh failed', e)

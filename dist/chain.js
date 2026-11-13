@@ -36,23 +36,54 @@ export function buildIssueContext(entry) {
     lines.push('When this workflow reaches $done, the plugin will automatically start the next workflow in the chain — do not call step_done() early; the plugin orchestrates the chain.');
     return lines.join('\n');
 }
+/**
+ * The values the plugin can offer to a workflow, keyed by the parameter
+ * NAME the workflows declare.
+ *
+ * The host maps the positional arguments of a `/<workflow-id> <args…>`
+ * prompt onto the workflow's DECLARED parameters, by position, and
+ * refuses the launch when a required one is missing. Only the parameters
+ * the workflow actually declares are therefore offered — the others are
+ * simply not sent.
+ *
+ * The names below are the ones the REAL workflows declare (read from the
+ * installed host's workflow definitions):
+ *
+ *   plan-issue-v3     → issue_ref (position 0, required), repo (position 1)
+ *   build-verify-v3   → workdir (position 0)
+ *   publish-pr-v1     → workdir (position 0)
+ *
+ * `issue_ref` is `<owner>/<repo>#<number>`: the planner parses that form
+ * itself (`repo=${ref%#*}; num=${ref##*#}`) and reads the issue with an
+ * authenticated `gh issue view`. The issue body and the comments are
+ * therefore NOT transported: the workflow re-reads them from GitHub, and
+ * the host has no channel to carry free text anyway (the prompt is split
+ * on whitespace, so any free text would CORRUPT the positional mapping).
+ */
 export function buildIssueParams(entry) {
     return {
-        // `issue_ref` is a REQUIRED parameter of plan-issue / plan-issue-v3. The
-        // host refuses to launch a workflow whose required params are missing
-        // (src/server/runner/orchestrator.ts), so the chain could never start the
-        // planning step. The id is the stable, already-resolved target: the entry
-        // exists precisely because this issue was scanned and queued.
+        // The explicit target of the planning step. It is REQUIRED by
+        // plan-issue-v3, and the host refuses a launch whose required
+        // parameters are missing — the workflow would then be queued as a
+        // plain chat message and never start.
         issue_ref: `${entry.repoKey}#${entry.issueNumber}`,
-        issue_url: entry.url,
-        issue_number: String(entry.issueNumber),
-        issue_title: entry.title,
-        issue_body: entry.body ?? '',
-        issue_labels: entry.labels.join(', '),
-        issue_comments: entry.comments.map((c) => `${c.author}: ${c.body}`).join('\n\n'),
-        repo_key: entry.repoKey,
-        project_id: entry.projectId,
+        // `owner/name`, as declared by the workflow. It lets the planner read
+        // the issue with an authenticated `gh` instead of guessing the
+        // repository from the session's working directory.
+        repo: entry.repoKey,
     };
+}
+/**
+ * The working directory to offer to a workflow, when it is known.
+ *
+ * `workdir` is a parameter of build-verify-v3 and publish-pr-v1. The host
+ * resolves the `{{workdir}}` template variable from the SESSION, not from
+ * the parameters, so a wrong value would be misleading rather than
+ * effective: the value is therefore only offered when the plugin knows
+ * the real working directory of the session.
+ */
+export function buildWorkdirParams(workdir) {
+    return workdir ? { workdir } : {};
 }
 export function initExecutionStack(chain) {
     return chain.map((id) => ({

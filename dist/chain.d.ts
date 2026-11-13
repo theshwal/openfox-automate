@@ -51,7 +51,41 @@ export interface LaunchParams {
     projectId?: string | undefined;
 }
 export declare function buildIssueContext(entry: QueueEntry): string;
+/**
+ * The values the plugin can offer to a workflow, keyed by the parameter
+ * NAME the workflows declare.
+ *
+ * The host maps the positional arguments of a `/<workflow-id> <args…>`
+ * prompt onto the workflow's DECLARED parameters, by position, and
+ * refuses the launch when a required one is missing. Only the parameters
+ * the workflow actually declares are therefore offered — the others are
+ * simply not sent.
+ *
+ * The names below are the ones the REAL workflows declare (read from the
+ * installed host's workflow definitions):
+ *
+ *   plan-issue-v3     → issue_ref (position 0, required), repo (position 1)
+ *   build-verify-v3   → workdir (position 0)
+ *   publish-pr-v1     → workdir (position 0)
+ *
+ * `issue_ref` is `<owner>/<repo>#<number>`: the planner parses that form
+ * itself (`repo=${ref%#*}; num=${ref##*#}`) and reads the issue with an
+ * authenticated `gh issue view`. The issue body and the comments are
+ * therefore NOT transported: the workflow re-reads them from GitHub, and
+ * the host has no channel to carry free text anyway (the prompt is split
+ * on whitespace, so any free text would CORRUPT the positional mapping).
+ */
 export declare function buildIssueParams(entry: QueueEntry): Record<string, string>;
+/**
+ * The working directory to offer to a workflow, when it is known.
+ *
+ * `workdir` is a parameter of build-verify-v3 and publish-pr-v1. The host
+ * resolves the `{{workdir}}` template variable from the SESSION, not from
+ * the parameters, so a wrong value would be misleading rather than
+ * effective: the value is therefore only offered when the plugin knows
+ * the real working directory of the session.
+ */
+export declare function buildWorkdirParams(workdir: string | undefined): Record<string, string>;
 export declare function initExecutionStack(chain: string[]): ExecutionStep[];
 export interface ChainOutcome {
     nextStepIndex: number;

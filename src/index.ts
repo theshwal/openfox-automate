@@ -1024,6 +1024,44 @@ function createLaunchDriver(
   }
 }
 
+/**
+ * How the plugin reaches the OpenFox host — computed LOCALLY.
+ *
+ * NO NETWORK CALL. This is what the panel polls, and the panel refreshes
+ * every 10 seconds: the full health check queries the GitHub API (one
+ * `GET /user` plus one `GET /issues/1` per mapped repository), which
+ * would spend ~1,440 requests per hour on the operator's GitHub quota
+ * for the display alone.
+ *
+ * The full check stays available for the operator's explicit click.
+ */
+function hostStatus(context: PluginContext, hasFacade: boolean, hasLegacy: boolean): HealthReport['host'] {
+  // The HTTP path is the ONLY one a plugin can use on the current host:
+  // `PluginContext` exposes no `host` and no `openFoxInternals`. Reporting
+  // only the in-process surfaces made the health check say 'missing' even
+  // when the plugin could reach the host.
+  const hostSettings = (context.settings ? context.settings() : {}) as Record<string, unknown>
+  const hostBaseUrl = readHostBaseUrl(context) ?? ''
+  const hostTokenConfigured = Boolean(readHostToken(context))
+  // The base URL falls back to the host's own default port when the
+  // operator did not set one, so the report says explicitly whether the
+  // URL was CONFIGURED or merely defaulted.
+  const configuredBaseUrl = hostSettings['host.baseUrl']
+  const hostBaseUrlConfigured = typeof configuredBaseUrl === 'string' && configuredBaseUrl.trim().length > 0
+  return {
+    /** The base URL the plugin uses to reach the host. */
+    baseUrl: hostBaseUrl,
+    /** True when the base URL comes from the operator's settings. */
+    baseUrlConfigured: hostBaseUrlConfigured,
+    /** True when a session token is configured (network auth). */
+    tokenConfigured: hostTokenConfigured,
+    /** 'http' when the plugin can drive the host, 'missing' otherwise. */
+    transport: hostBaseUrl ? 'http' : 'missing',
+    /** The in-process surfaces, when the host provides them. */
+    inProcess: hasFacade ? 'facade' : hasLegacy ? 'legacy' : 'none',
+  }
+}
+
 async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthReport> {
   const settings = readSettingsFromContext(context)
   const token = settings['github.token'] ?? ''
@@ -1064,18 +1102,7 @@ async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthR
   const internal = await getHostInternal(context)
   const hasFacade = internal?.kind === 'facade'
   const hasLegacy = internal?.kind === 'legacy'
-  // The HTTP path is the ONLY one a plugin can use on the current host:
-  // `PluginContext` exposes no `host` and no `openFoxInternals`. Reporting
-  // only the in-process surfaces made the health check say 'missing' even
-  // when the plugin could reach the host.
-  const hostSettings = (context.settings ? context.settings() : {}) as Record<string, unknown>
-  const hostBaseUrl = readHostBaseUrl(context) ?? ''
-  const hostTokenConfigured = Boolean(readHostToken(context))
-  // The base URL falls back to the host's own default port when the
-  // operator did not set one, so the report says explicitly whether the
-  // URL was CONFIGURED or merely defaulted.
-  const configuredBaseUrl = hostSettings['host.baseUrl']
-  const hostBaseUrlConfigured = typeof configuredBaseUrl === 'string' && configuredBaseUrl.trim().length > 0
+  const host = hostStatus(context, hasFacade, hasLegacy)
   return {
     github: { tokenValid: tokenRes.valid, rateLimitRemaining: tokenRes.rateLimit.remaining, reposAccessible },
     openFoxInternals: {
@@ -1083,18 +1110,7 @@ async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthR
       launchWorkflowRun: hasLegacy ? 'ok' : hasFacade ? 'ok' : 'missing',
       host: hasFacade ? 'ok' : 'missing',
     },
-    host: {
-      /** The base URL the plugin uses to reach the host. */
-      baseUrl: hostBaseUrl,
-      /** True when the base URL comes from the operator's settings. */
-      baseUrlConfigured: hostBaseUrlConfigured,
-      /** True when a session token is configured (network auth). */
-      tokenConfigured: hostTokenConfigured,
-      /** 'http' when the plugin can drive the host, 'missing' otherwise. */
-      transport: hostBaseUrl ? 'http' : 'missing',
-      /** The in-process surfaces, when the host provides them. */
-      inProcess: hasFacade ? 'facade' : hasLegacy ? 'legacy' : 'none',
-    },
+    host,
     workflows,
     projects,
     mapping: { valid: mappingIssues.length === 0, issues: mappingIssues },
@@ -1181,6 +1197,18 @@ export function register(registry: PluginRegistry): void {
   registry.registerRpc(`${RPC_NAMESPACE}scanNow`, async () => scanAll(rt))
 
   registry.registerRpc(`${RPC_NAMESPACE}health`, async () => healthCheck(rt, context))
+
+  // The host status WITHOUT the network.
+  //
+  // The full health check queries the GitHub API (one `GET /user` plus
+  // one `GET /issues/1` per mapped repository). The panel refreshes every
+  // 10 seconds, so calling it there spent ~1,440 GitHub requests per
+  // hour on the operator's quota for the display alone. This RPC is
+  // purely local, and it is what the panel polls.
+  registry.registerRpc(`${RPC_NAMESPACE}hostStatus`, async () => {
+    const internal = await getHostInternal(context)
+    return hostStatus(context, internal?.kind === 'facade', internal?.kind === 'legacy')
+  })
 
   // Control-plane introspection: the durable registry and its metrics.
   registry.registerRpc(`${RPC_NAMESPACE}controlPlaneStatus`, async () => {
