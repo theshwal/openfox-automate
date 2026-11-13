@@ -184,8 +184,9 @@ describe('AC31 #21 — EVERY host task is closed, so the host slots are released
     // slots saturate and the next issue's task stays QUEUED forever — the
     // plugin believes it is running, but the workflow never starts.
     //
-    // The host is given ONE slot, so a dead task really does block the
-    // next one.
+    // The host is given ONE slot and the plugin ONE worker, so a dead
+    // task really does block the next issue: the scenario is exactly the
+    // one that broke.
     const sim = makeFaithfulSim({
       issues: [
         { number: 1, title: 'I1' },
@@ -193,6 +194,7 @@ describe('AC31 #21 — EVERY host task is closed, so the host slots are released
       ],
       chain: CHAIN,
       slotLimit: 1,
+      settings: { 'batch.maxConcurrency': 1, 'batch.maxConcurrencyPerRepo': 1 },
     })
     register(sim.registry)
     await settle()
@@ -201,8 +203,6 @@ describe('AC31 #21 — EVERY host task is closed, so the host slots are released
     await settle()
 
     // The plugin asks for the capacity it needs; the host honours it.
-    // The scenario below forces the host back to ONE slot so a dead task
-    // really blocks the next issue.
     const settingsCall = sim.hostCalls.find((c) => c.url.endsWith('/tasks/settings'))
     expect(settingsCall).toBeDefined()
 
@@ -211,13 +211,21 @@ describe('AC31 #21 — EVERY host task is closed, so the host slots are released
     await completeStep(sim, 1, 'build-verify-v3')
     await completeStep(sim, 1, 'publish-pr-v1')
 
-    // Every task of the FIRST issue is closed: none of them holds a host
-    // slot any more. That is the property the defect broke.
-    const firstIssueTasks = sim.tasks.filter((t) => t.prompt.includes('acme/widgets#1'))
+    // Every task the FIRST issue created is closed: none of them holds a
+    // host slot any more. That is the property the defect broke — with a
+    // dead task in_progress, the host's single slot would stay taken and
+    // the next issue would never start.
+    const firstIssueTasks = sim.tasksOfIssue('acme/widgets#1')
     expect(firstIssueTasks).toHaveLength(3)
     for (const task of firstIssueTasks) {
       expect(task.state).toBe('done')
     }
+    // The host's single slot is taken by the NEXT issue, not by a dead
+    // task of the first one.
+    expect(sim.activeTaskCount()).toBe(1)
+    expect(
+      sim.tasks.filter((t) => t.state === 'in_progress').every((t) => t.issueRef === 'acme/widgets#2'),
+    ).toBe(true)
 
     // The second issue starts AND its workflow actually RUNS on the host
     // (runState is 'running', not 'queued'): the slots were released.
@@ -225,7 +233,7 @@ describe('AC31 #21 — EVERY host task is closed, so the host slots are released
     await rpcOf(sim.calls.rpc, 'automate.controlPlaneSchedule')({}, sim.registry.context)
     await settle()
 
-    const second = sim.tasks.filter((t) => t.prompt.includes('acme/widgets#2'))
+    const second = sim.tasksOfIssue('acme/widgets#2')
     expect(second.length).toBeGreaterThan(0)
     for (const task of second) {
       expect(task.runState).toBe('running')

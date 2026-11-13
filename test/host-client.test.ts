@@ -30,13 +30,26 @@ describe('buildWorkflowLaunchMessage', () => {
     expect(buildWorkflowLaunchMessage('plan-issue-v3', { issue_ref: 'o/r#1' })).toBe('/plan-issue-v3 o/r#1')
   })
 
-  it('respects the declared parameter order', () => {
-    const message = buildWorkflowLaunchMessage('plan-issue-v3', { b: 'second', a: 'first' }, ['a', 'b'])
+  it('sends the values in the host declared order', () => {
+    // The values arrive already sorted in the workflow's DECLARED order
+    // (the mapping is done by `mapDeclaredParameters`), so the prompt
+    // carries them positionally.
+    const message = buildWorkflowLaunchMessage('plan-issue-v3', { issue_ref: 'first', repo: 'second' }, [
+      'first',
+      'second',
+    ])
     expect(message).toBe('/plan-issue-v3 first second')
   })
 
-  it('drops empty parameter values', () => {
-    expect(buildWorkflowLaunchMessage('wf', { a: '', b: 'kept' }, ['a', 'b'])).toBe('/wf kept')
+  it('carries NO free text: the host splits the prompt on every whitespace', () => {
+    // The host maps the tokens onto the declared parameters BY POSITION,
+    // so a newline (or any free text) would land in the NEXT parameter.
+    const message = buildWorkflowLaunchMessage('plan-issue-v3', { issue_ref: 'o/r#1', repo: 'o/r' }, [
+      'o/r#1',
+      'o/r',
+    ])
+    expect(message).toBe('/plan-issue-v3 o/r#1 o/r')
+    expect(message.split(/\s+/)).toHaveLength(3)
   })
 
   it('works without parameters', () => {

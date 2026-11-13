@@ -262,13 +262,12 @@ describe('AC14 — workflow parameter mapping', () => {
   it('maps the parameters onto the positional arguments the host expects', () => {
     // The host parses `/<id> <arg> <arg>` and maps the positional
     // arguments onto the workflow's declared parameters (sorted by
-    // position). The client therefore sends them in the declared order.
+    // position). The values therefore arrive ALREADY in the declared
+    // order — the mapping is done by `mapDeclaredParameters`, which
+    // refuses to guess when the declaration cannot be read.
     expect(
-      buildWorkflowLaunchMessage('plan-issue-v3', { issue_ref: 'o/r#7', issue_title: 'Boom' }, [
-        'issue_ref',
-        'issue_title',
-      ]),
-    ).toBe('/plan-issue-v3 o/r#7 Boom')
+      buildWorkflowLaunchMessage('plan-issue-v3', { issue_ref: 'o/r#7', repo: 'o/r' }, ['o/r#7', 'o/r']),
+    ).toBe('/plan-issue-v3 o/r#7 o/r')
   })
 
   it('produces the exact message the host resolves', () => {

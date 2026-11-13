@@ -161,24 +161,41 @@ export interface HostClientDeps {
  *   never starts a workflow.
  *
  *   So this prompt must be sent to the task board
- *   (`POST /api/projects/:projectId/tasks`), which is the only
+ *   (`/api/projects/:projectId/tasks`), which is the only
  *   HTTP-reachable path that makes the host resolve and launch a
  *   workflow.
+ *
+ * THE PROMPT CARRIES THE ARGUMENTS AND NOTHING ELSE.
+ *
+ * The host splits the prompt on EVERY whitespace (newlines included) and
+ * maps the resulting tokens onto the declared parameters BY POSITION
+ * (`parseSlashInvocation` + `workflowParamsFromArgs`, host
+ * chunk-Q54OOZ5U.js:309-330). Any free text appended here would
+ * therefore be SPLIT INTO TOKENS and would land in the NEXT positional
+ * parameter — the `repo` parameter of plan-issue-v3 received the first
+ * token of the issue context, which made the planner fail with
+ * "TARGET REJECTED".
+ *
+ * The host also DROPS the prompt when it launches a workflow: it passes
+ * `{ workflowId, params, scope, attachments }` to the runner
+ * (chunk-Q54OOZ5U.js:1240-1245). So the prompt is a transport for the
+ * POSITIONAL ARGUMENTS, not a channel for content.
+ *
+ * `orderedValues` are the values already sorted in the workflow's
+ * DECLARED order, so they line up with what the host will read.
  */
 export function buildWorkflowLaunchMessage(
   workflowId: string,
   params: Record<string, string> = {},
-  orderedParamIds?: string[],
-  content?: string,
+  orderedValues?: string[],
 ): string {
-  const ids = orderedParamIds && orderedParamIds.length > 0 ? orderedParamIds : Object.keys(params)
-  const values = ids.map((id) => params[id]).filter((v): v is string => typeof v === 'string' && v.length > 0)
-  const head = [`/${workflowId}`, ...values].join(' ')
-  // The host only ever sees `task.prompt`, so the issue CONTEXT is carried
-  // after the positional arguments: the arguments come first because the
-  // host maps them onto the declared parameters by position.
-  if (!content || content.trim().length === 0) return head
-  return `${head}\n\n${content}`
+  const values =
+    orderedValues && orderedValues.length > 0
+      ? orderedValues
+      : Object.keys(params)
+          .map((id) => params[id])
+          .filter((v): v is string => typeof v === 'string' && v.length > 0)
+  return [`/${workflowId}`, ...values].join(' ')
 }
 
 function failure(reason: HostClientFailureReason, message: string, status?: number): HostClientFailure {
@@ -382,17 +399,17 @@ export class HostClient {
     projectId: string,
     workflowId: string,
     params: Record<string, string> = {},
-    orderedParamIds?: string[],
+    orderedValues?: string[],
     sessionId?: string,
-    content?: string,
   ): Promise<HostClientResult<HostLaunch>> {
     if (!workflowId) return failure('bad-request', 'workflowId is required')
     if (!projectId) return failure('bad-request', 'projectId is required')
 
-    // The issue CONTEXT must not be lost: the host only ever sees
-    // `task.prompt`, so it is appended after the launch arguments. The
-    // arguments stay first, because the host maps them positionally.
-    const prompt = buildWorkflowLaunchMessage(workflowId, params, orderedParamIds, content)
+    // The prompt carries the POSITIONAL ARGUMENTS and nothing else: the
+    // host splits it on every whitespace and maps the tokens onto the
+    // declared parameters by position, and it DROPS the prompt when it
+    // launches the workflow.
+    const prompt = buildWorkflowLaunchMessage(workflowId, params, orderedValues)
 
     const created = await this.request<{ task?: HostTask }>(
       'POST',

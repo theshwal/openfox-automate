@@ -10,6 +10,7 @@
 import type { PluginContext } from 'openfox/plugin'
 import { getHostInternal } from './resolve-openfox.js'
 import { HostClient, defaultHostBaseUrl } from './host-client.js'
+import { mapDeclaredParameters } from './parameter-mapping.js'
 
 export interface SessionLike {
   id: string
@@ -222,26 +223,34 @@ export function createHostOrchestration(
       }
       // The host maps the positional arguments onto the workflow's
       // DECLARED parameters, by position, and refuses the launch when a
-      // required one is missing — the prompt is then queued as a plain chat
-      // message and the workflow never starts. The declared order is
-      // therefore read from the host before the prompt is built.
+      // required one is missing — the prompt is then queued as a plain
+      // chat message and the workflow never starts.
+      //
+      // The declared order is therefore READ FROM THE HOST, and the
+      // values are mapped onto it. When the declaration cannot be read,
+      // the launch is REFUSED: guessing the order from `Object.keys()`
+      // is what put an issue URL in the `repo` parameter.
       const declared = await client.getWorkflowParameters(params.workflowId)
-      const orderedParamIds = declared.ok ? declared.value.map((p) => p.id) : undefined
-      if (!declared.ok) {
-        context.logger.warn(`cannot map the parameters of "${params.workflowId}": ${declared.message}`)
+      const mapping = mapDeclaredParameters(declared.ok ? declared.value : null, params.params ?? {})
+      if (!mapping.ok) {
+        context.logger.warn(
+          `cannot launch "${params.workflowId}": ${mapping.message}`,
+          mapping.reason === 'missing-required' ? { missing: mapping.missing } : {},
+        )
+        return { launched: false }
       }
       const result = await client.launchWorkflow(
         params.projectId,
         params.workflowId,
-        params.params ?? {},
-        orderedParamIds,
+        mapping.params,
+        // The values are ALREADY in the host's declared order: they are
+        // sent as the positional arguments, and the host maps them onto
+        // the same sorted list.
+        mapping.values,
         // The EXISTING session: the host reuses it when it is still
         // pristine. When it is not, the host seeds a new one and reports
         // it — the caller follows the reported id.
         params.sessionId,
-        // The issue context: the host only sees `task.prompt`, so it would
-        // otherwise be LOST.
-        params.content,
       )
       if (!result.ok) {
         context.logger.warn(`launchWorkflow failed (${result.reason}): ${result.message}`, {

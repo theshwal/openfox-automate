@@ -43,6 +43,18 @@ export interface HostTask {
   state: 'todo' | 'in_progress' | 'done'
   runState: 'queued' | 'running' | 'idle'
   sessionId?: string
+  /** The workflow the prompt asks for. */
+  workflowId: string
+  /**
+   * The issue the task belongs to, read from the `issue_ref` argument of
+   * the prompt when there is one.
+   *
+   * Only the FIRST step of a chain carries the reference: the later steps
+   * declare no parameter the plugin can fill (the host resolves
+   * `{{workdir}}` from the session), so their prompt is just
+   * `/build-verify-v3`.
+   */
+  issueRef?: string
 }
 
 export interface FaithfulSim {
@@ -56,6 +68,15 @@ export interface FaithfulSim {
   tasks: HostTask[]
   /** The tasks that are still in_progress — they hold the host's slots. */
   activeTaskCount(): number
+  /**
+   * The tasks that belong to one issue.
+   *
+   * The tasks of a chain are identified by their SESSION: only the first
+   * step carries the `issue_ref` argument, the later ones declare no
+   * parameter the plugin can fill (the host resolves `{{workdir}}` from
+   * the session itself).
+   */
+  tasksOfIssue(issueRef: string): HostTask[]
   /** The sessions the host created, in order. */
   sessions: string[]
   /** The prompt of every task, in order. */
@@ -230,7 +251,13 @@ export function makeFaithfulSim(options: FaithfulHostOptions = {}): FaithfulSim 
         prompt,
         state: 'todo',
         runState: 'idle',
+        workflowId: prompt.replace(/^\//, '').split(/\s+/)[0] ?? '',
       }
+      // The `issue_ref` argument, when the prompt carries one. It is the
+      // FIRST argument of `plan-issue-v3`, whose reference is
+      // `<owner>/<repo>#<number>`.
+      const reference = /^\/[^\s]+\s+(\S*#\d+)/.exec(prompt)
+      if (reference?.[1]) task.issueRef = reference[1]
       tasks.push(task)
       return new Response(JSON.stringify({ task }), { status: 201 })
     }
@@ -295,12 +322,38 @@ export function makeFaithfulSim(options: FaithfulHostOptions = {}): FaithfulSim 
   })
   vi.stubGlobal('fetch', fetchStub as unknown as typeof fetch)
 
+  /**
+   * The tasks that belong to one issue.
+   *
+   * Only the FIRST step of a chain carries the issue reference (the later
+   * steps declare no parameter the plugin can fill — the host resolves
+   * `{{workdir}}` from the session). The chain of an issue is therefore:
+   * the task that names the issue, plus the tasks without a reference that
+   * come IMMEDIATELY after it (the plugin creates the next step right
+   * after the previous one completes).
+   *
+   * With several issues running at once the tasks interleave: the task of
+   * another issue ends the chain of the one before it.
+   */
+  const tasksOfIssue = (issueRef: string): HostTask[] => {
+    const start = tasks.findIndex((t) => t.issueRef === issueRef)
+    if (start < 0) return []
+    const owned: HostTask[] = [tasks[start]!]
+    for (let i = start + 1; i < tasks.length; i += 1) {
+      const task = tasks[i]!
+      if (task.issueRef) break
+      owned.push(task)
+    }
+    return owned
+  }
+
   return {
     registry,
     calls,
     backing,
     tasks,
     activeTaskCount,
+    tasksOfIssue,
     sessions,
     prompts,
     hostCalls,

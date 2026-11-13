@@ -47,15 +47,21 @@ describe('AC31 #20 — the parameters and the content reach the workflow', () =>
     expect(taskCall).toBeDefined()
     const prompt = (taskCall?.body as { prompt: string }).prompt
 
-    // The arguments come FIRST, in the declared order (issue_ref, then
+    // The arguments come FIRST, in the DECLARED order (issue_ref, then
     // repo) — the host maps them by position.
     expect(prompt.startsWith('/plan-issue-v3 ')).toBe(true)
     expect(prompt).toContain('acme/widgets#7')
+    // And the repo, so the planner can read the issue with an
+    // authenticated `gh issue view -R <repo>`.
+    expect(prompt).toContain('acme/widgets')
 
-    // And the issue CONTEXT is not lost: the host only ever sees the
-    // prompt, so the body must travel with it.
-    expect(prompt).toContain('It crashes on startup.')
-    expect(prompt).toContain('Widget explodes')
+    // The issue CONTEXT does NOT travel in the prompt: the host splits it
+    // on every whitespace (the free text would land in the NEXT
+    // positional parameter) and it drops the prompt when it launches the
+    // workflow anyway. The planner re-reads the issue itself.
+    expect(prompt).not.toContain('It crashes on startup.')
+    expect(prompt).not.toContain('Widget explodes')
+    expect(prompt.split(/\s+/)).toHaveLength(3)
   })
 
   it('reads the declared parameter order from the host before building the prompt', async () => {
