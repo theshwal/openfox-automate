@@ -742,7 +742,13 @@ async function launchAndBind(
     params: Record<string, string>
     projectId?: string | undefined
   },
-): Promise<{ sessionId: string; taskId: string | undefined; launched: boolean }> {
+): Promise<{
+  sessionId: string
+  taskId: string | undefined
+  launched: boolean
+  failure: 'refused' | 'queued' | undefined
+  reason: string | undefined
+}> {
   const outcome = await rt.orchestration.launchWorkflow({
     sessionId: launch.sessionId,
     workflowId: launch.workflowId,
@@ -752,11 +758,23 @@ async function launchAndBind(
   })
   const sessionId = outcome.sessionId ?? launch.sessionId
   if (!outcome.launched) {
+    // The two reasons are DIFFERENT and the operator must be able to tell
+    // them: a refusal means the plugin could not build a valid launch (the
+    // host was never asked), a queueing means the host accepted the task
+    // and is waiting for a slot.
     rt.context.logger.warn(
-      `the host queued the launch of "${launch.workflowId}": its task slot limit was reached`,
+      outcome.failure === 'refused'
+        ? `the launch of "${launch.workflowId}" was REFUSED: ${outcome.reason ?? 'unknown reason'}`
+        : `the host queued the launch of "${launch.workflowId}": its task slot limit was reached`,
     )
   }
-  return { sessionId, taskId: outcome.taskId, launched: outcome.launched }
+  return {
+    sessionId,
+    taskId: outcome.taskId,
+    launched: outcome.launched,
+    failure: outcome.failure,
+    reason: outcome.reason,
+  }
 }
 
 /**
@@ -864,6 +882,56 @@ async function pickAndSpawnNext(rt: Runtime): Promise<QueueEntry | null> {
   return null
 }
 
+/**
+ * Record a launch that did NOT start.
+ *
+ * The workflow never ran: the host refused the launch, or it could not
+ * be reached. The issue must NOT stay 'running' — it would show a
+ * running issue in the panel with no workflow behind it, and no error
+ * either. It is BLOCKED in BOTH views, with the reason, so the operator
+ * sees it and can re-process it once the cause is fixed.
+ */
+async function failLaunch(rt: Runtime, entry: QueueEntry, message: string): Promise<void> {
+  const key = `${entry.repoKey}#${entry.issueNumber}`
+  await rt.controlPlane.mutate((state) => {
+    if (!state.items[key]) {
+      admit(state, [
+        {
+          repoKey: entry.repoKey,
+          projectId: entry.projectId,
+          issueNumber: entry.issueNumber,
+          title: entry.title,
+          url: entry.url,
+          labels: entry.labels,
+          dependsOn: entry.dependsOn,
+        },
+      ])
+    }
+    completeItem(state, key, 'blocked', { error: message })
+  })
+  const item = await rt.controlPlane.read((state) => state.items[key])
+  const patched = syncQueueStatus(entry, item)
+  try {
+    await rt.store.transitionTo(entry.id, patched.status, {
+      executionStack: entry.executionStack ?? [],
+      error: message,
+      finishedAt: new Date().toISOString(),
+    })
+  } catch (err) {
+    // The store refused the transition: the entry is written directly so
+    // the two views still agree.
+    rt.context.logger.warn(
+      `could not block the entry after a failed launch: ${err instanceof Error ? err.message : String(err)}`,
+    )
+    await rt.store.update({ ...entry, ...patched, error: message })
+  }
+  rt.context.notify({
+    title: { en: 'Workflow could not start', fr: 'Le workflow n’a pas pu démarrer' },
+    body: { en: message, fr: message },
+    level: 'error',
+  })
+}
+
 async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
   const settings = readSettingsFromContext(rt.context)
   const chain = resolveChain(entry, settings)
@@ -934,9 +1002,25 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
           )
         })
       }
-      updated.executionStack = startChain(updated, createLaunchDriver(rt, onSessionBound, onTaskBound), {
-        sessionId: updated.sessionId ?? '',
-      })
+      // A launch that does NOT start must be visible: the issue would
+      // otherwise stay 'running' with nothing running, and the operator
+      // would see a running issue in the panel with no workflow and no
+      // error. The issue is BLOCKED in BOTH views, with the reason.
+      const onLaunchFailed = (workflowId: string, reason: string): void => {
+        const message = `could not start workflow ${workflowId}: ${reason}`
+        void failLaunch(rt, updated, message).catch((err: unknown) => {
+          rt.context.logger.error(
+            `could not record the launch failure: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        })
+      }
+      updated.executionStack = startChain(
+        updated,
+        createLaunchDriver(rt, onSessionBound, onTaskBound, onLaunchFailed),
+        {
+          sessionId: updated.sessionId ?? '',
+        },
+      )
     }
     await rt.store.update(updated)
   } catch (e) {
@@ -983,6 +1067,7 @@ function createLaunchDriver(
   rt: Runtime,
   onSessionBound: (sessionId: string, workflowId: string) => void,
   onTaskBound: (taskId: string, workflowId: string) => void,
+  onLaunchFailed: (workflowId: string, reason: string) => void,
 ): {
   launch(params: {
     sessionId: string
@@ -1001,6 +1086,12 @@ function createLaunchDriver(
       void (async () => {
         try {
           const bound = await launchAndBind(rt, p)
+          if (!bound.launched) {
+            // The workflow did NOT start. The issue must not stay
+            // 'running' with nothing running: the operator has to see it.
+            onLaunchFailed(p.workflowId, bound.reason ?? 'the host did not start the workflow')
+            return
+          }
           if (bound.sessionId !== p.sessionId) {
             // The host seeded a NEW session (it can only reuse a session
             // that has no messages yet): the entry must follow it.
@@ -1013,9 +1104,9 @@ function createLaunchDriver(
             onTaskBound(bound.taskId, p.workflowId)
           }
         } catch (err) {
-          rt.context.logger.error(
-            `launchWorkflow failed: ${err instanceof Error ? err.message : String(err)}`,
-          )
+          const message = err instanceof Error ? err.message : String(err)
+          rt.context.logger.error(`launchWorkflow failed: ${message}`)
+          onLaunchFailed(p.workflowId, message)
         }
       })()
     },
@@ -1624,16 +1715,34 @@ export function register(registry: PluginRegistry): void {
           await closeHostTask(rt, entry, 'done')
           entry.hostTaskId = undefined
         }
-        let bound: { sessionId: string; taskId: string | undefined; launched: boolean }
+        let bound: {
+          sessionId: string
+          taskId: string | undefined
+          launched: boolean
+          failure: 'refused' | 'queued' | undefined
+          reason: string | undefined
+        }
         try {
           bound = await launchAndBind(rt, launch)
         } catch (err) {
-          context.logger.error(
-            `could not launch the next step "${launch.workflowId}": ${
-              err instanceof Error ? err.message : String(err)
+          const message = err instanceof Error ? err.message : String(err)
+          context.logger.error(`could not launch the next step "${launch.workflowId}": ${message}`)
+          // The step did NOT start: the issue must not stay 'running' with
+          // nothing running. It is blocked, in BOTH views, with the reason.
+          await failLaunch(rt, entry, `could not start workflow ${launch.workflowId}: ${message}`)
+          return
+        }
+        if (!bound.launched) {
+          // Same contract as the first step: a launch that does not start
+          // is VISIBLE, it is not a silent 'running'.
+          await failLaunch(
+            rt,
+            entry,
+            `could not start workflow ${launch.workflowId}: ${
+              bound.reason ?? 'the host did not start the workflow'
             }`,
           )
-          continue
+          return
         }
         if (bound.sessionId !== entry.sessionId) {
           // The host seeded a NEW session: the entry follows it.

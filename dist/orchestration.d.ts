@@ -65,8 +65,23 @@ export interface OpenFoxOrchestration {
 export interface LaunchOutcome {
     /** The session the host bound to the run, when it reports one. */
     sessionId?: string | undefined;
-    /** False when the host queued the run (its slot limit was reached). */
+    /**
+     * Whether the workflow actually STARTED.
+     *
+     * It is false for two DIFFERENT reasons, and the caller must tell them
+     * apart:
+     *
+     *   - 'refused': the plugin could not build a valid launch (the
+     *     workflow's declared parameters could not be read, or a required
+     *     one is missing). The host was never asked to run anything.
+     *   - 'queued': the host accepted the task but its slot limit was
+     *     reached, so the run waits for a slot.
+     */
     launched: boolean;
+    /** Why the launch did not start, when it did not. */
+    failure?: 'refused' | 'queued' | undefined;
+    /** The reason, in operator-readable words. */
+    reason?: string | undefined;
     /**
      * The id of the host TASK the launch created. The host only frees its
      * worker slot when the task leaves "in_progress", so it must be closed

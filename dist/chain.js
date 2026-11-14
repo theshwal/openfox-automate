@@ -59,6 +59,15 @@ export function buildIssueContext(entry) {
  * therefore NOT transported: the workflow re-reads them from GitHub, and
  * the host has no channel to carry free text anyway (the prompt is split
  * on whitespace, so any free text would CORRUPT the positional mapping).
+ *
+ * `workdir` is deliberately NOT offered. It is a parameter of
+ * build-verify-v3 and publish-pr-v1, but the host resolves the
+ * `{{workdir}}` template variable from the SESSION, and the session
+ * inherits the HOST PROJECT's working directory — not the target
+ * repository's. Sending a value would be misleading rather than
+ * effective, and the plugin does not know the repository's path. The
+ * parameter is optional and last, so omitting it leaves the positional
+ * mapping intact.
  */
 export function buildIssueParams(entry) {
     return {
@@ -72,18 +81,6 @@ export function buildIssueParams(entry) {
         // repository from the session's working directory.
         repo: entry.repoKey,
     };
-}
-/**
- * The working directory to offer to a workflow, when it is known.
- *
- * `workdir` is a parameter of build-verify-v3 and publish-pr-v1. The host
- * resolves the `{{workdir}}` template variable from the SESSION, not from
- * the parameters, so a wrong value would be misleading rather than
- * effective: the value is therefore only offered when the plugin knows
- * the real working directory of the session.
- */
-export function buildWorkdirParams(workdir) {
-    return workdir ? { workdir } : {};
 }
 export function initExecutionStack(chain) {
     return chain.map((id) => ({

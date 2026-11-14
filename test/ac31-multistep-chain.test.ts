@@ -179,6 +179,52 @@ describe('AC31 #21 — EVERY host task is closed, so the host slots are released
     }
   })
 
+  it('a BLOCKED step is retried once, on a fresh session and a fresh task', async () => {
+    // The retry-once path is a LAUNCH like any other: the host seeds a
+    // new session (the previous one has messages now), the plugin must
+    // follow it, and the task of the failed attempt must be closed so it
+    // does not hold a host slot forever.
+    const sim = makeFaithfulSim({ issues: [{ number: 7, title: 'I7' }], chain: CHAIN })
+    register(sim.registry)
+    await settle()
+    await rpcOf(sim.calls.rpc, 'automate.scanNow')({}, sim.registry.context)
+    await rpcOf(sim.calls.rpc, 'automate.controlPlaneSchedule')({}, sim.registry.context)
+    await settle()
+
+    const queue = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
+    const firstSession = queue[0]?.sessionId
+    expect(firstSession).toBeTruthy()
+
+    // The step is blocked: the chain retries it once.
+    await sim.calls.hook
+      .find((h) => h.h === 'workflow.execution.changed')!
+      .fn({
+        event: 'workflow.execution.changed',
+        timestamp: new Date().toISOString(),
+        sessionId: firstSession,
+        data: {
+          executionId: 'exec-blocked',
+          workflowId: 'plan-issue-v3',
+          workflowName: 'plan-issue-v3',
+          status: 'blocked',
+        },
+      })
+    await settle()
+
+    // The step is running again, with its retry counted.
+    const afterBlock = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
+    expect(afterBlock[0]?.executionStack?.[0]?.status).toBe('running')
+    expect(afterBlock[0]?.executionStack?.[0]?.retryCount).toBe(1)
+
+    // A NEW task was created for the retry…
+    expect(sim.tasks).toHaveLength(2)
+    // …the task of the failed attempt is closed (no dead slot)…
+    expect(sim.tasks[0]?.state).toBe('done')
+    expect(sim.tasks[1]?.state).toBe('in_progress')
+    // …and the entry follows the session the host reported for the retry.
+    expect(afterBlock[0]?.sessionId).not.toBe(firstSession)
+  })
+
   it('the host slots are released, so the NEXT issue still starts', async () => {
     // THE DEFECT: with the intermediate tasks left in_progress, the host's
     // slots saturate and the next issue's task stays QUEUED forever — the

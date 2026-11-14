@@ -116,13 +116,21 @@ export function createHostOrchestration(context, httpClientFactory = defaultHttp
             const client = httpClientFactory();
             if (!client) {
                 context.logger.warn('OpenFox host orchestration is not available; cannot launch workflow', params);
-                return { launched: false };
+                return {
+                    launched: false,
+                    failure: 'refused',
+                    reason: 'the host is not reachable: no base URL is configured',
+                };
             }
             if (!params.projectId) {
                 context.logger.warn('cannot launch workflow: the host project is unknown', {
                     workflowId: params.workflowId,
                 });
-                return { launched: false };
+                return {
+                    launched: false,
+                    failure: 'refused',
+                    reason: 'the host project is unknown',
+                };
             }
             // The host maps the positional arguments onto the workflow's
             // DECLARED parameters, by position, and refuses the launch when a
@@ -137,7 +145,7 @@ export function createHostOrchestration(context, httpClientFactory = defaultHttp
             const mapping = mapDeclaredParameters(declared.ok ? declared.value : null, params.params ?? {});
             if (!mapping.ok) {
                 context.logger.warn(`cannot launch "${params.workflowId}": ${mapping.message}`, mapping.reason === 'missing-required' ? { missing: mapping.missing } : {});
-                return { launched: false };
+                return { launched: false, failure: 'refused', reason: mapping.message };
             }
             const result = await client.launchWorkflow(params.projectId, params.workflowId, mapping.params, 
             // The values are ALREADY in the host's declared order: they are
@@ -152,11 +160,15 @@ export function createHostOrchestration(context, httpClientFactory = defaultHttp
                 context.logger.warn(`launchWorkflow failed (${result.reason}): ${result.message}`, {
                     workflowId: params.workflowId,
                 });
-                return { launched: false };
+                return { launched: false, failure: 'refused', reason: result.message };
             }
             return {
                 sessionId: result.value.sessionId,
                 launched: result.value.launched,
+                // The host queued the task: its slot limit was reached.
+                ...(result.value.launched
+                    ? {}
+                    : { failure: 'queued', reason: 'the host slot limit was reached' }),
                 taskId: result.value.task.id,
             };
         },

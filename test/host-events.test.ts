@@ -212,6 +212,7 @@ async function setup(overrides: Partial<QueueEntry> = {}): Promise<{
 }> {
   const { registry, calls, backing } = makeFakeRegistry()
   registry.context.settings = vi.fn(() => SETTINGS) as unknown as PluginContext['settings']
+  stubHostWorkflows()
   seedRunningEntry(backing, overrides)
   register(registry)
   await new Promise((resolve) => setTimeout(resolve, 0))
@@ -230,7 +231,52 @@ function historyOf(backing: Map<string, unknown>): QueueEntry[] {
 
 afterEach(() => {
   _resetLifecycleForTesting()
+  vi.unstubAllGlobals()
 })
+
+/**
+ * The fake host.
+ *
+ * The plugin reads the workflows' DECLARED parameters before it launches
+ * anything, and it REFUSES the launch when that read fails (the host
+ * would otherwise map the arguments by position onto the WRONG
+ * parameters). The stub therefore serves the real declarations.
+ */
+function stubHostWorkflows(): void {
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/api/workflows')) {
+      return new Response(
+        JSON.stringify({
+          defaults: [],
+          userItems: [
+            {
+              id: 'plan-issue-v3',
+              parameters: [
+                { id: 'issue_ref', position: 0, required: true },
+                { id: 'repo', position: 1, required: false },
+              ],
+            },
+            { id: 'build-verify-v3', parameters: [{ id: 'workdir', position: 0, required: false }] },
+            { id: 'publish-pr-v1', parameters: [{ id: 'workdir', position: 0, required: false }] },
+          ],
+          projectItems: [],
+        }),
+        { status: 200 },
+      )
+    }
+    if (url.endsWith('/tasks')) {
+      return new Response(JSON.stringify({ task: { id: 'task-1' } }), { status: 201 })
+    }
+    if (url.includes('/move')) {
+      return new Response(JSON.stringify({ task: { id: 'task-1' }, sessionId: 'sess-host-1' }), {
+        status: 200,
+      })
+    }
+    return new Response(JSON.stringify({ success: true }), { status: 200 })
+  })
+  vi.stubGlobal('fetch', fetchImpl as unknown as typeof fetch)
+}
 
 describe('AC2 — workflow.execution.changed host payload contract', () => {
   it('reads the workflow fields from data.* (host shape) — status "completed" advances the chain', async () => {

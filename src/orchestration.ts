@@ -72,8 +72,23 @@ export interface OpenFoxOrchestration {
 export interface LaunchOutcome {
   /** The session the host bound to the run, when it reports one. */
   sessionId?: string | undefined
-  /** False when the host queued the run (its slot limit was reached). */
+  /**
+   * Whether the workflow actually STARTED.
+   *
+   * It is false for two DIFFERENT reasons, and the caller must tell them
+   * apart:
+   *
+   *   - 'refused': the plugin could not build a valid launch (the
+   *     workflow's declared parameters could not be read, or a required
+   *     one is missing). The host was never asked to run anything.
+   *   - 'queued': the host accepted the task but its slot limit was
+   *     reached, so the run waits for a slot.
+   */
   launched: boolean
+  /** Why the launch did not start, when it did not. */
+  failure?: 'refused' | 'queued' | undefined
+  /** The reason, in operator-readable words. */
+  reason?: string | undefined
   /**
    * The id of the host TASK the launch created. The host only frees its
    * worker slot when the task leaves "in_progress", so it must be closed
@@ -213,13 +228,21 @@ export function createHostOrchestration(
           'OpenFox host orchestration is not available; cannot launch workflow',
           params as unknown as Record<string, unknown>,
         )
-        return { launched: false }
+        return {
+          launched: false,
+          failure: 'refused',
+          reason: 'the host is not reachable: no base URL is configured',
+        }
       }
       if (!params.projectId) {
         context.logger.warn('cannot launch workflow: the host project is unknown', {
           workflowId: params.workflowId,
         })
-        return { launched: false }
+        return {
+          launched: false,
+          failure: 'refused',
+          reason: 'the host project is unknown',
+        }
       }
       // The host maps the positional arguments onto the workflow's
       // DECLARED parameters, by position, and refuses the launch when a
@@ -237,7 +260,7 @@ export function createHostOrchestration(
           `cannot launch "${params.workflowId}": ${mapping.message}`,
           mapping.reason === 'missing-required' ? { missing: mapping.missing } : {},
         )
-        return { launched: false }
+        return { launched: false, failure: 'refused', reason: mapping.message }
       }
       const result = await client.launchWorkflow(
         params.projectId,
@@ -256,11 +279,15 @@ export function createHostOrchestration(
         context.logger.warn(`launchWorkflow failed (${result.reason}): ${result.message}`, {
           workflowId: params.workflowId,
         })
-        return { launched: false }
+        return { launched: false, failure: 'refused', reason: result.message }
       }
       return {
         sessionId: result.value.sessionId,
         launched: result.value.launched,
+        // The host queued the task: its slot limit was reached.
+        ...(result.value.launched
+          ? {}
+          : { failure: 'queued' as const, reason: 'the host slot limit was reached' }),
         taskId: result.value.task.id,
       }
     },
