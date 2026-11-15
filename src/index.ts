@@ -13,14 +13,35 @@ import {
   parseChain,
   parseRepoOverrides,
   parseIgnoreLabels,
+  clampSettings,
 } from './settings.js'
 import { QueueStore, isTerminated, newEntryId } from './queue.js'
 import { orderQueue, findMissingDependencies } from './ordering.js'
 import { fetchAllOpenIssues, getIssue, listIssueComments, validateToken, isPullRequest } from './github.js'
 import { spawnSessionFor } from './spawner.js'
 import { startChain, buildIssueContext, buildIssueParams, processWorkflowEvent } from './chain.js'
-import { createOrchestration, type OpenFoxOrchestration } from './orchestration.js'
+import {
+  createOrchestration,
+  defaultHttpClientFactory,
+  readHostBaseUrl,
+  readHostToken,
+  type OpenFoxOrchestration,
+} from './orchestration.js'
+import { HostClient } from './host-client.js'
 import { getHostInternal } from './resolve-openfox.js'
+import { extractToolOutputText, normalizeWorkflowExecutionPayload, readSessionId } from './host-events.js'
+import { ControlPlaneStore, controlPlaneOptionsFromSettings } from './control-plane-store.js'
+import { findDivergence, syncQueueStatus } from './state-ownership.js'
+import {
+  admit,
+  completeItem,
+  computeControlPlaneMetrics,
+  dependencyState,
+  markRunning,
+  recordTokenUsage,
+  reserve,
+  type ControlPlaneOptions,
+} from './control-plane.js'
 import { postProcess, fetchAuthenticatedLogin } from './postprocess.js'
 import { computeMetrics } from './metrics.js'
 import type { HealthReport, PluginSettings, QueueEntry } from './types.js'
@@ -39,6 +60,15 @@ interface Runtime {
   executions: Map<string, { entryId: string; sessionId: string; chain: string[]; currentStep: number }>
   orchestration: OpenFoxOrchestration
   appliedExecutionEvents: Set<string>
+  /** Durable control-plane registry (admission, reservation, budgets). */
+  controlPlane: ControlPlaneStore
+  /**
+   * The supported host HTTP client, when the host is configured.
+   *
+   * It is needed to close the HOST TASK at the end of a chain: the host
+   * only frees its worker slot when the task leaves "in_progress".
+   */
+  hostClient?: (() => HostClient | null) | undefined
 }
 
 let currentRt: Runtime | null = null
@@ -72,7 +102,11 @@ export function _hasActiveRuntimeForTesting(): boolean {
 function readSettingsFromContext(context: PluginContext): PluginSettings {
   const raw = (context.settings ? context.settings() : {}) as Record<string, unknown>
   const merged: Record<string, unknown> = { ...DEFAULT_SETTINGS, ...raw }
-  return merged as PluginSettings
+  // The clamps are applied on the REAL path: the host validates the
+  // settings form, but a value set through another route (or a future
+  // host version) must not be able to push the worker count past its
+  // ceiling.
+  return clampSettings(merged as PluginSettings)
 }
 
 function hasAnyPostToggle(settings: PluginSettings): boolean {
@@ -207,8 +241,64 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
     return { added: 0, skipped: 0, errors }
   }
 
-  const { added, skipped } = await rt.store.addNew(candidates)
-  const ordered = await orderAndStore(rt)
+  // An issue the control plane already FINISHED must never be re-added,
+  // whatever the history retention is: the history is PRUNED on every scan
+  // (pruneHistory), so the queue's dedup cannot be the authority here — the
+  // durable control-plane registry can.
+  const finished = await rt.controlPlane.read(
+    (state) =>
+      new Set(
+        Object.values(state.items)
+          // 'failed' counts too: a failed issue lives in the history,
+          // which is pruned on every scan, so the durable registry is the
+          // only place that still knows it.
+          .filter((i) => i.status === 'done' || i.status === 'cancelled' || i.status === 'failed')
+          .map((i) => `${i.repoKey}#${i.issueNumber}`),
+      ),
+  )
+  const reRunnable = candidates.filter((c) => !finished.has(`${c.repoKey}#${c.issueNumber}`))
+  const { added, skipped } = await rt.store.addNew(reRunnable)
+  const { ordered, cycleEntries } = await orderAndStore(rt)
+  // Admit the same candidates into the durable control-plane registry, so
+  // the scheduler owns an exclusive, crash-safe view of what may run.
+  await rt.controlPlane.mutate((state) => {
+    // The dependencies come from the ORDERED entries: `orderQueue` derives
+    // them from the issue text (the `#N` references), and the raw scan
+    // candidates carry an empty list. Admitting them with an empty list
+    // made the control plane disagree with the legacy view, which blocks
+    // the entries whose dependency is missing.
+    const orderedByKey = new Map(ordered.map((e) => [`${e.repoKey}#${e.issueNumber}`, e]))
+    // The DERIVED status is mirrored too: `orderAndStore` blocked the
+    // entries whose dependency is missing, and admitting them as 'queued'
+    // made the two views disagree (and the scheduler started an issue
+    // whose prerequisite was absent).
+    const blockedIds = new Set([
+      ...ordered.filter((e) => e.status === 'blocked').map((e) => `${e.repoKey}#${e.issueNumber}`),
+      // The cycle entries are not in `ordered` (the topological sort
+      // cannot place them), so they are blocked explicitly: admitting them
+      // as 'queued' would let the scheduler start an issue whose
+      // dependency is a cycle.
+      ...cycleEntries.map((e) => `${e.repoKey}#${e.issueNumber}`),
+    ])
+    admit(
+      state,
+      candidates.map((c) => {
+        const key = `${c.repoKey}#${c.issueNumber}`
+        const derived = orderedByKey.get(key)
+        return {
+          repoKey: c.repoKey,
+          projectId: c.projectId,
+          issueNumber: c.issueNumber,
+          title: c.title,
+          url: c.url,
+          labels: c.labels,
+          dependsOn: derived?.dependsOn ?? c.dependsOn,
+          blocked: blockedIds.has(key),
+          blockedReason: derived?.error,
+        }
+      }),
+    )
+  })
   rt.lastScanAt = new Date().toISOString()
   publishQueue(rt, ordered)
   if (added.length > 0 && !dryRun) {
@@ -223,7 +313,13 @@ async function scanAll(rt: Runtime): Promise<{ added: number; skipped: number; e
   return { added: added.length, skipped, errors }
 }
 
-async function orderAndStore(rt: Runtime): Promise<QueueEntry[]> {
+interface OrderedResult {
+  ordered: QueueEntry[]
+  /** Entries the topological sort could not place (a dependency cycle). */
+  cycleEntries: QueueEntry[]
+}
+
+async function orderAndStore(rt: Runtime): Promise<OrderedResult> {
   const settings = readSettingsFromContext(rt.context)
   const active = await rt.store.loadActive()
   const { ordered, cycleEntries } = orderQueue(
@@ -231,14 +327,89 @@ async function orderAndStore(rt: Runtime): Promise<QueueEntry[]> {
     settings['ordering.strategy'] ?? 'default',
     settings['ordering.dependencyPattern'] ?? '(#(\\d+))',
   )
-  const blockedByMissing = findMissingDependencies(ordered).map((x) => x.entry)
+  // The dependency decision belongs to the CONTROL PLANE, which is the
+  // authority. The legacy view used to decide it on its own, from the
+  // ACTIVE queue only: a dependency that had left the active queue
+  // (completed, failed or cancelled — it now lives in the history) looked
+  // missing, so its dependent was blocked in the legacy queue while the
+  // control plane kept it 'queued'. The divergence never healed.
+  //
+  // The legacy view therefore only reports a dependency as missing when
+  // the durable registry also says so.
+  const dependencyView = await rt.controlPlane.read((state) => {
+    const known = new Set(
+      Object.values(state.items)
+        .filter((i) => i.status !== 'done' && i.status !== 'failed' && i.status !== 'cancelled')
+        .map((i) => i.issueNumber),
+    )
+    const satisfied = new Set(
+      Object.values(state.items)
+        .filter((i) => i.status === 'done' || i.status === 'failed' || i.status === 'cancelled')
+        .map((i) => i.issueNumber),
+    )
+    return { known, satisfied }
+  })
+  const blockedByMissing = findMissingDependencies(
+    ordered,
+    dependencyView.satisfied,
+    dependencyView.known,
+  ).map((x) => x.entry)
   const blockedIds = new Set([...cycleEntries.map((e) => e.id), ...blockedByMissing.map((e) => e.id)])
-  const final = ordered.map((e) =>
-    blockedIds.has(e.id) ? { ...e, status: 'blocked' as const, error: 'missing or circular dependency' } : e,
+  // A RUNNING or RESERVED issue is never blocked: its workflow is in
+  // flight and its session is live. The SAME rule applies to the legacy
+  // view and to the control plane, so the two cannot diverge on it.
+  const runningKeys = new Set(
+    await rt.controlPlane.read((state) =>
+      Object.values(state.items)
+        .filter((i) => i.status === 'running' || i.status === 'reserved')
+        .map((i) => `${i.repoKey}#${i.issueNumber}`),
+    ),
   )
+  // The CYCLE entries are NOT part of `ordered` (the topological sort
+  // cannot place them), so building the legacy view from `ordered` alone
+  // DROPPED them from the queue — while the control plane still held them,
+  // and the scheduler then failed with 'Queue entry not found'. They are
+  // kept here and blocked, in BOTH views.
+  const orderedIds = new Set(ordered.map((e) => e.id))
+  const keptCycles = cycleEntries.filter((e) => !orderedIds.has(e.id))
+  const final = [
+    ...ordered.map((e) =>
+      blockedIds.has(e.id) && !runningKeys.has(`${e.repoKey}#${e.issueNumber}`)
+        ? { ...e, status: 'blocked' as const, error: 'missing or circular dependency' }
+        : e,
+    ),
+    ...keptCycles.map((e) => ({
+      ...e,
+      status: 'blocked' as const,
+      error: 'missing or circular dependency',
+    })),
+  ]
+  // The dependency decision belongs to the CONTROL PLANE: the scan-time
+  // block must be recorded THERE first, and the legacy entry written from
+  // it. Blocking only the legacy entry left the control plane saying
+  // 'queued' while the legacy queue said 'blocked' — a permanent
+  // divergence, and a dependent that could be clobbered mid-run.
+  if (blockedIds.size > 0) {
+    await rt.controlPlane.mutate((state) => {
+      for (const entry of [...blockedByMissing, ...keptCycles]) {
+        const key = `${entry.repoKey}#${entry.issueNumber}`
+        const item = state.items[key]
+        if (!item) continue
+        // NEVER clobber a RUNNING issue: its workflow is in flight and its
+        // session is live. Blocking it here would abort a legitimate run and
+        // leave the session behind. The dependency that vanished will be
+        // reported when the run finishes.
+        if (item.status === 'running' || item.status === 'reserved') continue
+        item.status = 'blocked'
+        item.error = 'missing or circular dependency'
+        item.updatedAt = new Date().toISOString()
+        state.updatedAt = item.updatedAt
+      }
+    })
+  }
   await rt.store.replace(final)
   await rt.store.pruneHistory(settings['history.retentionCount'] ?? 100)
-  return final
+  return { ordered: final, cycleEntries: keptCycles }
 }
 
 function publishQueue(rt: Runtime, active: QueueEntry[]): void {
@@ -260,15 +431,422 @@ function nextScanAtIso(rt: Runtime): string | null {
   return new Date(Date.now() + minutes * 60_000).toISOString()
 }
 
+/**
+ * Reserve the worker slots and start the reserved work.
+ *
+ * The reservation is EXCLUSIVE and durable: it happens inside the
+ * control-plane store's serialized read-modify-write, so two concurrent
+ * callers cannot reserve the same issue. The chain engine is NOT touched:
+ * the control plane only decides WHAT runs, the engine advances the chain
+ * of a running session.
+ *
+ * FAIL CLOSED: an issue whose session cannot be created is marked failed
+ * in the registry, and the slot is released for the next candidate.
+ */
+/**
+ * Mirror the control plane's blocks onto the legacy queue.
+ *
+ * The control plane blocks an item for several reasons — an expired
+ * lease, a missing dependency, an exceeded token budget — and every one of
+ * them must be reflected in the legacy entry. The legacy entry is written
+ * FROM the authority, so the two views cannot drift.
+ */
+async function mirrorControlPlaneBlocks(rt: Runtime): Promise<void> {
+  const state = await rt.controlPlane.read((s) => s)
+  const active = await rt.store.loadActive()
+  for (const entry of active) {
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    const item = state.items[key]
+    if (!item) continue
+    if (item.status !== 'blocked') continue
+    if (entry.status === 'blocked') continue
+    const patched = syncQueueStatus(entry, item)
+    try {
+      await rt.store.transitionTo(entry.id, patched.status, {
+        ...(patched.error ? { error: patched.error } : {}),
+        finishedAt: new Date().toISOString(),
+      })
+    } catch {
+      // The store may refuse the transition (e.g. a terminal entry); the
+      // drift detector reports it.
+    }
+  }
+}
+
+/**
+ * Reserve ONE issue in the control plane.
+ *
+ * The reservation is exclusive and scoped to this issue: a bulk
+ * `reserve(state, options)` would reserve EVERY eligible issue, and the
+ * ones that were not started immediately would stay 'reserved' with no
+ * session — and since `reserve` only selects 'queued' items, they could
+ * never be scheduled again.
+ *
+ * Returns false when the issue is already held or the capacity is
+ * reached.
+ */
+async function reserveSingleIssue(
+  rt: Runtime,
+  entry: {
+    repoKey: string
+    projectId: string
+    issueNumber: number
+    title: string
+    url: string
+    labels: string[]
+    dependsOn: number[]
+  },
+  options: ControlPlaneOptions,
+): Promise<boolean> {
+  const key = `${entry.repoKey}#${entry.issueNumber}`
+  return await rt.controlPlane.mutate((state) => {
+    const existing = state.items[key]
+    // A RESERVED or RUNNING item is already held by the control plane.
+    if (existing?.status === 'reserved' || existing?.status === 'running') return false
+    // A FINISHED item (failed / cancelled / blocked / done) is NEVER
+    // revived by the manual path: the durable registry exists precisely
+    // so that a finished issue is not re-admitted automatically, and the
+    // legacy entry is only the mirror. `automate.startIssue` would
+    // otherwise start a NEW session for an issue that already failed,
+    // keeping its stale error while the item runs again.
+    // The explicit way to run it again is `automate.reprocess`, which
+    // resets the item on purpose.
+    if (
+      existing &&
+      (existing.status === 'failed' ||
+        existing.status === 'cancelled' ||
+        existing.status === 'blocked' ||
+        existing.status === 'done')
+    ) {
+      return false
+    }
+    // The issue may not be in the registry yet (it was added manually):
+    // admit it first so the reservation has something to attach to.
+    if (!existing) {
+      admit(state, [
+        {
+          repoKey: entry.repoKey,
+          projectId: entry.projectId,
+          issueNumber: entry.issueNumber,
+          title: entry.title,
+          url: entry.url,
+          labels: entry.labels,
+          dependsOn: entry.dependsOn,
+        },
+      ])
+    }
+    const item = state.items[key]
+    if (!item) return false
+    // The DEPENDENCY GATE: an issue may only run when every dependency is
+    // done. Without it the legacy path could start an issue whose
+    // prerequisite was missing (the control plane's own `reserve` applies
+    // the gate, but this path reserved the item directly).
+    const deps = dependencyState(state, item)
+    if (!deps.satisfied) {
+      if (deps.missing.length > 0) {
+        item.status = 'blocked'
+        item.error = `missing dependency: ${deps.missing.join(', ')}`
+        item.updatedAt = new Date().toISOString()
+        state.updatedAt = item.updatedAt
+      }
+      return false
+    }
+    // The TOKEN BUDGET applies on this path too, exactly as in the bulk
+    // `reserve()`: an issue that already exceeded its budget must not be
+    // started by the manual path either.
+    if (options.maxTokensPerIssue > 0 && item.tokens.totalTokens >= options.maxTokensPerIssue) {
+      item.status = 'blocked'
+      item.error = `token budget exceeded (${item.tokens.totalTokens}/${options.maxTokensPerIssue})`
+      item.updatedAt = new Date().toISOString()
+      state.updatedAt = item.updatedAt
+      return false
+    }
+    const active = Object.values(state.items).filter((i) => i.status === 'running' || i.status === 'reserved')
+    if (active.length >= options.maxWorkers) return false
+    if (active.filter((i) => i.repoKey === item.repoKey).length >= options.maxWorkersPerRepo) return false
+    item.status = 'reserved'
+    item.attempt += 1
+    item.leaseExpiresAt = Date.now() + options.leaseMs
+    item.updatedAt = new Date().toISOString()
+    state.updatedAt = item.updatedAt
+    return true
+  })
+}
+
+/**
+ * Reserve the worker slots and start the reserved work.
+ *
+ * The reservation is EXCLUSIVE and durable: it happens inside the
+ * control-plane store's serialized read-modify-write, so two concurrent
+ * callers cannot reserve the same issue. The chain engine is NOT touched:
+ * the control plane only decides WHAT runs, the engine advances the chain
+ * of a running session.
+ *
+ * FAIL CLOSED: an issue whose session cannot be created is marked failed
+ * in the registry, and the slot is released for the next candidate.
+ */
+async function scheduleControlPlane(rt: Runtime): Promise<number> {
+  const settings = readSettingsFromContext(rt.context)
+  const options = controlPlaneOptionsFromSettings(settings)
+  const dryRun = Boolean(settings.dryRun)
+
+  // A dry run must NOT reserve anything: a reservation without a session
+  // is an orphan that blocks the queue once the dry run is turned off.
+  if (dryRun) {
+    const queued = await rt.controlPlane.read(
+      (state) => Object.values(state.items).filter((i) => i.status === 'queued').length,
+    )
+    rt.context.logger.info(`[DRY RUN] would schedule ${queued} issue(s); nothing was reserved`)
+    return 0
+  }
+
+  const reserved = await rt.controlPlane.mutate((state) => reserve(state, options).reserved)
+
+  // `reserve` may BLOCK items (a missing dependency, an exceeded token
+  // budget) and RECLAIM the expired leases. Every one of those changes
+  // must be mirrored to the legacy queue, otherwise the two views
+  // disagree.
+  await mirrorControlPlaneBlocks(rt)
+
+  if (reserved.length === 0) return 0
+
+  // The HOST's task board defaults to ONE concurrent task per project, so
+  // the host's own scheduler would serialise the plugin's workers: the
+  // second issue's task would sit queued on the host's side and its
+  // workflow would never start, while the plugin believes it is running.
+  // The plugin asks for the capacity it needs — the host clamps it to
+  // 1..10.
+  const hostClient = rt.hostClient?.()
+  if (hostClient) {
+    for (const projectId of new Set(reserved.map((i) => i.projectId))) {
+      const slotResult = await hostClient.setTaskSlotLimit(projectId, options.maxWorkers)
+      if (!slotResult.ok) {
+        rt.context.logger.warn(
+          `could not raise the host task slot limit for ${projectId} (${slotResult.reason}): ${slotResult.message}`,
+        )
+      }
+    }
+  }
+
+  let started = 0
+  for (const item of reserved) {
+    try {
+      // The control plane must reuse the chain engine, not duplicate it:
+      // the issue is written to the legacy queue and spawned through
+      // `spawnEntry`, which creates the session AND launches the chain.
+      // Spawning the session directly here produced a session the chain
+      // engine could never see.
+      //
+      // The control plane keys an issue by `<repoKey>#<issueNumber>` while
+      // the legacy queue uses its own entry id. The EXISTING queue entry is
+      // reused when there is one, so the two views stay consistent.
+      const active = await rt.store.loadActive()
+      const existing = active.find((e) => e.repoKey === item.repoKey && e.issueNumber === item.issueNumber)
+      const queueEntry: QueueEntry = existing ?? {
+        id: item.key,
+        repoKey: item.repoKey,
+        projectId: item.projectId,
+        issueNumber: item.issueNumber,
+        title: item.title,
+        body: '',
+        url: item.url,
+        labels: [],
+        comments: [],
+        dependsOn: item.dependsOn,
+        status: 'queued',
+        position: 0,
+        addedAt: new Date().toISOString(),
+      }
+      if (!existing) {
+        // The entry does not exist yet: `update` THROWS on a missing id, so
+        // it must be ADDED. Otherwise the control plane holds an item the
+        // legacy queue does not, and the scheduler fails with a cryptic
+        // 'Queue entry not found'.
+        await rt.store.addNew([queueEntry])
+      }
+      const spawned = await spawnEntry(rt, { ...queueEntry, status: 'queued' })
+      if (spawned.status === 'running') {
+        started += 1
+      } else {
+        await rt.controlPlane.mutate((state) => {
+          // A REFUSED launch already blocked the item in both views, with
+          // the reason: overwriting it with 'failed' would make the two
+          // views disagree. Only a reservation that never reached a status
+          // is completed here.
+          const current = state.items[item.key]
+          if (current && current.status === 'reserved') {
+            completeItem(state, item.key, 'failed', { error: spawned.error ?? 'could not start' })
+          }
+        })
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      // Fail closed: the slot is released, the issue is recorded as failed.
+      await rt.controlPlane.mutate((state) => {
+        completeItem(state, item.key, 'failed', { error: message })
+      })
+      rt.context.logger.error(`control plane: could not start ${item.key}: ${message}`)
+    }
+  }
+  return started
+}
+
+/**
+ * Spawn the next queued issue, honouring the control plane.
+ *
+ * The control plane is the ONLY scheduler. The legacy path used to spawn
+ * on its own, so an issue could get TWO sessions: one from the control
+ * plane and one from here (both schedulers saw the same queue). The
+ * reservation is now taken BEFORE the session is created and is released
+ * if the creation fails, so a second caller finds the issue already
+ * reserved and skips it.
+ */
+/**
+ * Allocate a unique issue number for a manually added issue.
+ *
+ * The number must be unique per repository: the control plane keys an
+ * issue by `<repoKey>#<issueNumber>`, so two manual entries sharing a
+ * number would be treated as the same issue.
+ */
+async function nextManualIssueNumber(rt: Runtime, repoKey: string): Promise<number> {
+  const active = await rt.store.loadActive()
+  const used = new Set(active.filter((e) => e.repoKey === repoKey).map((e) => e.issueNumber))
+  // Start from the current time (stable and sortable) and walk forward
+  // until the number is free.
+  let candidate = Date.now()
+  while (used.has(candidate)) {
+    candidate += 1
+  }
+  return candidate
+}
+
+/**
+ * Launch a workflow and report what the host actually did.
+ *
+ * THE SINGLE LAUNCH PATH. Both the first step of a chain (`startChain`)
+ * and the chain advance (the `workflow.execution.changed` hook) go through
+ * this function, because they face the SAME host contract:
+ *
+ *   - the host's `reusableTarget` only reuses a session that has NO
+ *     MESSAGES, so from the SECOND step on the host necessarily seeds a
+ *     NEW session. The plugin must follow the REPORTED id, or the host's
+ *     events for that step are dropped by the hook (which looks the entry
+ *     up by session id) and the chain stalls after step 1;
+ *   - the host creates a TASK per launch and only frees its worker slot
+ *     when the task leaves "in_progress". Every task must therefore be
+ *     closed — the intermediate ones included, or the host's slots
+ *     saturate and the next issue never starts.
+ *
+ * The launch is asynchronous, so the caller awaits it and persists what
+ * the host reported.
+ */
+async function launchAndBind(
+  rt: Runtime,
+  launch: {
+    sessionId: string
+    workflowId: string
+    content: string
+    params: Record<string, string>
+    projectId?: string | undefined
+  },
+): Promise<{
+  sessionId: string
+  taskId: string | undefined
+  launched: boolean
+  failure: 'refused' | 'queued' | undefined
+  reason: string | undefined
+}> {
+  const outcome = await rt.orchestration.launchWorkflow({
+    sessionId: launch.sessionId,
+    workflowId: launch.workflowId,
+    params: launch.params,
+    content: launch.content,
+    projectId: launch.projectId,
+  })
+  const sessionId = outcome.sessionId ?? launch.sessionId
+  if (!outcome.launched) {
+    // The two reasons are DIFFERENT and the operator must be able to tell
+    // them: a refusal means the plugin could not build a valid launch (the
+    // host was never asked), a queueing means the host accepted the task
+    // and is waiting for a slot.
+    rt.context.logger.warn(
+      outcome.failure === 'refused'
+        ? `the launch of "${launch.workflowId}" was REFUSED: ${outcome.reason ?? 'unknown reason'}`
+        : `the host queued the launch of "${launch.workflowId}": its task slot limit was reached`,
+    )
+  }
+  return {
+    sessionId,
+    taskId: outcome.taskId,
+    launched: outcome.launched,
+    failure: outcome.failure,
+    reason: outcome.reason,
+  }
+}
+
+/**
+ * Close a host task by id.
+ *
+ * The host only frees a worker slot when its task leaves the "in_progress"
+ * state. A task left there consumes the slot forever: the next issue's
+ * task is queued on the host's side and its workflow never starts, while
+ * the plugin believes it is running.
+ *
+ * A failure to close is reported but never fatal: the chain itself is
+ * over, and the issue must still be completed.
+ */
+async function closeHostTask(
+  rt: Runtime,
+  entry: QueueEntry,
+  finalState: 'done' | 'cancelled',
+): Promise<void> {
+  const taskId = entry.hostTaskId
+  const projectId = entry.hostProjectId ?? entry.projectId
+  if (!taskId || !projectId) return
+  const client = rt.hostClient?.()
+  if (!client) return
+  const result =
+    finalState === 'done'
+      ? await client.completeTask(projectId, taskId)
+      : await client.deleteTask(projectId, taskId)
+  if (!result.ok) {
+    rt.context.logger.warn(
+      `could not close the host task ${taskId} (${result.reason}): ${result.message} — ` +
+        'the host keeps its worker slot, the next issue may not start',
+    )
+  }
+}
+
+/**
+ * Report every divergence between the control plane (the authority) and
+ * the legacy queue (the mirror).
+ *
+ * The detector existed but was never called from the runtime, so a drift
+ * was invisible in production. It is called on every status read and
+ * logged as a warning.
+ */
+async function collectDivergences(rt: Runtime): Promise<string[]> {
+  const active = await rt.store.loadActive()
+  const state = await rt.controlPlane.read((s) => s)
+  const divergences: string[] = []
+  for (const entry of active) {
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    const item = state.items[key]
+    if (!item) continue
+    const divergence = findDivergence(entry, item)
+    if (divergence) divergences.push(`${key}: ${divergence}`)
+  }
+  return divergences
+}
+
 async function pickAndSpawnNext(rt: Runtime): Promise<QueueEntry | null> {
   const settings = readSettingsFromContext(rt.context)
-  const maxGlobal = settings['batch.maxConcurrency'] ?? 3
-  const maxPerRepo = settings['batch.maxConcurrencyPerRepo'] ?? 2
+  const options = controlPlaneOptionsFromSettings(settings)
   const dryRun = Boolean(settings.dryRun)
 
   const active = await rt.store.loadActive()
   const runningCount = active.filter((e) => e.status === 'running').length
-  if (runningCount >= maxGlobal) return null
+  if (runningCount >= options.maxWorkers) return null
   const runningByRepo = new Map<string, number>()
   for (const e of active) {
     if (e.status === 'running') runningByRepo.set(e.repoKey, (runningByRepo.get(e.repoKey) ?? 0) + 1)
@@ -276,15 +854,98 @@ async function pickAndSpawnNext(rt: Runtime): Promise<QueueEntry | null> {
 
   for (const entry of active) {
     if (entry.status !== 'queued') continue
+    const perRepoCount = runningByRepo.get(entry.repoKey) ?? 0
+    if (perRepoCount >= options.maxWorkersPerRepo) continue
     if (dryRun) {
       rt.context.logger.info(`[DRY RUN] would spawn session for ${entry.repoKey}#${entry.issueNumber}`)
       return entry
     }
-    const perRepoCount = runningByRepo.get(entry.repoKey) ?? 0
-    if (perRepoCount >= maxPerRepo) continue
-    return await spawnEntry(rt, entry)
+
+    // Reserve the issue in the control plane BEFORE creating the session.
+    // The reservation is exclusive and scoped to THIS issue only: a bulk
+    // reservation left the issues that were not started here 'reserved'
+    // with no session, and the queue could never be scheduled again.
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    const reserved = await reserveSingleIssue(rt, entry, options)
+    if (!reserved) {
+      // The reservation can have FAILED because the dependency gate
+      // blocked the item. That block must be mirrored to the legacy queue,
+      // or the two views disagree.
+      await mirrorControlPlaneBlocks(rt)
+      continue
+    }
+
+    try {
+      return await spawnEntry(rt, entry)
+    } catch (err) {
+      // Fail closed: release the reservation so the issue is not stuck.
+      const message = err instanceof Error ? err.message : String(err)
+      await rt.controlPlane.mutate((state) => {
+        completeItem(state, key, 'failed', { error: message })
+      })
+      throw err
+    }
   }
   return null
+}
+
+/**
+ * Record a launch that did NOT start.
+ *
+ * The workflow never ran: the host refused the launch, or it could not
+ * be reached. The issue must NOT stay 'running' — it would show a
+ * running issue in the panel with no workflow behind it, and no error
+ * either. It is BLOCKED in BOTH views, with the reason, so the operator
+ * sees it and can re-process it once the cause is fixed.
+ */
+async function failLaunch(rt: Runtime, entry: QueueEntry, message: string): Promise<void> {
+  const key = `${entry.repoKey}#${entry.issueNumber}`
+  await rt.controlPlane.mutate((state) => {
+    if (!state.items[key]) {
+      admit(state, [
+        {
+          repoKey: entry.repoKey,
+          projectId: entry.projectId,
+          issueNumber: entry.issueNumber,
+          title: entry.title,
+          url: entry.url,
+          labels: entry.labels,
+          dependsOn: entry.dependsOn,
+        },
+      ])
+    }
+    completeItem(state, key, 'blocked', { error: message })
+  })
+  const item = await rt.controlPlane.read((state) => state.items[key])
+  const patched = syncQueueStatus(entry, item)
+  // The in-flight STEP must not stay 'running' under a blocked issue: that
+  // is the very contradiction this function exists to remove. The step
+  // that could not start is marked 'blocked' too; the reason lives on the
+  // entry (and on the control-plane item), so the two views and the stack
+  // all tell the same story.
+  const finishedAt = new Date().toISOString()
+  const stack = (entry.executionStack ?? []).map((step) =>
+    step.status === 'running' ? { ...step, status: 'blocked' as const, finishedAt } : step,
+  )
+  try {
+    await rt.store.transitionTo(entry.id, patched.status, {
+      executionStack: stack,
+      error: message,
+      finishedAt,
+    })
+  } catch (err) {
+    // The store refused the transition: the entry is written directly so
+    // the two views still agree.
+    rt.context.logger.warn(
+      `could not block the entry after a failed launch: ${err instanceof Error ? err.message : String(err)}`,
+    )
+    await rt.store.update({ ...entry, ...patched, executionStack: stack, error: message })
+  }
+  rt.context.notify({
+    title: { en: 'Workflow could not start', fr: 'Le workflow n’a pas pu démarrer' },
+    body: { en: message, fr: message },
+    level: 'error',
+  })
 }
 
 async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
@@ -304,22 +965,123 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
   await rt.store.update(updated)
 
   try {
-    const session = await spawnSessionFor(updated, { context: rt.context })
+    // The ORCHESTRATION PORT resolves the host: `context.host`, the
+    // legacy in-process surface, or the supported HTTP API. Passing the
+    // port here is what makes the session creation work on a real host,
+    // where no in-process surface exists.
+    const session = await spawnSessionFor(updated, { orchestration: rt.orchestration })
     if (session.id) updated.sessionId = session.id
+    // The CONTROL PLANE is the authority for the scheduling state: the
+    // issue becomes 'running' there, and the legacy entry mirrors it.
+    if (session.id) {
+      await rt.controlPlane.mutate((state) => {
+        markRunning(state, `${entry.repoKey}#${entry.issueNumber}`, session.id)
+      })
+    }
     if (chain.length > 0) {
       // startChain returns a stack with the first workflow marked running —
       // assign it back so subsequent reads (RPC, hooks, store) see the
       // running status immediately, before the workflow fires its first
       // workflow.execution.changed event.
-      updated.executionStack = startChain(updated, createLaunchDriver(rt), {
+      //
+      // The host may bind the run to a DIFFERENT session (it can only
+      // reuse a session that has no messages yet), so the entry follows
+      // the session the host reports.
+      const onSessionBound = (sessionId: string, _workflowId: string): void => {
+        updated.sessionId = sessionId
+        // The session is part of the SCHEDULING state: the control plane
+        // (the authority) must know it too, or the two views disagree on
+        // the session and the drift detector reports it.
+        void rt.controlPlane
+          .mutate((state) => {
+            markRunning(state, `${entry.repoKey}#${entry.issueNumber}`, sessionId)
+          })
+          .catch((err: unknown) => {
+            rt.context.logger.error(
+              `could not record the host session in the control plane: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            )
+          })
+        void rt.store.update({ ...updated }).catch((err: unknown) => {
+          rt.context.logger.error(
+            `could not record the host session: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        })
+      }
+      const onTaskBound = (taskId: string, _workflowId: string): void => {
+        updated.hostTaskId = taskId
+        updated.hostProjectId = entry.projectId
+        void rt.store.update({ ...updated }).catch((err: unknown) => {
+          rt.context.logger.error(
+            `could not record the host task: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        })
+      }
+      // A launch that does NOT start must be visible: the issue would
+      // otherwise stay 'running' with nothing running, and the operator
+      // would see a running issue in the panel with no workflow and no
+      // error. The issue is BLOCKED in BOTH views, with the reason.
+      // The failure is AWAITED by the driver, so `settle()` only resolves
+      // once the entry is really blocked in both views: the caller then
+      // reads the store and reports the refusal instead of the stale
+      // 'running' object.
+      const onLaunchFailed = (workflowId: string, reason: string): Promise<void> => {
+        const message = `could not start workflow ${workflowId}: ${reason}`
+        return failLaunch(rt, updated, message).catch((err: unknown) => {
+          rt.context.logger.error(
+            `could not record the launch failure: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        })
+      }
+      const driver = createLaunchDriver(rt, onSessionBound, onTaskBound, onLaunchFailed)
+      updated.executionStack = startChain(updated, driver, {
         sessionId: updated.sessionId ?? '',
       })
+      // The launch is asynchronous, and a REFUSED one blocks the entry
+      // through `failLaunch`. Wait for it, then never overwrite the entry
+      // with the stale 'running' object: that write restored 'running'
+      // and dropped the error — exactly the silent state this fix
+      // removes. The entry is returned as the store holds it, so the
+      // callers that branch on the returned entry (the scheduler, the
+      // startIssue RPC) see the refusal and release the reservation.
+      await driver.settle()
+      const stored = (await rt.store.loadActive()).find((e) => e.id === updated.id)
+      if (stored && stored.status !== 'running') {
+        Object.assign(updated, stored)
+        return updated
+      }
     }
     await rt.store.update(updated)
   } catch (e) {
     const err = e instanceof Error ? e.message : String(e)
-    updated.status = 'failed'
-    updated.error = err
+    // The CONTROL PLANE is the authority: it must learn about the failure
+    // too. Writing only the legacy entry left the control plane saying
+    // 'reserved' while the entry said 'failed' — a drift, and an orphan
+    // reservation that blocked the queue.
+    // A failed spawn must release the host's worker slot too.
+    await closeHostTask(rt, updated, 'cancelled')
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    await rt.controlPlane.mutate((state) => {
+      if (!state.items[key]) {
+        admit(state, [
+          {
+            repoKey: entry.repoKey,
+            projectId: entry.projectId,
+            issueNumber: entry.issueNumber,
+            title: entry.title,
+            url: entry.url,
+            labels: entry.labels,
+            dependsOn: entry.dependsOn,
+          },
+        ])
+      }
+      completeItem(state, key, 'failed', { error: err })
+    })
+    const item = await rt.controlPlane.read((state) => state.items[key])
+    const patched = syncQueueStatus(updated, item)
+    updated.status = patched.status
+    updated.error = patched.error ?? err
     updated.finishedAt = new Date().toISOString()
     await rt.store.update(updated)
     rt.context.notify({
@@ -331,27 +1093,110 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
   return updated
 }
 
-function createLaunchDriver(rt: Runtime): {
+function createLaunchDriver(
+  rt: Runtime,
+  onSessionBound: (sessionId: string, workflowId: string) => void,
+  onTaskBound: (taskId: string, workflowId: string) => void,
+  onLaunchFailed: (workflowId: string, reason: string) => Promise<void> | void,
+): {
   launch(params: {
     sessionId: string
     workflowId: string
     content: string
     params: Record<string, string>
+    projectId?: string | undefined
   }): void
+  onSessionBound: (sessionId: string, workflowId: string) => void
+  onTaskBound: (taskId: string, workflowId: string) => void
+  settle(): Promise<void>
 } {
+  // Every launch started by this driver, so the caller can wait for the
+  // host's answer before it persists the entry. Without this, a refusal
+  // that resolves without I/O could be recorded BEFORE the caller writes
+  // its stale 'running' object, and that write would erase it.
+  const pending: Promise<void>[] = []
   return {
     launch: (p) => {
-      try {
-        rt.orchestration.launchWorkflow({
-          sessionId: p.sessionId,
-          workflowId: p.workflowId,
-          params: p.params,
-          content: p.content,
-        })
-      } catch (err) {
-        rt.context.logger.error(`launchWorkflow failed: ${err instanceof Error ? err.message : String(err)}`)
-      }
+      // The launch is asynchronous: the host reports the session it bound
+      // to the run, and the plugin must follow it.
+      pending.push(
+        (async () => {
+          try {
+            const bound = await launchAndBind(rt, p)
+            if (!bound.launched && bound.failure === 'refused') {
+              // The workflow was REFUSED: the host was never asked. The
+              // issue must not stay 'running' with nothing running.
+              await onLaunchFailed(p.workflowId, bound.reason ?? 'the host did not start the workflow')
+              return
+            }
+            // A 'queued' launch is NOT a failure: the host accepted the
+            // task and runs it as soon as a slot frees, so the issue stays
+            // 'running' and the session and the task are still bound — the
+            // task has to be closed later, and the host's event will
+            // arrive. Blocking here would orphan the run: its event would
+            // find no active entry and be dropped.
+            if (bound.sessionId !== p.sessionId) {
+              // The host seeded a NEW session (it can only reuse a session
+              // that has no messages yet): the entry must follow it.
+              onSessionBound(bound.sessionId, p.workflowId)
+            }
+            if (bound.taskId) {
+              // The host task must be CLOSED when the chain ends, otherwise
+              // it keeps its worker slot forever and the next issue never
+              // starts.
+              onTaskBound(bound.taskId, p.workflowId)
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err)
+            rt.context.logger.error(`launchWorkflow failed: ${message}`)
+            await onLaunchFailed(p.workflowId, message)
+          }
+        })(),
+      )
     },
+    settle: async () => {
+      await Promise.allSettled(pending)
+    },
+    onSessionBound,
+    onTaskBound,
+  }
+}
+
+/**
+ * How the plugin reaches the OpenFox host — computed LOCALLY.
+ *
+ * NO NETWORK CALL. This is what the panel polls, and the panel refreshes
+ * every 10 seconds: the full health check queries the GitHub API (one
+ * `GET /user` plus one `GET /issues/1` per mapped repository), which
+ * would spend ~1,440 requests per hour on the operator's GitHub quota
+ * for the display alone.
+ *
+ * The full check stays available for the operator's explicit click.
+ */
+function hostStatus(context: PluginContext, hasFacade: boolean, hasLegacy: boolean): HealthReport['host'] {
+  // The HTTP path is the ONLY one a plugin can use on the current host:
+  // `PluginContext` exposes no `host` and no `openFoxInternals`. Reporting
+  // only the in-process surfaces made the health check say 'missing' even
+  // when the plugin could reach the host.
+  const hostSettings = (context.settings ? context.settings() : {}) as Record<string, unknown>
+  const hostBaseUrl = readHostBaseUrl(context) ?? ''
+  const hostTokenConfigured = Boolean(readHostToken(context))
+  // The base URL falls back to the host's own default port when the
+  // operator did not set one, so the report says explicitly whether the
+  // URL was CONFIGURED or merely defaulted.
+  const configuredBaseUrl = hostSettings['host.baseUrl']
+  const hostBaseUrlConfigured = typeof configuredBaseUrl === 'string' && configuredBaseUrl.trim().length > 0
+  return {
+    /** The base URL the plugin uses to reach the host. */
+    baseUrl: hostBaseUrl,
+    /** True when the base URL comes from the operator's settings. */
+    baseUrlConfigured: hostBaseUrlConfigured,
+    /** True when a session token is configured (network auth). */
+    tokenConfigured: hostTokenConfigured,
+    /** 'http' when the plugin can drive the host, 'missing' otherwise. */
+    transport: hostBaseUrl ? 'http' : 'missing',
+    /** The in-process surfaces, when the host provides them. */
+    inProcess: hasFacade ? 'facade' : hasLegacy ? 'legacy' : 'none',
   }
 }
 
@@ -395,6 +1240,7 @@ async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthR
   const internal = await getHostInternal(context)
   const hasFacade = internal?.kind === 'facade'
   const hasLegacy = internal?.kind === 'legacy'
+  const host = hostStatus(context, hasFacade, hasLegacy)
   return {
     github: { tokenValid: tokenRes.valid, rateLimitRemaining: tokenRes.rateLimit.remaining, reposAccessible },
     openFoxInternals: {
@@ -402,6 +1248,7 @@ async function healthCheck(rt: Runtime, context: PluginContext): Promise<HealthR
       launchWorkflowRun: hasLegacy ? 'ok' : hasFacade ? 'ok' : 'missing',
       host: hasFacade ? 'ok' : 'missing',
     },
+    host,
     workflows,
     projects,
     mapping: { valid: mappingIssues.length === 0, issues: mappingIssues },
@@ -431,6 +1278,15 @@ export function register(registry: PluginRegistry): void {
     },
   })
 
+  // The durable control-plane registry lives under its own storage key, so
+  // its read-modify-write cycle never races the queue's.
+  const controlPlane = new ControlPlaneStore({
+    get: async (k: string) => (await context.storage?.get(k)) as unknown,
+    set: async (k: string, v: unknown) => {
+      await context.storage?.set(k, v as Parameters<NonNullable<typeof context.storage.set>>[1])
+    },
+  })
+
   const settingsReader = () => readSettingsFromContext(context)
   const rt: Runtime = {
     context,
@@ -443,7 +1299,9 @@ export function register(registry: PluginRegistry): void {
     rateLimitedUntil: null,
     executions: new Map(),
     orchestration: createOrchestration(context),
+    hostClient: defaultHttpClientFactory(context),
     appliedExecutionEvents: new Set(),
+    controlPlane,
   }
   currentRt = rt
 
@@ -478,6 +1336,48 @@ export function register(registry: PluginRegistry): void {
 
   registry.registerRpc(`${RPC_NAMESPACE}health`, async () => healthCheck(rt, context))
 
+  // The host status WITHOUT the network.
+  //
+  // The full health check queries the GitHub API (one `GET /user` plus
+  // one `GET /issues/1` per mapped repository). The panel refreshes every
+  // 10 seconds, so calling it there spent ~1,440 GitHub requests per
+  // hour on the operator's quota for the display alone. This RPC is
+  // purely local, and it is what the panel polls.
+  registry.registerRpc(`${RPC_NAMESPACE}hostStatus`, async () => {
+    const internal = await getHostInternal(context)
+    return hostStatus(context, internal?.kind === 'facade', internal?.kind === 'legacy')
+  })
+
+  // Control-plane introspection: the durable registry and its metrics.
+  registry.registerRpc(`${RPC_NAMESPACE}controlPlaneStatus`, async () => {
+    const settings = readSettingsFromContext(context)
+    const options = controlPlaneOptionsFromSettings(settings)
+    // The divergence between the two views is reported, not silently
+    // tolerated: the control plane is the authority, so a drift means a
+    // writer bypassed it and must be fixed.
+    const divergences = await collectDivergences(rt)
+    if (divergences.length > 0) {
+      context.logger.warn(
+        `control plane: ${divergences.length} divergence(s) between the control plane and the queue`,
+        { divergences },
+      )
+    }
+    return await rt.controlPlane.read((state) => ({
+      options,
+      metrics: computeControlPlaneMetrics(state, { maxWorkers: options.maxWorkers }),
+      items: Object.values(state.items),
+      divergences,
+    }))
+  })
+
+  // Run one scheduling pass: reserve the free worker slots and start the
+  // reserved issues. Safe to call repeatedly — the reservation is
+  // exclusive, so a second call finds nothing left to reserve.
+  registry.registerRpc(`${RPC_NAMESPACE}controlPlaneSchedule`, async () => {
+    const started = await scheduleControlPlane(rt)
+    return { started }
+  })
+
   registry.registerRpc(`${RPC_NAMESPACE}getQueue`, async (params: unknown) => {
     const p = (params ?? {}) as { filter?: string; statusFilter?: string[] }
     const active = await rt.store.loadActive()
@@ -506,7 +1406,48 @@ export function register(registry: PluginRegistry): void {
     const entry = await rt.store.findById(queueId)
     if (!entry) throw new Error(`queue entry not found: ${queueId}`)
     if (entry.status !== 'queued') throw new Error(`cannot start entry in status ${entry.status}`)
-    return await spawnEntry(rt, entry)
+    // The control plane is the only scheduler: the reservation is taken
+    // BEFORE the session is created, so an issue already handled by the
+    // control plane is never started a second time.
+    const settings = readSettingsFromContext(context)
+    const options = controlPlaneOptionsFromSettings(settings)
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    // The SAME single-item reservation as the legacy path: a bulk
+    // reservation here left the other issues 'reserved' with no session.
+    const reserved = await reserveSingleIssue(rt, entry, options)
+    if (!reserved) {
+      // The reservation can have failed because the dependency gate
+      // blocked the item, not because it was already reserved. The block
+      // is mirrored so the two views agree, and the message says which.
+      await mirrorControlPlaneBlocks(rt)
+      const item = await rt.controlPlane.read((state) => state.items[key])
+      if (item?.status === 'blocked') {
+        throw new Error(`issue ${key} is blocked: ${item.error ?? 'unknown reason'}`)
+      }
+      // A FINISHED issue is never revived by this path: the operator must
+      // use `automate.reprocess`, which resets it on purpose.
+      if (item && (item.status === 'failed' || item.status === 'cancelled' || item.status === 'done')) {
+        throw new Error(`issue ${key} is ${item.status}: use automate.reprocess to run it again`)
+      }
+      throw new Error(`issue ${key} is already reserved by the control plane`)
+    }
+    // `spawnEntry` reports a failure in the returned entry rather than
+    // throwing, so the reservation is released here when the entry did not
+    // start: the issue must not stay reserved forever.
+    const spawned = await spawnEntry(rt, entry)
+    if (spawned.status !== 'running') {
+      await rt.controlPlane.mutate((state) => {
+        // A REFUSED launch already blocked the item in both views, with the
+        // reason: overwriting it with 'failed' would make the two views
+        // disagree. Only a reservation that never reached a status is
+        // completed here.
+        const item = state.items[key]
+        if (item && item.status === 'reserved') {
+          completeItem(state, key, 'failed', { error: spawned.error ?? 'could not start' })
+        }
+      })
+    }
+    return spawned
   })
 
   registry.registerRpc(`${RPC_NAMESPACE}cancelIssue`, async (params: unknown) => {
@@ -522,11 +1463,47 @@ export function register(registry: PluginRegistry): void {
         )
       }
     }
-    return await rt.store.transitionTo(queueId, 'cancelled', { finishedAt: new Date().toISOString() })
+    // The cancelled issue must release the host's worker slot too.
+    await closeHostTask(rt, entry, 'cancelled')
+    // The CONTROL PLANE is the authority for the scheduling state: the
+    // legacy entry is updated from it, never the other way round.
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    await rt.controlPlane.mutate((state) => {
+      if (!state.items[key]) {
+        admit(state, [
+          {
+            repoKey: entry.repoKey,
+            projectId: entry.projectId,
+            issueNumber: entry.issueNumber,
+            title: entry.title,
+            url: entry.url,
+            labels: entry.labels,
+            dependsOn: entry.dependsOn,
+          },
+        ])
+      }
+      completeItem(state, key, 'cancelled')
+    })
+    const item = await rt.controlPlane.read((state) => state.items[key])
+    const patched = syncQueueStatus(entry, item)
+    return await rt.store.transitionTo(queueId, patched.status, {
+      finishedAt: new Date().toISOString(),
+      ...(patched.error ? { error: patched.error } : {}),
+    })
   })
 
   registry.registerRpc(`${RPC_NAMESPACE}removeIssue`, async (params: unknown) => {
     const { queueId } = (params ?? {}) as { queueId: string }
+    const entry = await rt.store.findById(queueId)
+    if (!entry) throw new Error(`queue entry not found: ${queueId}`)
+    // The CONTROL PLANE is the authority: the issue is removed THERE
+    // first, so it cannot be scheduled again while the legacy entry still
+    // exists.
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    await rt.controlPlane.mutate((state) => {
+      delete state.items[key]
+      state.updatedAt = new Date().toISOString()
+    })
     await rt.store.remove(queueId)
     return { ok: true }
   })
@@ -539,18 +1516,83 @@ export function register(registry: PluginRegistry): void {
     if (!isTerminated(entry.status) && entry.status !== 'blocked') {
       throw new Error(`cannot reprocess entry in status ${entry.status}`)
     }
+    // The previous session must be STOPPED before the issue runs again.
+    // Reprocessing while the previous session may still be alive created a
+    // SECOND session for the same issue — two agents on the same code.
+    if (entry.sessionId) {
+      // FAIL CLOSED: if the previous session cannot be stopped, the issue
+      // must NOT run again — a second live session for the same issue means
+      // two agents on the same code.
+      try {
+        await rt.orchestration.stopSession(entry.sessionId)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        context.logger.warn(`automate.reprocess: stopSession failed: ${message}`)
+        throw new Error(
+          `cannot reprocess: the previous session (${entry.sessionId}) could not be stopped (${message})`,
+        )
+      }
+    }
     const reset = settings['post.reprocessResetsRetryCount']
     const executionStack = entry.executionStack?.map((s) =>
       reset ? { ...s, retryCount: 0, status: 'pending' as const } : s,
     )
+    // The CONTROL PLANE is the authority: the issue goes back to 'queued'
+    // THERE first. Without this the control plane kept the issue 'blocked'
+    // while the legacy entry said 'queued', and since `reserve` only
+    // selects 'queued' items the issue could never run again.
+    const key = `${entry.repoKey}#${entry.issueNumber}`
+    await rt.controlPlane.mutate((state) => {
+      if (!state.items[key]) {
+        admit(state, [
+          {
+            repoKey: entry.repoKey,
+            projectId: entry.projectId,
+            issueNumber: entry.issueNumber,
+            title: entry.title,
+            url: entry.url,
+            labels: entry.labels,
+            dependsOn: entry.dependsOn,
+          },
+        ])
+      }
+      const item = state.items[key]!
+      item.status = 'queued'
+      item.sessionId = undefined
+      item.leaseExpiresAt = undefined
+      delete item.error
+      item.updatedAt = new Date().toISOString()
+      state.updatedAt = item.updatedAt
+
+      // The DEPENDENCY GATE applies here too: reprocessing an issue whose
+      // prerequisite is missing must leave it 'blocked' in BOTH views, not
+      // 'queued' in the legacy queue and 'blocked' in the control plane.
+      // The gate is applied AFTER the reset, because the reset is what
+      // clears the previous block.
+      const deps = dependencyState(state, item)
+      if (!deps.satisfied) {
+        if (deps.missing.length > 0) {
+          item.status = 'blocked'
+          item.error = `missing dependency: ${deps.missing.join(', ')}`
+          item.updatedAt = new Date().toISOString()
+          state.updatedAt = item.updatedAt
+        }
+      }
+    })
+    const item = await rt.controlPlane.read((state) => state.items[key])
+    const status = item?.status === 'blocked' ? 'blocked' : 'queued'
     const updated: QueueEntry = {
       ...entry,
-      status: 'queued',
+      status,
       ...(executionStack ? { executionStack } : {}),
     }
     delete updated.startedAt
     delete updated.finishedAt
-    delete updated.error
+    if (status === 'blocked') {
+      updated.error = item?.error ?? 'missing dependency'
+    } else {
+      delete updated.error
+    }
     await rt.store.update(updated)
     await pickAndSpawnNext(rt)
     return updated
@@ -603,11 +1645,17 @@ export function register(registry: PluginRegistry): void {
     const repos = parseRepoMapping(settings['repos.mapping'])
     const mapping = repos.find((r) => r.repoKey === p.repoKey)
     if (!mapping) throw new Error(`no project mapping for ${p.repoKey}`)
+    // A manual entry has no GitHub issue number. `Date.now()` was used, but
+    // two calls in the same millisecond produced the SAME number — and the
+    // control plane keys an issue by `<repoKey>#<issueNumber>`, so the
+    // second entry was seen as a duplicate of the first and could never
+    // be scheduled. A monotonic counter keeps the keys unique.
+    const issueNumber = await nextManualIssueNumber(rt, p.repoKey)
     const entry: QueueEntry = {
       id: newEntryId(),
       repoKey: p.repoKey,
       projectId: mapping.projectId,
-      issueNumber: Date.now(),
+      issueNumber,
       title: p.title,
       body: p.body,
       url: '',
@@ -650,14 +1698,17 @@ export function register(registry: PluginRegistry): void {
   registry.registerHook(
     'tool.completed',
     safeHook('tool.completed', async (payload: unknown) => {
-      const p = payload as { sessionId?: string; output?: string }
-      if (!p.sessionId || !p.output) return
+      // The host nests the tool output under `data.result.output`; the
+      // adapter also accepts the legacy flat `{ sessionId, output }` shape.
+      const sessionId = readSessionId(payload)
+      const output = extractToolOutputText(payload)
+      if (!sessionId || !output) return
       const settings = readSettingsFromContext(context)
       const re = new RegExp(settings['pr.urlRegex'] ?? 'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)', 'i')
-      const match = re.exec(p.output)
+      const match = re.exec(output)
       if (!match) return
       const active = await rt.store.loadActive()
-      const entry = active.find((e) => e.sessionId === p.sessionId)
+      const entry = active.find((e) => e.sessionId === sessionId)
       if (!entry || entry.prUrl) return
       entry.prUrl = match[0]
       await rt.store.update(entry)
@@ -668,24 +1719,23 @@ export function register(registry: PluginRegistry): void {
   registry.registerHook(
     'workflow.execution.changed',
     safeHook('workflow.execution.changed', async (payload: unknown) => {
-      const p = payload as {
-        sessionId?: string
-        workflowId?: string
-        status?: string
-        executionId?: string
-        currentStepId?: string
-      }
+      // The host nests the workflow fields under `data` and uses the status
+      // vocabulary 'running' | 'waiting' | 'completed' | 'cancelled' |
+      // 'blocked'. The adapter normalises it; an incomplete payload is
+      // ignored without launching anything.
+      const normalized = normalizeWorkflowExecutionPayload(payload)
+      if (!normalized) return
       const active = await rt.store.loadActive()
-      const entry = active.find((e) => e.sessionId === p.sessionId)
+      const entry = active.find((e) => e.sessionId === normalized.sessionId)
       if (!entry) return
 
       const outcome = processWorkflowEvent(
         entry,
         {
-          sessionId: p.sessionId,
-          workflowId: p.workflowId,
-          executionId: p.executionId,
-          status: p.status as 'pending' | 'running' | 'done' | 'blocked' | undefined,
+          sessionId: normalized.sessionId,
+          workflowId: normalized.workflowId,
+          executionId: normalized.executionId,
+          status: normalized.status,
         },
         {
           appliedExecutionEvents: rt.appliedExecutionEvents,
@@ -697,36 +1747,168 @@ export function register(registry: PluginRegistry): void {
 
       if (outcome.deduplicated) return
 
+      // The CHAIN ADVANCE launches the next step. It must go through the
+      // same path as the first step: the host seeds a NEW session for
+      // every step (it can only reuse a session that has no messages), so
+      // the entry has to follow the session the host REPORTS — otherwise
+      // the host's event for that step is dropped by this very hook (which
+      // looks the entry up by session id) and the chain stalls after step
+      // 1. The host TASK of the PREVIOUS step is closed here as well: it
+      // only frees the host's worker slot when it leaves "in_progress",
+      // so the intermediate tasks would otherwise consume the host's slots
+      // forever.
       for (const launch of outcome.launches) {
-        rt.orchestration.launchWorkflow({
-          sessionId: launch.sessionId,
-          workflowId: launch.workflowId,
-          params: launch.params,
-          content: launch.content,
+        // The task of the step that just finished is released BEFORE the
+        // next one is created: the host counts the running tasks, so
+        // closing it first keeps the slot count honest.
+        //
+        // `outcome.launches` never holds more than one element (the
+        // chain advance and the retry are mutually exclusive), so the
+        // release happens once per advance.
+        if (entry.hostTaskId) {
+          await closeHostTask(rt, entry, 'done')
+          entry.hostTaskId = undefined
+        }
+        let bound: {
+          sessionId: string
+          taskId: string | undefined
+          launched: boolean
+          failure: 'refused' | 'queued' | undefined
+          reason: string | undefined
+        }
+        try {
+          bound = await launchAndBind(rt, launch)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          context.logger.error(`could not launch the next step "${launch.workflowId}": ${message}`)
+          // The step did NOT start: the issue must not stay 'running' with
+          // nothing running. It is blocked, in BOTH views, with the reason.
+          await failLaunch(rt, entry, `could not start workflow ${launch.workflowId}: ${message}`)
+          return
+        }
+        if (!bound.launched && bound.failure === 'refused') {
+          // Same contract as the first step: a REFUSED launch is VISIBLE,
+          // it is not a silent 'running'.
+          await failLaunch(
+            rt,
+            entry,
+            `could not start workflow ${launch.workflowId}: ${
+              bound.reason ?? 'the host did not start the workflow'
+            }`,
+          )
+          return
+        }
+        if (bound.sessionId !== entry.sessionId) {
+          // The host seeded a NEW session: the entry follows it.
+          //
+          // The session is part of the SCHEDULING state, so the CONTROL
+          // PLANE (the authority) must know it too — otherwise the two
+          // views disagree on the session and the drift detector reports
+          // it. The STATUS is left untouched: the item is already
+          // 'running' (a step is in flight), and `markRunning` would
+          // revive a finished item.
+          const sessionChanged = bound.sessionId
+          entry.sessionId = sessionChanged
+          await rt.controlPlane.mutate((state) => {
+            const item = state.items[`${entry.repoKey}#${entry.issueNumber}`]
+            if (!item) return
+            item.sessionId = sessionChanged
+            item.updatedAt = new Date().toISOString()
+            state.updatedAt = item.updatedAt
+          })
+        }
+        if (bound.taskId) {
+          entry.hostTaskId = bound.taskId
+          entry.hostProjectId = launch.projectId ?? entry.projectId
+        }
+        // The session and the task id are persisted BEFORE the next
+        // event arrives: the hook looks the entry up by session id, so a
+        // session that is not persisted makes the next event invisible.
+        await rt.store.update({
+          ...entry,
+          ...(entry.executionStack ? { executionStack: entry.executionStack } : {}),
         })
       }
 
-      if (outcome.transitionTo === 'done') {
-        await rt.store.transitionTo(entry.id, 'done', {
-          executionStack: entry.executionStack ?? [],
-          finishedAt: new Date().toISOString(),
+      if (outcome.transitionTo === 'done' || outcome.transitionTo === 'blocked') {
+        // The chain is over: the HOST TASK must be closed, otherwise it
+        // keeps the host's worker slot forever and the next issue is
+        // queued on the host's side and never starts (the host's default
+        // slot limit is one).
+        await closeHostTask(rt, entry, outcome.transitionTo === 'done' ? 'done' : 'cancelled')
+
+        // The CONTROL PLANE is the single authority for the scheduling
+        // state. The legacy queue entry is updated afterwards from that
+        // authority, so the two views cannot drift: there is one writer
+        // for `status`, not two.
+        const key = `${entry.repoKey}#${entry.issueNumber}`
+        const status = outcome.transitionTo
+        const reason =
+          status === 'blocked'
+            ? (outcome.blockedReason ?? `workflow ${normalized.workflowId} blocked`)
+            : undefined
+        await rt.controlPlane.mutate((state) => {
+          // The authority ADOPTS an issue it does not know yet (it was
+          // added manually, or the registry was lost): the scheduling
+          // state must never be written to the legacy queue alone.
+          if (!state.items[key]) {
+            admit(state, [
+              {
+                repoKey: entry.repoKey,
+                projectId: entry.projectId,
+                issueNumber: entry.issueNumber,
+                title: entry.title,
+                url: entry.url,
+                labels: entry.labels,
+                dependsOn: entry.dependsOn,
+              },
+            ])
+          }
+          completeItem(state, key, status, reason ? { error: reason } : {})
         })
-        await maybePostProcess(rt, entry)
-        await pickAndSpawnNext(rt)
-      } else if (outcome.transitionTo === 'blocked') {
-        await rt.store.transitionTo(entry.id, 'blocked', {
-          executionStack: entry.executionStack ?? [],
-          error: outcome.blockedReason ?? `workflow ${p.workflowId} blocked`,
-        })
-        context.notify({
-          title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
-          body: {
-            en: `Issue #${entry.issueNumber} needs intervention`,
-            fr: `Issue #${entry.issueNumber} demande intervention`,
-          },
-          level: 'error',
-        })
-      } else if (outcome.launches.length === 0) {
+        const item = await rt.controlPlane.read((state) => state.items[key])
+        const patched = syncQueueStatus(entry, item)
+        // FAIL CLOSED, but never throw: a refused transition must not abort
+        // the hook before the freed worker slot is reused.
+        try {
+          await rt.store.transitionTo(entry.id, patched.status, {
+            executionStack: entry.executionStack ?? [],
+            finishedAt: new Date().toISOString(),
+            ...(patched.error ? { error: patched.error } : {}),
+          })
+        } catch (err) {
+          context.logger.warn(
+            `workflow ${normalized.workflowId}: the legacy transition to "${patched.status}" was refused: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          )
+          // The legacy entry is written directly so the two views agree even
+          // when the store refuses the transition.
+          await rt.store.update({ ...entry, ...patched })
+        }
+        if (status === 'done') {
+          await maybePostProcess(rt, entry)
+          await pickAndSpawnNext(rt)
+        } else {
+          context.notify({
+            title: { en: 'Workflow blocked', fr: 'Workflow bloqué' },
+            body: {
+              en: `Issue #${entry.issueNumber} needs intervention`,
+              fr: `Issue #${entry.issueNumber} demande intervention`,
+            },
+            level: 'error',
+          })
+        }
+      } else {
+        // Persist the mutated execution stack on EVERY path.
+        //
+        // `processWorkflowEvent` mutates `entry.executionStack` in place. The
+        // chain-advance branch (a workflow completed, the next one launched)
+        // used to fall through without persisting it: with the real host
+        // storage (JSON round-trip) the in-place mutation was then LOST, so
+        // the next step stayed 'pending', the engine found no 'running' step
+        // on the following event, and the chain stalled after the first
+        // workflow.
         await rt.store.update({
           ...entry,
           ...(entry.executionStack ? { executionStack: entry.executionStack } : {}),
@@ -742,6 +1924,57 @@ export function register(registry: PluginRegistry): void {
     safeHook('task.completed', async () => {
       await pickAndSpawnNext(rt)
       publishQueue(rt, await rt.store.loadActive())
+    }),
+  )
+
+  // Budget accounting. The host reports the token usage of every LLM call
+  // through `llm.completed`; the usage is attributed to the issue the
+  // session is working on, so the per-issue budget and the cache ratio can
+  // be observed without any extra LLM call.
+  registry.registerHook(
+    'llm.completed',
+    safeHook('llm.completed', async (payload: unknown) => {
+      const sessionId = readSessionId(payload)
+      if (!sessionId) return
+      const data = (payload as { data?: Record<string, unknown> } | undefined)?.data ?? {}
+      const num = (key: string): number => {
+        const value = Number(data[key])
+        return Number.isFinite(value) ? value : 0
+      }
+      const budget = controlPlaneOptionsFromSettings(readSettingsFromContext(context)).maxTokensPerIssue
+      const blocked = await rt.controlPlane.mutate((state) => {
+        const item = recordTokenUsage(
+          state,
+          sessionId,
+          {
+            promptTokens: num('promptTokens'),
+            completionTokens: num('completionTokens'),
+            totalTokens: num('totalTokens'),
+            cachedPromptTokens: num('cachedPromptTokens'),
+            cacheWriteTokens: num('cacheWriteTokens'),
+            llmCalls: 1,
+          },
+          { maxTokensPerIssue: budget },
+        )
+        // The budget can block the item IN the control plane. The legacy
+        // entry must be mirrored, or the two views disagree.
+        return item?.status === 'blocked' ? item : null
+      })
+      if (blocked) {
+        const active = await rt.store.loadActive()
+        const entry = active.find((e) => e.sessionId === sessionId)
+        if (entry && entry.status !== 'blocked') {
+          const patched = syncQueueStatus(entry, blocked)
+          try {
+            await rt.store.transitionTo(entry.id, patched.status, {
+              ...(patched.error ? { error: patched.error } : {}),
+            })
+          } catch {
+            // The store may refuse the transition; the drift detector
+            // reports it.
+          }
+        }
+      }
     }),
   )
 
@@ -835,6 +2068,9 @@ export function register(registry: PluginRegistry): void {
         void rt.store.loadActive().then((q) => publishQueue(rt, q))
       },
       signal: rt.abortController.signal,
+      // The PR monitor updates the control plane (the authority) and the
+      // legacy entry is written from it.
+      controlPlane: rt.controlPlane,
     })
     if (result.checked > 0 || result.errors.length > 0) {
       context.logger.info(

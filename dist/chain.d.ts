@@ -20,14 +20,70 @@ export interface ChainContext {
 }
 export interface LaunchDriver {
     launch(params: LaunchParams): void;
+    /**
+     * Called when the host reports the session it actually bound to the run.
+     *
+     * The host seeds a NEW session when the one it was given already has
+     * messages, so the plugin cannot assume its own session is reused: it
+     * must follow the reported id, or the host's events are ignored and the
+     * chain stalls after its first step.
+     *
+     * The SAME rule applies to EVERY step of the chain, not only the first
+     * one: by the second step the session already has messages, so the host
+     * necessarily seeds a new one.
+     */
+    onSessionBound?(sessionId: string, workflowId: string): void;
+    /**
+     * Called when the host reports the TASK it created for the run.
+     *
+     * The host only frees a worker slot when its task leaves "in_progress",
+     * so every task the plugin creates must be closed — including the ones
+     * created for the INTERMEDIATE steps of a chain.
+     */
+    onTaskBound?(taskId: string, workflowId: string): void;
 }
 export interface LaunchParams {
     sessionId: string;
     workflowId: string;
     content: string;
     params: Record<string, string>;
+    /** The host project the workflow belongs to (needed by the task-board launch). */
+    projectId?: string | undefined;
 }
 export declare function buildIssueContext(entry: QueueEntry): string;
+/**
+ * The values the plugin can offer to a workflow, keyed by the parameter
+ * NAME the workflows declare.
+ *
+ * The host maps the positional arguments of a `/<workflow-id> <args…>`
+ * prompt onto the workflow's DECLARED parameters, by position, and
+ * refuses the launch when a required one is missing. Only the parameters
+ * the workflow actually declares are therefore offered — the others are
+ * simply not sent.
+ *
+ * The names below are the ones the REAL workflows declare (read from the
+ * installed host's workflow definitions):
+ *
+ *   plan-issue-v3     → issue_ref (position 0, required), repo (position 1)
+ *   build-verify-v3   → workdir (position 0)
+ *   publish-pr-v1     → workdir (position 0)
+ *
+ * `issue_ref` is `<owner>/<repo>#<number>`: the planner parses that form
+ * itself (`repo=${ref%#*}; num=${ref##*#}`) and reads the issue with an
+ * authenticated `gh issue view`. The issue body and the comments are
+ * therefore NOT transported: the workflow re-reads them from GitHub, and
+ * the host has no channel to carry free text anyway (the prompt is split
+ * on whitespace, so any free text would CORRUPT the positional mapping).
+ *
+ * `workdir` is deliberately NOT offered. It is a parameter of
+ * build-verify-v3 and publish-pr-v1, but the host resolves the
+ * `{{workdir}}` template variable from the SESSION, and the session
+ * inherits the HOST PROJECT's working directory — not the target
+ * repository's. Sending a value would be misleading rather than
+ * effective, and the plugin does not know the repository's path. The
+ * parameter is optional and last, so omitting it leaves the positional
+ * mapping intact.
+ */
 export declare function buildIssueParams(entry: QueueEntry): Record<string, string>;
 export declare function initExecutionStack(chain: string[]): ExecutionStep[];
 export interface ChainOutcome {
@@ -35,9 +91,20 @@ export interface ChainOutcome {
     finished: boolean;
     blocked: boolean;
     waiting: boolean;
+    /** The host cancelled the execution: terminal, and NOT a retryable block. */
+    cancelled: boolean;
 }
+/**
+ * Status vocabulary of the chain engine.
+ *
+ * `done` and `cancelled` come from the host adapter
+ * (`src/host-events.ts`): the OpenFox host emits `completed` (normalised to
+ * `done`) and `cancelled` (kept distinct so it is terminal without
+ * triggering the retry-once path).
+ */
+export type ChainEventStatus = 'pending' | 'running' | 'done' | 'blocked' | 'waiting' | 'cancelled';
 export declare function applyExecutionEvent(stack: ExecutionStep[], currentIndex: number, event: {
-    status: 'pending' | 'running' | 'done' | 'blocked' | 'waiting';
+    status: ChainEventStatus;
 }): ChainOutcome;
 export declare function startChain(entry: QueueEntry, driver: LaunchDriver, options: {
     sessionId: string;
@@ -55,13 +122,15 @@ export interface WorkflowExecutionChange {
     sessionId?: string | undefined;
     workflowId?: string | undefined;
     executionId?: string | undefined;
-    status?: 'pending' | 'running' | 'done' | 'blocked' | undefined;
+    status?: ChainEventStatus | undefined;
 }
 export interface ProcessLaunch {
     sessionId: string;
     workflowId: string;
     content: string;
     params: Record<string, string>;
+    /** The host project the workflow belongs to (needed by the task-board launch). */
+    projectId?: string | undefined;
 }
 /**
  * Pure orchestration outcome from processing a workflow.execution.changed

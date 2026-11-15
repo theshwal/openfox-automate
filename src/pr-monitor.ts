@@ -19,6 +19,8 @@ import type { QueueEntry } from './types.js'
 import type { GitHubPullRequest } from './github.js'
 import { getPullRequest, type RateLimitInfo } from './github.js'
 import type { QueueStore } from './queue.js'
+import type { ControlPlaneState } from './control-plane.js'
+import { completeItem } from './control-plane.js'
 import { RPC_NAMESPACE } from './constants.js'
 
 export interface PRMonitorDeps {
@@ -36,6 +38,21 @@ export interface PRMonitorDeps {
   republish: () => void
   /** AbortSignal forwarded into GitHub fetches. */
   signal?: AbortSignal
+  /**
+   * The durable control plane — the AUTHORITY for the scheduling state.
+   *
+   * The PR monitor used to write the legacy queue entry directly, so a
+   * merged or conflicting PR left the control plane saying 'running'
+   * while the legacy entry said 'done': the two views diverged and the
+   * control plane then refused to schedule the issue again.
+   *
+   * When provided, the monitor updates the control plane FIRST and the
+   * legacy entry is written from it. When absent (a standalone use of
+   * this module), the monitor keeps its previous behaviour.
+   */
+  controlPlane?: {
+    mutate<T>(fn: (state: ControlPlaneState) => T): Promise<T>
+  }
 }
 
 export interface PRMonitorResult {
@@ -44,6 +61,77 @@ export interface PRMonitorResult {
   completed: number
   errors: string[]
   rateLimit: RateLimitInfo | null
+}
+
+/**
+ * Move an entry to a terminal status, through the control plane.
+ *
+ * The control plane is the authority: it is updated FIRST, and the legacy
+ * queue entry is then written from it. Writing the legacy entry alone
+ * (the previous behaviour) left the two views disagreeing — the control
+ * plane still said 'running' while the entry said 'done', so the issue
+ * could never be scheduled again.
+ */
+async function transitionThroughControlPlane(
+  deps: PRMonitorDeps,
+  entry: { id: string; repoKey: string; issueNumber: number },
+  status: 'done' | 'failed',
+  error?: string,
+): Promise<void> {
+  if (!deps.controlPlane) {
+    await deps.store.transitionTo(entry.id, status, {
+      finishedAt: new Date().toISOString(),
+      ...(error ? { error } : {}),
+    })
+    return
+  }
+  const key = `${entry.repoKey}#${entry.issueNumber}`
+
+  // The LEGACY transition decides whether it is allowed at all: the store
+  // rejects some transitions (e.g. blocked → done). The control plane must
+  // only be updated AFTER that transition succeeded — mutating it first
+  // left the two views diverging (control plane 'done', legacy 'blocked').
+  //
+  // A refused transition is NOT an error: it means the entry is already in
+  // a state the monitor must not override (a blocked entry stays blocked
+  // until an operator reprocesses it). It is reported as a skipped
+  // transition instead of throwing, so the scan timer never sees an
+  // unhandled rejection.
+  try {
+    await deps.store.transitionTo(entry.id, status, {
+      finishedAt: new Date().toISOString(),
+      ...(error ? { error } : {}),
+    })
+  } catch {
+    return
+  }
+
+  await deps.controlPlane.mutate((state) => {
+    if (!state.items[key]) {
+      state.items[key] = {
+        key,
+        repoKey: entry.repoKey,
+        projectId: '',
+        issueNumber: entry.issueNumber,
+        title: '',
+        url: '',
+        status: 'queued',
+        priority: 0,
+        dependsOn: [],
+        attempt: 0,
+        tokens: {
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+          cachedPromptTokens: 0,
+          cacheWriteTokens: 0,
+          llmCalls: 0,
+        },
+        updatedAt: new Date().toISOString(),
+      }
+    }
+    completeItem(state, key, status, error ? { error } : {})
+  })
 }
 
 export async function monitorPRs(deps: PRMonitorDeps): Promise<PRMonitorResult> {
@@ -101,9 +189,7 @@ export async function monitorPRs(deps: PRMonitorDeps): Promise<PRMonitorResult> 
     const pr = cached.pr
 
     if (pr.merged) {
-      await deps.store.transitionTo(entry.id, 'done', {
-        finishedAt: new Date().toISOString(),
-      })
+      await transitionThroughControlPlane(deps, entry, 'done')
       result.completed += 1
       deps.notify({
         title: { en: 'PR merged', fr: 'PR fusionnée' },
@@ -117,10 +203,7 @@ export async function monitorPRs(deps: PRMonitorDeps): Promise<PRMonitorResult> 
     }
 
     if (pr.state === 'open' && pr.mergeable === false) {
-      await deps.store.transitionTo(entry.id, 'failed', {
-        finishedAt: new Date().toISOString(),
-        error: 'pr_conflicts',
-      })
+      await transitionThroughControlPlane(deps, entry, 'failed', 'pr_conflicts')
       result.failed += 1
       deps.notify({
         title: { en: 'PR has conflicts', fr: 'PR en conflit' },

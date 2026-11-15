@@ -25,6 +25,17 @@ export interface QueueEntry {
     finishedAt?: string;
     commentUrl?: string;
     prUrl?: string;
+    /**
+     * The id of the HOST TASK the launch created on the host's task board.
+     *
+     * The host only frees a worker slot when its task leaves the
+     * "in_progress" state, so the task must be closed when the chain ends —
+     * otherwise the host's slot limit is consumed forever and the next issue
+     * never starts.
+     */
+    hostTaskId?: string | undefined;
+    /** The host project the task belongs to. */
+    hostProjectId?: string | undefined;
 }
 export interface IssueComment {
     author: string;
@@ -58,6 +69,21 @@ export interface HealthReport {
         launchWorkflowRun: 'ok' | 'missing';
         host: 'ok' | 'missing';
     };
+    /**
+     * How the plugin reaches the host.
+     *
+     * The HTTP path is the only one available to a plugin on the current
+     * host: `PluginContext` exposes neither `host` nor
+     * `openFoxInternals`.
+     */
+    host: {
+        baseUrl: string;
+        /** True when the base URL comes from the operator's settings. */
+        baseUrlConfigured: boolean;
+        tokenConfigured: boolean;
+        transport: 'http' | 'missing';
+        inProcess: 'facade' | 'legacy' | 'none';
+    };
     workflows: Record<string, 'ok' | 'not-found'>;
     projects: Record<string, 'ok' | 'missing'>;
     mapping: {
@@ -85,6 +111,10 @@ export interface PluginSettings {
     'post.reprocessResetsRetryCount'?: boolean;
     'pr.monitorEnabled'?: boolean;
     'pr.urlRegex'?: string;
+    'budget.maxTokensPerIssue'?: number;
+    'control.leaseMinutes'?: number;
+    'host.baseUrl'?: string;
+    'host.sessionToken'?: string;
 }
-export declare const DEFAULT_SETTINGS: Required<Omit<PluginSettings, 'github.token' | 'repos.mapping' | 'workflows.repoOverrides' | 'post.commentTemplate' | 'ordering.dependencyPattern' | 'pr.urlRegex'>>;
+export declare const DEFAULT_SETTINGS: Required<Omit<PluginSettings, 'github.token' | 'repos.mapping' | 'workflows.repoOverrides' | 'post.commentTemplate' | 'ordering.dependencyPattern' | 'pr.urlRegex' | 'host.baseUrl' | 'host.sessionToken'>>;
 //# sourceMappingURL=types.d.ts.map

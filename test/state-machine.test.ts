@@ -148,7 +148,7 @@ describe('state machine — production code (processWorkflowEvent)', () => {
     expect(results[1]!.launches[0]?.workflowId).toBe('build-verify-v3')
   })
 
-  it('duplicate done with different executionIds but same workflowId triggers re-launch', () => {
+  it('stale done for an already-finished workflow does NOT re-launch (relevance guard)', () => {
     const entry = entryWithStack(['plan-issue-v3', 'build-verify-v3', 'publish-pr-v1'])
     startChain(entry)
 
@@ -161,7 +161,8 @@ describe('state machine — production code (processWorkflowEvent)', () => {
       ],
       seen,
     )
-    entry.executionStack![1]!.status = 'running'
+    // The chain advance already moved step 2 to 'running'.
+    expect(entry.executionStack![1]!.status).toBe('running')
 
     const seen2 = new Set<string>()
     const results = feed(
@@ -172,9 +173,14 @@ describe('state machine — production code (processWorkflowEvent)', () => {
       ],
       seen2,
     )
-    entry.executionStack![2]!.status = 'running'
 
-    expect(results[1]!.launches.map((l) => l.workflowId)).toEqual(['publish-pr-v1'])
+    // The second event targets 'plan-issue-v3' while the chain is running
+    // 'build-verify-v3': it is not pertinent, so it must not advance the
+    // chain and must not launch 'publish-pr-v1'.
+    expect(results[1]!.launches).toHaveLength(0)
+    expect(results[1]!.transitionTo).toBeUndefined()
+    expect(entry.executionStack![1]!.status).toBe('running')
+    expect(entry.executionStack![2]!.status).toBe('pending')
   })
 
   it('blocked #1 → real retry (1 relaunch), blocked #2 → entry blocked (no launch)', () => {
@@ -265,7 +271,7 @@ describe('state machine — production code (processWorkflowEvent)', () => {
     expect(logged).toMatch(/without executionId/)
   })
 
-  it('chain advance populates content and params via buildIssueContext/buildIssueParams', () => {
+  it('chain advance populates the DECLARED params via buildIssueParams', () => {
     const entry = entryWithStack(['plan-issue-v3', 'build-verify-v3'])
     startChain(entry)
 
@@ -282,11 +288,12 @@ describe('state machine — production code (processWorkflowEvent)', () => {
     const launch = results[1]!.launches[0]!
     expect(launch.sessionId).toBe('sess-1')
     expect(launch.workflowId).toBe('build-verify-v3')
-    expect(launch.content).toContain('**Title:** test issue')
-    expect(launch.params.issue_url).toBe('https://github.com/o/r/issues/42')
-    expect(launch.params.issue_number).toBe('42')
-    expect(launch.params.repo_key).toBe('o/r')
-    expect(launch.params.project_id).toBe('p')
+    // The chain advance offers the SAME declared parameters as the first
+    // step: only what the workflows declare, so the host's positional
+    // mapping can never be corrupted.
+    expect(launch.params.issue_ref).toBe('o/r#42')
+    expect(launch.params.repo).toBe('o/r')
+    expect(Object.keys(launch.params).sort()).toEqual(['issue_ref', 'repo'])
   })
 
   it('last workflow done → entry transitions to done', () => {

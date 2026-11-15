@@ -17,6 +17,7 @@
 import type { QueueEntry } from './types.js';
 import { type RateLimitInfo } from './github.js';
 import type { QueueStore } from './queue.js';
+import type { ControlPlaneState } from './control-plane.js';
 export interface PRMonitorDeps {
     token: string;
     store: QueueStore;
@@ -45,6 +46,21 @@ export interface PRMonitorDeps {
     republish: () => void;
     /** AbortSignal forwarded into GitHub fetches. */
     signal?: AbortSignal;
+    /**
+     * The durable control plane — the AUTHORITY for the scheduling state.
+     *
+     * The PR monitor used to write the legacy queue entry directly, so a
+     * merged or conflicting PR left the control plane saying 'running'
+     * while the legacy entry said 'done': the two views diverged and the
+     * control plane then refused to schedule the issue again.
+     *
+     * When provided, the monitor updates the control plane FIRST and the
+     * legacy entry is written from it. When absent (a standalone use of
+     * this module), the monitor keeps its previous behaviour.
+     */
+    controlPlane?: {
+        mutate<T>(fn: (state: ControlPlaneState) => T): Promise<T>;
+    };
 }
 export interface PRMonitorResult {
     checked: number;

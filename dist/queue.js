@@ -8,7 +8,11 @@
  * The plugin only reads/writes via the storage passed at construction.
  */
 const VALID_TRANSITIONS = {
-    queued: ['running', 'cancelled', 'removed'],
+    // 'blocked' is reachable from 'queued': a scan can discover that an
+    // issue depends on a missing issue, and an expired lease can block a
+    // queued entry. Without it the store refuses the transition and the
+    // refusal is swallowed, leaving the two views disagreeing.
+    queued: ['running', 'blocked', 'cancelled', 'removed'],
     running: ['blocked', 'done', 'failed', 'cancelled'],
     blocked: ['running', 'failed', 'cancelled', 'queued'],
     done: ['queued'],
@@ -51,7 +55,15 @@ export class QueueStore {
     }
     async addNew(candidates) {
         const active = await this.loadActive();
-        const existing = new Set(active.map((e) => dedupKey(e.repoKey, e.issueNumber)));
+        // The HISTORY counts too: a completed issue lives there, and the next
+        // scan re-added it — which made the legacy path run it a second time
+        // (a second session for the same issue) while the control plane still
+        // said 'done'.
+        const history = await this.loadHistory();
+        const existing = new Set([
+            ...active.map((e) => dedupKey(e.repoKey, e.issueNumber)),
+            ...history.map((e) => dedupKey(e.repoKey, e.issueNumber)),
+        ]);
         const fresh = candidates.filter((c) => !existing.has(dedupKey(c.repoKey, c.issueNumber)));
         if (fresh.length > 0) {
             const next = [...active, ...fresh];

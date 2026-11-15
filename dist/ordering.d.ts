@@ -12,7 +12,15 @@ export declare function orderQueue(entries: QueueEntry[], strategy: OrderingStra
     ordered: QueueEntry[];
     cycleEntries: QueueEntry[];
 };
-export declare function findMissingDependencies(entries: QueueEntry[]): {
+/**
+ * Find the entries whose dependency is missing.
+ *
+ * `satisfiedNumbers` carries the issue numbers that are known to be
+ * SATISFIED even when they are not in the active queue — a dependency that
+ * already completed lives in the HISTORY, and treating it as missing would
+ * re-block its dependents forever.
+ */
+export declare function findMissingDependencies(entries: QueueEntry[], satisfiedNumbers?: Iterable<number>, knownNumbers?: Iterable<number>): {
     entry: QueueEntry;
     missing: number[];
 }[];

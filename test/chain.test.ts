@@ -83,21 +83,18 @@ describe('chain.applyExecutionEvent', () => {
 })
 
 describe('chain builders', () => {
-  it('buildIssueParams exposes the documented keys', () => {
+  it('buildIssueParams exposes ONLY the parameters the workflows declare', () => {
+    // The host maps the positional arguments onto the DECLARED
+    // parameters, so a value that no workflow declares is never sent.
+    // The real declarations are: plan-issue-v3 → issue_ref + repo ;
+    // build-verify-v3 / publish-pr-v1 → workdir.
+    //
+    // The issue body and the comments are NOT transported: the planner
+    // re-reads the issue with an authenticated `gh issue view`, and the
+    // host has no channel for free text (the prompt is split on
+    // whitespace, so any free text would corrupt the mapping).
     const params = buildIssueParams(entry({}))
-    expect(Object.keys(params).sort()).toEqual(
-      [
-        'issue_body',
-        'issue_comments',
-        'issue_labels',
-        'issue_number',
-        'issue_ref',
-        'issue_title',
-        'issue_url',
-        'project_id',
-        'repo_key',
-      ].sort(),
-    )
+    expect(Object.keys(params).sort()).toEqual(['issue_ref', 'repo'])
   })
 
   it('buildIssueParams supplies issue_ref, a REQUIRED param of the planner', () => {
@@ -107,6 +104,13 @@ describe('chain builders', () => {
     const params = buildIssueParams(entry({ repoKey: 'theshwal/visipdp', issueNumber: 2024 }))
     expect(params['issue_ref']).toBe('theshwal/visipdp#2024')
     expect('issue_ref' in params).toBe(true)
+  })
+
+  it('buildIssueParams supplies the repo the planner reads the issue with', () => {
+    // plan-issue-v3 runs `gh issue view "$num" -R "$repo"`: a repo that
+    // is not `owner/name` makes the planner fail with "TARGET REJECTED".
+    const params = buildIssueParams(entry({ repoKey: 'acme/widgets', issueNumber: 7 }))
+    expect(params['repo']).toBe('acme/widgets')
   })
 
   it('buildIssueContext embeds the URL and body', () => {

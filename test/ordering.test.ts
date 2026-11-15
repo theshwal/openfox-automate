@@ -34,6 +34,20 @@ describe('parseDependencies', () => {
   it('deduplicates', () => {
     expect(parseDependencies('#5 #5 #6', '(#(\\d+))')).toEqual([5, 6])
   })
+
+  it('returns an empty array for an EMPTY pattern instead of looping forever', () => {
+    // Regression: an empty pattern compiles to a regex that matches the
+    // empty string at every position. `re.exec` never advances `lastIndex`,
+    // so the parsing loop spun forever and froze the host on every scan
+    // with an empty `ordering.dependencyPattern`.
+    expect(parseDependencies('some issue body', '')).toEqual([])
+    expect(parseDependencies('some issue body', '   ')).toEqual([])
+  })
+
+  it('returns an empty array for a pattern that can match the empty string', () => {
+    // `a*` matches the empty string — same infinite-loop hazard.
+    expect(parseDependencies('some issue body', 'a*')).toEqual([])
+  })
 })
 
 describe('orderQueue — default strategy', () => {

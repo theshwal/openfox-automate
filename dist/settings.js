@@ -32,10 +32,10 @@ export const settingsSchema = {
             type: 'textarea',
             label: { en: 'Workflow chain', fr: 'Chaîne de workflows' },
             description: {
-                en: 'Ordered workflow IDs, one per line. Default: Plan Issue v2 → Build & Verify Auto v2 → Delivery v2.',
-                fr: 'Identifiants de workflows ordonnés, un par ligne. Défaut : Plan Issue v2 → Build & Verify Auto v2 → Delivery v2.',
+                en: 'Ordered stable workflow IDs, one per line — not display names, which the host cannot resolve. Default: plan-issue-v3 → build-verify-v3 → publish-pr-v1. There is no merge workflow: publish stops at the PR and the merge policy is read afterwards.',
+                fr: 'Identifiants de workflows stables ordonnés, un par ligne — pas les noms d’affichage, que l’hôte ne sait pas résoudre. Défaut : plan-issue-v3 → build-verify-v3 → publish-pr-v1. Aucun workflow de merge : publish s’arrête à la PR et la policy de merge est lue ensuite.',
             },
-            default: 'Plan Issue v2\nBuild & Verify Auto v2\nDelivery v2',
+            default: 'plan-issue-v3\nbuild-verify-v3\npublish-pr-v1',
         },
         {
             key: 'workflows.repoOverrides',
@@ -60,7 +60,11 @@ export const settingsSchema = {
             key: 'scan.startupScan',
             type: 'boolean',
             label: { en: 'Run a scan immediately on plugin start', fr: 'Lancer un scan au démarrage du plugin' },
-            default: true,
+            description: {
+                en: 'Off by default. A startup scan only READS GitHub; it never creates a session by itself.',
+                fr: 'Désactivé par défaut. Un scan au démarrage ne fait que LIRE GitHub ; il ne crée jamais de session.',
+            },
+            default: false,
         },
         {
             key: 'scan.ignoreLabels',
@@ -117,7 +121,11 @@ export const settingsSchema = {
                 en: 'Dry run (no sessions created, no GitHub writes)',
                 fr: 'Simulation (aucune session créée, aucune écriture GitHub)',
             },
-            default: false,
+            description: {
+                en: 'ON by default: enabling the plugin never creates a session, never writes to GitHub and never launches a workflow until you turn this off.',
+                fr: 'ACTIVÉ par défaut : activer le plugin ne crée aucune session, n’écrit rien sur GitHub et ne lance aucun workflow tant que vous ne l’avez pas désactivé.',
+            },
+            default: true,
         },
         {
             key: 'history.retentionCount',
@@ -142,8 +150,8 @@ export const settingsSchema = {
             type: 'textarea',
             label: { en: 'Comment template', fr: 'Modèle de commentaire' },
             description: {
-                en: 'Supports {{title}}, {{summary}}, {{sessionUrl}}, {{prUrl}}. Empty by default (Delivery v2 handles comments).',
-                fr: 'Supporte {{title}}, {{summary}}, {{sessionUrl}}, {{prUrl}}. Vide par défaut (Delivery v2 gère les commentaires).',
+                en: 'Supports {{title}}, {{summary}}, {{sessionUrl}}, {{prUrl}}. Empty by default (the publish workflow handles comments).',
+                fr: 'Supporte {{title}}, {{summary}}, {{sessionUrl}}, {{prUrl}}. Vide par défaut (le workflow de publication gère les commentaires).',
             },
             default: '',
         },
@@ -170,6 +178,46 @@ export const settingsSchema = {
             type: 'text',
             label: { en: 'GitHub PR URL regex', fr: 'Regex des URL de PR GitHub' },
             default: 'https://github\\.com/[^/]+/[^/]+/pull/(\\d+)',
+        },
+        {
+            key: 'host.baseUrl',
+            type: 'text',
+            label: { en: 'OpenFox host base URL', fr: 'URL de base de l’hôte OpenFox' },
+            description: {
+                en: 'The host does not expose its port to a plugin, so it must be configured here. Only a loopback address is accepted. Leave empty to use the host default.',
+                fr: 'L’hôte n’expose pas son port au plugin : il doit être configuré ici. Seule une adresse loopback est acceptée. Laissez vide pour utiliser la valeur par défaut.',
+            },
+            default: '',
+        },
+        {
+            key: 'host.sessionToken',
+            type: 'password',
+            label: { en: 'OpenFox session token', fr: 'Jeton de session OpenFox' },
+            description: {
+                en: 'Only needed when the host requires network authentication. Sent as the x-session-token header, never in a URL.',
+                fr: 'Nécessaire uniquement si l’hôte exige l’authentification réseau. Envoyé en en-tête x-session-token, jamais dans une URL.',
+            },
+            secret: true,
+        },
+        {
+            key: 'budget.maxTokensPerIssue',
+            type: 'number',
+            label: { en: 'Max tokens per issue (0 = unlimited)', fr: 'Tokens max par issue (0 = illimité)' },
+            description: {
+                en: 'When the cumulative token usage of an issue reaches this budget, the issue is blocked and needs intervention.',
+                fr: 'Lorsque l’usage cumulé de tokens d’une issue atteint ce budget, l’issue est bloquée et demande une intervention.',
+            },
+            default: 0,
+        },
+        {
+            key: 'control.leaseMinutes',
+            type: 'number',
+            label: { en: 'Reservation lease (minutes)', fr: 'Bail de réservation (minutes)' },
+            description: {
+                en: 'A reservation older than this lease is reclaimed after an interrupted run, so a crash never leaks a worker slot.',
+                fr: 'Une réservation plus ancienne que ce bail est récupérée après une exécution interrompue : un crash ne fuit donc jamais de slot.',
+            },
+            default: 10,
         },
     ],
 };
@@ -221,6 +269,27 @@ export function clampSettings(settings) {
     }
     else {
         out['batch.maxConcurrencyPerRepo'] = Math.floor(perRepo);
+    }
+    // The control plane never runs more than 5 workers at once.
+    if (global > 5) {
+        out['batch.maxConcurrency'] = 5;
+    }
+    const budget = Number(out['budget.maxTokensPerIssue']);
+    if (!Number.isFinite(budget) || budget < 0) {
+        out['budget.maxTokensPerIssue'] = 0;
+    }
+    else {
+        out['budget.maxTokensPerIssue'] = Math.floor(budget);
+    }
+    const lease = Number(out['control.leaseMinutes']);
+    if (!Number.isFinite(lease) || lease < 1) {
+        out['control.leaseMinutes'] = 10;
+    }
+    else if (lease > 1440) {
+        out['control.leaseMinutes'] = 1440;
+    }
+    else {
+        out['control.leaseMinutes'] = Math.floor(lease);
     }
     const retention = Number(out['history.retentionCount']);
     if (!Number.isFinite(retention) || retention < 10) {
