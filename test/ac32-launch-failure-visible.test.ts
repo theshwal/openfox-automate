@@ -93,11 +93,26 @@ describe('AC32 — a refused launch is visible', () => {
   })
 
   it('a launch refused at the CHAIN ADVANCE also blocks the issue', async () => {
-    // The first step works, the second one is refused: the issue must not
+    // The first step works, the second one is REFUSED: the issue must not
     // stay 'running' either.
+    //
+    // The refusal is REAL: the host stops DECLARING build-verify-v3, so
+    // its parameters cannot be mapped and the plugin refuses the launch
+    // (fail-closed) instead of guessing the argument order.
+    const workflows = [
+      {
+        id: 'plan-issue-v3',
+        parameters: [
+          { id: 'issue_ref', position: 0, required: true },
+          { id: 'repo', position: 1, required: false },
+        ],
+      },
+      { id: 'build-verify-v3', parameters: [{ id: 'workdir', position: 0, required: false }] },
+    ]
     const sim = makeFaithfulSim({
       issues: [{ number: 1, title: 'I1' }],
       chain: ['plan-issue-v3', 'build-verify-v3'],
+      workflows,
     })
     register(sim.registry)
     await settle()
@@ -105,17 +120,21 @@ describe('AC32 — a refused launch is visible', () => {
     await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
     await settle()
 
-    // The host stops declaring the workflows: the next step cannot be
-    // mapped, so the launch is refused.
-    const workflowsCall = sim.hostCalls.filter((c) => c.url.endsWith('/api/workflows'))
-    expect(workflowsCall.length).toBeGreaterThan(0)
+    // The first step DID start: the entry is running and the second step
+    // is still pending.
+    const launched = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
+    expect(launched[0]?.status).toBe('running')
+    expect(launched[0]?.executionStack?.[1]?.status).toBe('pending')
 
-    const queue = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
+    // The host stops declaring the next workflow: the advance cannot be
+    // mapped, so the launch is refused.
+    workflows.splice(1, 1)
+
     const wfHook = sim.calls.hook.find((h) => h.h === 'workflow.execution.changed')!.fn
     await wfHook({
       event: 'workflow.execution.changed',
       timestamp: new Date().toISOString(),
-      sessionId: queue[0]?.sessionId,
+      sessionId: launched[0]?.sessionId,
       data: {
         executionId: 'exec-1',
         workflowId: 'plan-issue-v3',
@@ -125,9 +144,93 @@ describe('AC32 — a refused launch is visible', () => {
     })
     await settle()
 
-    // The chain advanced normally (the declarations are still served).
     const after = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
-    expect(after[0]?.executionStack?.[1]?.status).toBe('running')
-    expect(after[0]?.status).toBe('running')
+    const cp = readJson<{ items: Record<string, { status: string; error?: string }> }>(
+      sim.backing,
+      'control_plane',
+    )
+    // Blocked in BOTH views, with the same reason — not a silent 'running'.
+    expect(after[0]?.status).toBe('blocked')
+    expect(cp?.items['acme/widgets#1']?.status).toBe('blocked')
+    expect(after[0]?.error).toContain('could not start workflow build-verify-v3')
+    expect(cp?.items['acme/widgets#1']?.error).toContain('could not start workflow build-verify-v3')
+    // The step that could not start is not left 'running' under a blocked
+    // issue.
+    expect(after[0]?.executionStack?.[1]?.status).not.toBe('running')
+  })
+
+  it('a QUEUED launch is NOT a failure: the issue stays running', async () => {
+    // The host's slots are already held by OTHER work: the plugin's launch
+    // is QUEUED, not refused. The host accepted the task and runs it as
+    // soon as a slot frees, so blocking the issue would orphan the run —
+    // when it eventually starts, its workflow.execution.changed event
+    // would find no active entry and be dropped.
+    const sim = makeFaithfulSim({
+      issues: [{ number: 1, title: 'I1' }],
+      chain: ['plan-issue-v3'],
+    })
+    // The plugin raises the host's slot limit to its own worker count
+    // (three by default), so three tasks already in progress exhaust it.
+    for (let i = 0; i < 5; i += 1) {
+      sim.tasks.push({
+        id: `manual-${i}`,
+        prompt: '',
+        state: 'in_progress',
+        runState: 'running',
+        workflowId: '',
+      })
+    }
+    register(sim.registry)
+    await settle()
+    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
+    await sim.calls.rpc.find((r) => r.name === 'automate.controlPlaneSchedule')!.fn({}, sim.registry.context)
+    await settle()
+
+    // The host REALLY queued the launch, so the scenario under test
+    // actually happened.
+    expect(sim.tasks.some((t) => t.workflowId === 'plan-issue-v3' && t.runState === 'queued')).toBe(true)
+    const queue = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
+    const cp = readJson<{ items: Record<string, { status: string; error?: string }> }>(
+      sim.backing,
+      'control_plane',
+    )
+    expect(queue).toHaveLength(1)
+    // NOT blocked, in EITHER view: a queued launch is not a refusal.
+    expect(queue[0]?.status).toBe('running')
+    expect(queue[0]?.error).toBeFalsy()
+    expect(cp?.items['acme/widgets#1']?.status).toBe('running')
+    expect(cp?.items['acme/widgets#1']?.error).toBeFalsy()
+  })
+
+  it('the CALLER sees the refusal: startIssue returns the blocked entry', async () => {
+    // The refusal is recorded while the launch is still in flight. If the
+    // caller kept the stale 'running' object it built before the launch,
+    // it would believe the issue started and keep the reservation.
+    const sim = makeFaithfulSim({
+      issues: [{ number: 1, title: 'I1' }],
+      chain: ['plan-issue-v3'],
+      workflows: [],
+    })
+    register(sim.registry)
+    await settle()
+    await sim.calls.rpc.find((r) => r.name === 'automate.scanNow')!.fn({}, sim.registry.context)
+
+    const queued = readJson<QueueEntry[]>(sim.backing, 'queue') ?? []
+    expect(queued[0]?.status).toBe('queued')
+
+    const started = (await sim.calls.rpc
+      .find((r) => r.name === 'automate.startIssue')!
+      .fn({ queueId: queued[0]!.id }, sim.registry.context)) as QueueEntry
+
+    // The RETURNED entry reports the refusal — not a stale 'running'.
+    expect(started.status).toBe('blocked')
+    expect(started.error).toContain('could not start workflow plan-issue-v3')
+
+    // And the two views still agree: the refusal is not overwritten by
+    // 'failed' on the way out.
+    const status = (await sim.calls.rpc
+      .find((r) => r.name === 'automate.controlPlaneStatus')!
+      .fn({}, sim.registry.context)) as { divergences: string[] }
+    expect(status.divergences).toEqual([])
   })
 })

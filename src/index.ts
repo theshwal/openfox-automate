@@ -669,7 +669,14 @@ async function scheduleControlPlane(rt: Runtime): Promise<number> {
         started += 1
       } else {
         await rt.controlPlane.mutate((state) => {
-          completeItem(state, item.key, 'failed', { error: spawned.error ?? 'could not start' })
+          // A REFUSED launch already blocked the item in both views, with
+          // the reason: overwriting it with 'failed' would make the two
+          // views disagree. Only a reservation that never reached a status
+          // is completed here.
+          const current = state.items[item.key]
+          if (current && current.status === 'reserved') {
+            completeItem(state, item.key, 'failed', { error: spawned.error ?? 'could not start' })
+          }
         })
       }
     } catch (err) {
@@ -911,11 +918,20 @@ async function failLaunch(rt: Runtime, entry: QueueEntry, message: string): Prom
   })
   const item = await rt.controlPlane.read((state) => state.items[key])
   const patched = syncQueueStatus(entry, item)
+  // The in-flight STEP must not stay 'running' under a blocked issue: that
+  // is the very contradiction this function exists to remove. The step
+  // that could not start is marked 'blocked' too; the reason lives on the
+  // entry (and on the control-plane item), so the two views and the stack
+  // all tell the same story.
+  const finishedAt = new Date().toISOString()
+  const stack = (entry.executionStack ?? []).map((step) =>
+    step.status === 'running' ? { ...step, status: 'blocked' as const, finishedAt } : step,
+  )
   try {
     await rt.store.transitionTo(entry.id, patched.status, {
-      executionStack: entry.executionStack ?? [],
+      executionStack: stack,
       error: message,
-      finishedAt: new Date().toISOString(),
+      finishedAt,
     })
   } catch (err) {
     // The store refused the transition: the entry is written directly so
@@ -923,7 +939,7 @@ async function failLaunch(rt: Runtime, entry: QueueEntry, message: string): Prom
     rt.context.logger.warn(
       `could not block the entry after a failed launch: ${err instanceof Error ? err.message : String(err)}`,
     )
-    await rt.store.update({ ...entry, ...patched, error: message })
+    await rt.store.update({ ...entry, ...patched, executionStack: stack, error: message })
   }
   rt.context.notify({
     title: { en: 'Workflow could not start', fr: 'Le workflow n’a pas pu démarrer' },
@@ -1006,21 +1022,35 @@ async function spawnEntry(rt: Runtime, entry: QueueEntry): Promise<QueueEntry> {
       // otherwise stay 'running' with nothing running, and the operator
       // would see a running issue in the panel with no workflow and no
       // error. The issue is BLOCKED in BOTH views, with the reason.
-      const onLaunchFailed = (workflowId: string, reason: string): void => {
+      // The failure is AWAITED by the driver, so `settle()` only resolves
+      // once the entry is really blocked in both views: the caller then
+      // reads the store and reports the refusal instead of the stale
+      // 'running' object.
+      const onLaunchFailed = (workflowId: string, reason: string): Promise<void> => {
         const message = `could not start workflow ${workflowId}: ${reason}`
-        void failLaunch(rt, updated, message).catch((err: unknown) => {
+        return failLaunch(rt, updated, message).catch((err: unknown) => {
           rt.context.logger.error(
             `could not record the launch failure: ${err instanceof Error ? err.message : String(err)}`,
           )
         })
       }
-      updated.executionStack = startChain(
-        updated,
-        createLaunchDriver(rt, onSessionBound, onTaskBound, onLaunchFailed),
-        {
-          sessionId: updated.sessionId ?? '',
-        },
-      )
+      const driver = createLaunchDriver(rt, onSessionBound, onTaskBound, onLaunchFailed)
+      updated.executionStack = startChain(updated, driver, {
+        sessionId: updated.sessionId ?? '',
+      })
+      // The launch is asynchronous, and a REFUSED one blocks the entry
+      // through `failLaunch`. Wait for it, then never overwrite the entry
+      // with the stale 'running' object: that write restored 'running'
+      // and dropped the error — exactly the silent state this fix
+      // removes. The entry is returned as the store holds it, so the
+      // callers that branch on the returned entry (the scheduler, the
+      // startIssue RPC) see the refusal and release the reservation.
+      await driver.settle()
+      const stored = (await rt.store.loadActive()).find((e) => e.id === updated.id)
+      if (stored && stored.status !== 'running') {
+        Object.assign(updated, stored)
+        return updated
+      }
     }
     await rt.store.update(updated)
   } catch (e) {
@@ -1067,7 +1097,7 @@ function createLaunchDriver(
   rt: Runtime,
   onSessionBound: (sessionId: string, workflowId: string) => void,
   onTaskBound: (taskId: string, workflowId: string) => void,
-  onLaunchFailed: (workflowId: string, reason: string) => void,
+  onLaunchFailed: (workflowId: string, reason: string) => Promise<void> | void,
 ): {
   launch(params: {
     sessionId: string
@@ -1078,37 +1108,54 @@ function createLaunchDriver(
   }): void
   onSessionBound: (sessionId: string, workflowId: string) => void
   onTaskBound: (taskId: string, workflowId: string) => void
+  settle(): Promise<void>
 } {
+  // Every launch started by this driver, so the caller can wait for the
+  // host's answer before it persists the entry. Without this, a refusal
+  // that resolves without I/O could be recorded BEFORE the caller writes
+  // its stale 'running' object, and that write would erase it.
+  const pending: Promise<void>[] = []
   return {
     launch: (p) => {
       // The launch is asynchronous: the host reports the session it bound
       // to the run, and the plugin must follow it.
-      void (async () => {
-        try {
-          const bound = await launchAndBind(rt, p)
-          if (!bound.launched) {
-            // The workflow did NOT start. The issue must not stay
-            // 'running' with nothing running: the operator has to see it.
-            onLaunchFailed(p.workflowId, bound.reason ?? 'the host did not start the workflow')
-            return
+      pending.push(
+        (async () => {
+          try {
+            const bound = await launchAndBind(rt, p)
+            if (!bound.launched && bound.failure === 'refused') {
+              // The workflow was REFUSED: the host was never asked. The
+              // issue must not stay 'running' with nothing running.
+              await onLaunchFailed(p.workflowId, bound.reason ?? 'the host did not start the workflow')
+              return
+            }
+            // A 'queued' launch is NOT a failure: the host accepted the
+            // task and runs it as soon as a slot frees, so the issue stays
+            // 'running' and the session and the task are still bound — the
+            // task has to be closed later, and the host's event will
+            // arrive. Blocking here would orphan the run: its event would
+            // find no active entry and be dropped.
+            if (bound.sessionId !== p.sessionId) {
+              // The host seeded a NEW session (it can only reuse a session
+              // that has no messages yet): the entry must follow it.
+              onSessionBound(bound.sessionId, p.workflowId)
+            }
+            if (bound.taskId) {
+              // The host task must be CLOSED when the chain ends, otherwise
+              // it keeps its worker slot forever and the next issue never
+              // starts.
+              onTaskBound(bound.taskId, p.workflowId)
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err)
+            rt.context.logger.error(`launchWorkflow failed: ${message}`)
+            await onLaunchFailed(p.workflowId, message)
           }
-          if (bound.sessionId !== p.sessionId) {
-            // The host seeded a NEW session (it can only reuse a session
-            // that has no messages yet): the entry must follow it.
-            onSessionBound(bound.sessionId, p.workflowId)
-          }
-          if (bound.taskId) {
-            // The host task must be CLOSED when the chain ends, otherwise
-            // it keeps its worker slot forever and the next issue never
-            // starts.
-            onTaskBound(bound.taskId, p.workflowId)
-          }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err)
-          rt.context.logger.error(`launchWorkflow failed: ${message}`)
-          onLaunchFailed(p.workflowId, message)
-        }
-      })()
+        })(),
+      )
+    },
+    settle: async () => {
+      await Promise.allSettled(pending)
     },
     onSessionBound,
     onTaskBound,
@@ -1390,7 +1437,14 @@ export function register(registry: PluginRegistry): void {
     const spawned = await spawnEntry(rt, entry)
     if (spawned.status !== 'running') {
       await rt.controlPlane.mutate((state) => {
-        completeItem(state, key, 'failed', { error: spawned.error ?? 'could not start' })
+        // A REFUSED launch already blocked the item in both views, with the
+        // reason: overwriting it with 'failed' would make the two views
+        // disagree. Only a reservation that never reached a status is
+        // completed here.
+        const item = state.items[key]
+        if (item && item.status === 'reserved') {
+          completeItem(state, key, 'failed', { error: spawned.error ?? 'could not start' })
+        }
       })
     }
     return spawned
@@ -1732,9 +1786,9 @@ export function register(registry: PluginRegistry): void {
           await failLaunch(rt, entry, `could not start workflow ${launch.workflowId}: ${message}`)
           return
         }
-        if (!bound.launched) {
-          // Same contract as the first step: a launch that does not start
-          // is VISIBLE, it is not a silent 'running'.
+        if (!bound.launched && bound.failure === 'refused') {
+          // Same contract as the first step: a REFUSED launch is VISIBLE,
+          // it is not a silent 'running'.
           await failLaunch(
             rt,
             entry,
